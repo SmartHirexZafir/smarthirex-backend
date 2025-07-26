@@ -1,4 +1,5 @@
-# ✅ File: app/logic/response_builder.py
+# ✅ Cleaned: app/logic/response_builder.py
+
 import json
 import os
 import difflib
@@ -16,10 +17,12 @@ async def fuzzy_match(prompt, guide):
 
 async def build_response(parsed_data: dict) -> dict:
     intent = parsed_data.get("intent")
+    prompt = parsed_data.get("query", "")
 
     if intent == "filter_cv":
         resumes = await get_ranked_resumes(parsed_data)
         redirect_url = build_redirect_url(parsed_data)
+
         return {
             "message": "Redirecting to filtered CV results page.",
             "redirect": redirect_url,
@@ -28,7 +31,7 @@ async def build_response(parsed_data: dict) -> dict:
 
     if intent == "usage_help":
         guide = await load_usage_guide()
-        reply = await fuzzy_match(parsed_data.get("query", ""), guide)
+        reply = await fuzzy_match(prompt, guide)
         return {
             "message": reply if reply else "Sorry, is feature ke bare me mujhe info nahi mili.",
             "redirect": None
