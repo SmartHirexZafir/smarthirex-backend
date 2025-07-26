@@ -23,7 +23,7 @@ async def build_response(parsed_data: dict) -> dict:
         return {
             "message": "Redirecting to filtered CV results page.",
             "redirect": redirect_url,
-            "resumes_preview": resumes[:3]
+            "resumes_preview": resumes[:20]
         }
 
     if intent == "usage_help":
