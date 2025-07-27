@@ -1,4 +1,4 @@
-# ✅ Cleaned: app/logic/response_builder.py
+# ✅ File: app/logic/response_builder.py
 
 import json
 import os
@@ -20,11 +20,19 @@ async def build_response(parsed_data: dict) -> dict:
     prompt = parsed_data.get("query", "")
 
     if intent == "filter_cv":
-        resumes = await get_ranked_resumes(parsed_data)
+        # ✅ Extract expected ML filters safely
+        filters = {
+            "skills": parsed_data.get("skills", []),
+            "experience": parsed_data.get("experience", 0),
+            "job_role": parsed_data.get("job_role", ""),
+            "project_keywords": parsed_data.get("project_keywords", [])
+        }
+
+        resumes = await get_ranked_resumes(filters)
         redirect_url = build_redirect_url(parsed_data)
 
         return {
-            "message": "Redirecting to filtered CV results page.",
+            "reply": "Redirecting to filtered CV results page.",
             "redirect": redirect_url,
             "resumes_preview": resumes[:20]
         }
@@ -33,8 +41,11 @@ async def build_response(parsed_data: dict) -> dict:
         guide = await load_usage_guide()
         reply = await fuzzy_match(prompt, guide)
         return {
-            "message": reply if reply else "Sorry, is feature ke bare me mujhe info nahi mili.",
+            "reply": reply if reply else "Sorry, is feature ke bare me mujhe info nahi mili.",
             "redirect": None
         }
 
-    return {"message": "Sorry, I couldn't understand your query.", "redirect": None}
+    return {
+        "reply": "Sorry, I couldn't understand your query.",
+        "redirect": None
+    }

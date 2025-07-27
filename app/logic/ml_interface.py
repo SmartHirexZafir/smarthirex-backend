@@ -35,7 +35,6 @@ async def get_ranked_resumes(filters: dict) -> List[Dict]:
     required_skills = set(s.lower() for s in filters.get("skills", []))
     min_experience = int(filters.get("experience") or 0)
     required_projects = set(p.lower() for p in filters.get("project_keywords", []))
-
     job_role_raw = filters.get("job_role")
     required_role = job_role_raw.lower() if isinstance(job_role_raw, str) else ""
 
@@ -71,9 +70,21 @@ async def get_ranked_resumes(filters: dict) -> List[Dict]:
             else:
                 match_score = 100.0  # if no skills given, assume full match
 
+            matched_skills = list(overlap) if required_skills else list(skills)
+            missing_skills = list(required_skills - skills) if required_skills else []
+
+            cv["score"] = match_score
             cv["match_score"] = match_score
+            cv["testScore"] = cv.get("testScore", 0)
+            cv["matchedSkills"] = matched_skills
+            cv["missingSkills"] = missing_skills
+            cv["rank"] = 0  # temporary
+
             matched.append(cv)
 
-    # Sort by match_score descending
-    matched.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+    # Sort by score descending and assign ranks
+    matched.sort(key=lambda x: x.get("score", 0), reverse=True)
+    for i, cv in enumerate(matched):
+        cv["rank"] = i + 1
+
     return matched
