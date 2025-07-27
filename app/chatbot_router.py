@@ -48,4 +48,8 @@ async def handle_chatbot_query(request: Request):
             "candidates": response["resumes_preview"]
         })
 
-    return response
+    # ✅ Step 5: Return resumes with response so frontend gets candidates
+    return {
+        "reply": response.get("reply", ""),
+        "resumes_preview": response.get("resumes_preview", [])
+    }

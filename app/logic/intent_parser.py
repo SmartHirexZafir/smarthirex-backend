@@ -5,12 +5,20 @@ import re
 def detect_usage_help(prompt: str) -> bool:
     """
     Detects if the user is asking for help/about information.
+    Only triggers if user is clearly asking 'how to use' the system.
     """
-    keywords = [
-        "kaise", "kahan", "use", "signup", "interview", "shortlist",
-        "start", "register", "filter dikh", "candidate", "how to", "where"
+    prompt = prompt.lower()
+    help_patterns = [
+        r"\bhow to\b",
+        r"\bhelp\b",
+        r"\bkaise\b",
+        r"\buse\b",
+        r"\bstart\b",
+        r"\bregister\b",
+        r"\bsign ?up\b",
+        r"\bguide\b"
     ]
-    return any(word in prompt.lower() for word in keywords)
+    return any(re.search(pattern, prompt) for pattern in help_patterns)
 
 def parse_prompt(prompt: str) -> dict:
     """
@@ -32,7 +40,7 @@ def parse_prompt(prompt: str) -> dict:
     ]
     skills = list(set([s for s in known_skills if s in prompt]))
 
-    # Experience extraction (e.g., "5 years", "3+ yrs")
+    # Experience extraction (e.g., "5 years", "3+ yrs", "5 saal")
     exp_match = re.search(r"(\d+)\+?\s*(?:years|yrs|saal)?", prompt)
     experience = exp_match.group(1) if exp_match else None
 
