@@ -1,40 +1,39 @@
-# ✅ File: app/logic/response_builder.py
-
 import json
 import os
 import difflib
-from app.logic.ml_interface import get_ranked_resumes
+from app.logic.ml_interface import get_semantic_matches  # ✅ Only semantic now
 from app.utils.redirect_helper import build_redirect_url
+
 
 async def load_usage_guide():
     path = os.path.join("app", "static", "usage_guide.json")
     with open(path, "r") as f:
         return json.load(f)
 
+
 async def fuzzy_match(prompt, guide):
     closest = difflib.get_close_matches(prompt.lower(), guide.keys(), n=1, cutoff=0.3)
     return guide[closest[0]] if closest else None
+
 
 async def build_response(parsed_data: dict) -> dict:
     intent = parsed_data.get("intent")
     prompt = parsed_data.get("query", "")
 
-    if intent == "filter_cv":
-        # ✅ Extract expected ML filters safely
-        filters = {
-            "skills": parsed_data.get("skills", []),
-            "experience": parsed_data.get("experience", 0),
-            "job_role": parsed_data.get("job_role", ""),
-            "project_keywords": parsed_data.get("project_keywords", [])
-        }
+    if intent in ("filter_cv", "show_all"):
+        resumes = await get_semantic_matches(prompt)
 
-        resumes = await get_ranked_resumes(filters)
         redirect_url = build_redirect_url(parsed_data)
 
+        reply_text = (
+            f"Found {len(resumes)} candidate{'s' if len(resumes) != 1 else ''} matching your prompt."
+            if resumes else "No matching candidates found. Showing fallback results."
+        )
+
         return {
-            "reply": "Redirecting to filtered CV results page.",
+            "reply": reply_text,
             "redirect": redirect_url,
-            "resumes_preview": resumes[:20]
+            "resumes_preview": resumes
         }
 
     if intent == "usage_help":

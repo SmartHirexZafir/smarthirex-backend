@@ -1,5 +1,3 @@
-# ✅ File: app/logic/resume_parser.py
-
 import fitz  # PyMuPDF
 import docx2txt
 import io
@@ -117,6 +115,14 @@ def extract_work_history(text: str) -> list:
                 })
     return results
 
+# ✅ NEW: Extracts first found location using NLP (GPE entities)
+def extract_location(text: str) -> str:
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ == "GPE":  # Geo-Political Entity
+            return ent.text
+    return "N/A"
+
 def extract_info(text: str) -> dict:
     name = extract_name(text)
     email = extract_email(text)
@@ -127,9 +133,10 @@ def extract_info(text: str) -> dict:
     summary = extract_summary(text)
     education = extract_education(text)
     workHistory = extract_work_history(text)
+    location = extract_location(text)  # ✅ new
 
     return {
-        "name": name,
+        "name": name or "Unnamed Candidate",  # ✅ fallback for missing names
         "email": email,
         "phone": phone,
         "skills": skills,
@@ -145,7 +152,7 @@ def extract_info(text: str) -> dict:
         },
         "currentRole": workHistory[0]["title"] if workHistory else "N/A",
         "company": workHistory[0]["company"] if workHistory else "N/A",
-        "location": "N/A"
+        "location": location
     }
 
 def parse_resume_file(filename: str, content: bytes) -> dict:
