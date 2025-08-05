@@ -1,15 +1,14 @@
-# ✅ File: app/logic/ml_interface.py
-
 import joblib
-from app.utils.mongo import db
+import os
+import re
+from typing import List, Dict
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import LabelEncoder
-from typing import List, Dict
-import os
-import re
+from app.utils.mongo import db
+from sentence_transformers import SentenceTransformer, util
 
-# Load model and preprocessing artifacts
+# Load models
 MODEL_PATH = os.path.join("app", "ml_models", "Resume_Ensemble_Model.pkl")
 VECTORIZER_PATH = os.path.join("app", "ml_models", "Resume_Tfidf_Vectorizer.pkl")
 ENCODER_PATH = os.path.join("app", "ml_models", "Resume_LabelEncoder.pkl")
@@ -18,7 +17,10 @@ model: BaseEstimator = joblib.load(MODEL_PATH)
 vectorizer: TfidfVectorizer = joblib.load(VECTORIZER_PATH)
 label_encoder: LabelEncoder = joblib.load(ENCODER_PATH)
 
-# Text cleaner (same as in model training)
+# Load semantic model
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Clean text utility
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -30,60 +32,75 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+", ' ', text).strip()
     return text
 
-# Main async function to rank resumes
-async def get_ranked_resumes(filters: dict) -> List[Dict]:
-    required_skills = set(s.lower() for s in filters.get("skills", []))
-    min_experience = int(filters.get("experience") or 0)
-    required_projects = set(p.lower() for p in filters.get("project_keywords", []))
-    job_role_raw = filters.get("job_role")
-    required_role = job_role_raw.lower() if isinstance(job_role_raw, str) else ""
+# ✅ Final: Strict hybrid matching with safe thresholding
+async def get_semantic_matches(prompt: str, threshold: float = 0.45) -> List[Dict]:
+    cleaned_prompt = clean_text(prompt)
+    prompt_embedding = embedding_model.encode(cleaned_prompt, convert_to_tensor=True)
+
+    is_prompt_role_like = len(cleaned_prompt.split()) <= 4
+    matched = []
+    seen_ids = set()
 
     cursor = db.parsed_resumes.find({})
-    matched = []
 
     async for cv in cursor:
-        raw_text = cv.get("raw_text", "")
-        experience = int(cv.get("experience") or 0)
-        skills = set(s.lower() for s in cv.get("skills", []))
+        cv_id = cv.get("_id")
+        if not cv_id or cv_id in seen_ids:
+            continue
+        seen_ids.add(cv_id)
 
+        raw_text = cv.get("raw_text", "")
         if not raw_text.strip():
             continue
 
-        # Clean and vectorize for model prediction
-        cleaned_text = clean_text(raw_text)
-        features = vectorizer.transform([cleaned_text])
-        prediction = model.predict(features)
-        predicted_label = label_encoder.inverse_transform(prediction)[0].lower()
-        cv["predicted_role"] = predicted_label
+        predicted_role = (cv.get("predicted_role") or "").lower()
+        confidence = round(cv.get("confidence", 0), 2)
+        cleaned_resume_text = clean_text(raw_text)
 
-        # Filtering conditions
-        skill_match = required_skills.issubset(skills) if required_skills else True
-        exp_match = experience >= min_experience
-        project_match = all(proj in cleaned_text for proj in required_projects) if required_projects else True
-        role_match = required_role in predicted_label if required_role else True
+        # Decide what to compare with the prompt
+        compare_text = predicted_role if is_prompt_role_like else cleaned_resume_text
+        compare_embedding = embedding_model.encode(compare_text, convert_to_tensor=True)
 
-        if skill_match and exp_match and project_match and role_match:
-            # Match score (based on skill overlap)
-            if required_skills:
-                overlap = required_skills.intersection(skills)
-                match_score = round((len(overlap) / len(required_skills)) * 100, 2)
-            else:
-                match_score = 100.0  # if no skills given, assume full match
+        similarity = util.cos_sim(prompt_embedding, compare_embedding)[0][0].item()
+        semantic_score = round(similarity * 100, 2)
 
-            matched_skills = list(overlap) if required_skills else list(skills)
-            missing_skills = list(required_skills - skills) if required_skills else []
+        # ✅ Enforce stricter semantic match for role-like prompts
+        if is_prompt_role_like:
+            if semantic_score < 70:
+                continue  # Skip irrelevant roles
 
-            cv["score"] = match_score
-            cv["match_score"] = match_score
-            cv["testScore"] = cv.get("testScore", 0)
-            cv["matchedSkills"] = matched_skills
-            cv["missingSkills"] = missing_skills
-            cv["rank"] = 0  # temporary
+        # ✅ For content prompts, apply base threshold
+        if not is_prompt_role_like:
+            if semantic_score < threshold:
+                continue
 
-            matched.append(cv)
+        # ✅ Score logic
+        if confidence >= semantic_score:
+            final_score = confidence
+            score_type = "Model Score"
+        else:
+            final_score = semantic_score
+            score_type = "Semantic Score"
 
-    # Sort by score descending and assign ranks
-    matched.sort(key=lambda x: x.get("score", 0), reverse=True)
+        matched.append({
+            "_id": cv_id,
+            "name": cv.get("name") or "Unnamed",
+            "predicted_role": cv.get("predicted_role") or "",
+            "experience": cv.get("experience") or 0,
+            "location": cv.get("location") or "N/A",
+            "email": cv.get("email", "N/A"),
+            "skills": cv.get("skills", []),
+            "resume_url": cv.get("resume_url", ""),
+            "semantic_score": semantic_score,
+            "confidence": confidence,
+            "score_type": score_type,
+            "final_score": final_score,
+            "rank": 0,
+            "raw_text": raw_text
+        })
+
+    matched.sort(key=lambda x: x["final_score"], reverse=True)
+
     for i, cv in enumerate(matched):
         cv["rank"] = i + 1
 

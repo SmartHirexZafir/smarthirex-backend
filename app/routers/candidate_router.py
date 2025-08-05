@@ -1,5 +1,3 @@
-# ✅ File: app/routers/candidate_router.py
-
 from fastapi import APIRouter, HTTPException, Path, Body
 from typing import Literal
 from app.utils.mongo import db
@@ -38,10 +36,17 @@ async def get_candidate(candidate_id: str = Path(...)):
     candidate.setdefault("rank", 0)
 
     # Contact & profile info
-    candidate.setdefault("avatar", "")
+    candidate.setdefault("name", "Unnamed Candidate")  # ✅ fallback
     candidate.setdefault("location", "N/A")
     candidate.setdefault("currentRole", "N/A")
     candidate.setdefault("company", "N/A")
+    candidate.setdefault("avatar", "")
+
+    # ✅ Ensure model output fields for UI
+    candidate.setdefault("category", candidate.get("predicted_role", ""))
+    candidate.setdefault("confidence", 0)
+    candidate.setdefault("match_reason", "ML classified")
+    candidate.setdefault("semantic_score", None)
 
     return candidate
 

@@ -20,52 +20,42 @@ def detect_usage_help(prompt: str) -> bool:
     ]
     return any(re.search(pattern, prompt) for pattern in help_patterns)
 
+def detect_show_all(prompt: str) -> bool:
+    """
+    Detects if the user wants to see all resumes, without any filter.
+    """
+    prompt = prompt.strip().lower()
+    return prompt in [
+        "show all",
+        "list all",
+        "show all candidates",
+        "list all resumes",
+        "display all",
+        "get all",
+        "sab dikhao",
+        "saare candidate"
+    ]
+
 def parse_prompt(prompt: str) -> dict:
     """
-    Parses the user's prompt to extract intent, skills, experience,
-    project keywords, and job role (if any).
+    Parses the user's prompt to detect intent.
     """
-    prompt = prompt.lower()
+    prompt = prompt.strip().lower()
 
     if detect_usage_help(prompt):
-        return {"intent": "usage_help", "query": prompt}
+        return {
+            "intent": "usage_help",
+            "query": prompt
+        }
 
-    # Default intent
-    intent = "filter_cv"
+    if detect_show_all(prompt):
+        return {
+            "intent": "show_all",
+            "query": prompt
+        }
 
-    # Skill keyword extraction
-    known_skills = [
-        "python", "java", "react", "node", "django", "sql", "aws",
-        "angular", "ml", "ai", "html", "css", "javascript", "flask", "express"
-    ]
-    skills = list(set([s for s in known_skills if s in prompt]))
-
-    # Experience extraction (e.g., "5 years", "3+ yrs", "5 saal")
-    exp_match = re.search(r"(\d+)\+?\s*(?:years|yrs|saal)?", prompt)
-    experience = exp_match.group(1) if exp_match else None
-
-    # Project keyword extraction — catch phrases like "AI project", "ecommerce", "chatbot"
-    project_keywords = re.findall(r"(?:project|kaam|worked on)\s+(?:in|with|on)?\s*([a-zA-Z0-9\-]+)", prompt)
-    if "ai" in prompt and "ai" not in project_keywords:
-        project_keywords.append("ai")
-    if "chatbot" in prompt and "chatbot" not in project_keywords:
-        project_keywords.append("chatbot")
-
-    # Job role extraction — loose detection from common dev roles
-    role_keywords = [
-        "developer", "engineer", "data scientist", "web developer",
-        "backend", "frontend", "full stack", "devops", "intern"
-    ]
-    job_role = None
-    for phrase in role_keywords:
-        if phrase in prompt:
-            job_role = phrase
-            break
-
+    # Default: semantic CV filtering
     return {
-        "intent": intent,
-        "skills": skills,
-        "experience": experience,
-        "project_keywords": project_keywords,
-        "job_role": job_role
+        "intent": "filter_cv",
+        "query": prompt
     }
