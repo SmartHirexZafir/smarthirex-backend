@@ -25,9 +25,16 @@ def extract_text_from_docx(content: bytes) -> str:
     with io.BytesIO(content) as f:
         return docx2txt.process(f)
 
+# ✅ Name extractor: NLP entity + regex fallback
 def extract_name(text: str) -> str:
+    doc = nlp(text)
+    names = [ent.text.strip() for ent in doc.ents if ent.label_ == "PERSON" and 2 <= len(ent.text.strip().split()) <= 4]
+    if names:
+        return names[0]
+
+    # Fallback to regex
     lines = text.strip().split("\n")
-    for line in lines[:5]:
+    for line in lines[:10]:
         line = line.strip()
         if re.match(r"^[A-Z][a-z]+(?: [A-Z][a-z]+)+$", line):
             return line
@@ -66,23 +73,42 @@ def extract_experience(text: str) -> int:
     calculated_years = round(total_months / 12)
     return max(max_years, calculated_years)
 
-# ✅ Project extractor (clean, short)
+# ✅ Structured project extractor
 def extract_projects(text: str) -> list:
-    project_sections = re.findall(r'(?:Project[s]?:?|Responsibilities:|Description:)[\s\S]{0,1000}', text, re.IGNORECASE)
+    raw_sections = re.findall(r'(?:Project[s]?:?|Responsibilities:|Description:)[\s\S]{0,800}', text, re.IGNORECASE)
     projects = []
-    for section in project_sections:
-        lines = section.strip().split("\n")
-        filtered = [line.strip() for line in lines if len(line.strip()) > 20]
-        if filtered:
-            clean = " ".join(filtered[:3]).lower()
-            projects.append(clean)
-    return projects
+    seen = set()
+    for section in raw_sections:
+        lines = [line.strip() for line in section.strip().split('\n') if len(line.strip()) > 20]
+        if lines:
+            name = lines[0][:80]
+            description = " ".join(lines[1:]).strip()
+            if name not in seen:
+                seen.add(name)
+                projects.append({
+                    "name": name,
+                    "description": description,
+                    "tech": []
+                })
+    return projects[:5]  # Limit to top 5 projects
 
+# ✅ Full summary extractor with NLP fallback
 def extract_summary(text: str) -> str:
-    summary_match = re.search(r"(?:Summary|Objective)[:\n\s]*(.*?)(?:Education|Experience|Projects|Skills|$)", text, re.IGNORECASE | re.DOTALL)
-    if summary_match:
-        summary = summary_match.group(1).strip().split('\n')[0]
-        return summary[:500]
+    match = re.search(
+        r"(Summary|Objective)[:\n\s]*(.*?)(?:\n\n|\n[A-Z][a-z]+:|\n[A-Z ]{3,}|Education|Experience|Projects|Skills|$)",
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if match:
+        return match.group(2).strip()[:600]
+
+    # NLP fallback: find first paragraph with 2+ verbs
+    paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip().split()) > 10]
+    for para in paragraphs:
+        doc = nlp(para)
+        verbs = [token for token in doc if token.pos_ == "VERB"]
+        if len(verbs) >= 2:
+            return para.strip()[:600]
     return ""
 
 def extract_education(text: str) -> list:
@@ -100,14 +126,14 @@ def extract_education(text: str) -> list:
     return results
 
 def extract_work_history(text: str) -> list:
-    jobs = re.findall(r"(?:Experience|Work)[\s\S]{0,800}", text, re.IGNORECASE)
+    jobs = re.findall(r"(?:Experience|Work)[\s\S]{0,1000}", text, re.IGNORECASE)
     results = []
     for job in jobs:
-        lines = job.split('\n')
-        for i in range(0, len(lines)-2, 3):
-            title = lines[i].strip()
-            company = lines[i+1].strip()
-            duration = lines[i+2].strip()
+        lines = [line.strip() for line in job.strip().split('\n') if line.strip()]
+        for i in range(0, len(lines) - 2, 3):
+            title = lines[i]
+            company = lines[i + 1]
+            duration = lines[i + 2]
             if len(title) > 2 and len(company) > 2 and len(duration) > 2:
                 results.append({
                     "title": title,
@@ -123,8 +149,6 @@ def extract_location(text: str) -> str:
     locations = [ent.text.strip() for ent in doc.ents if ent.label_ == "GPE"]
     if locations:
         return locations[0]
-    
-    # Fallback (common city pattern)
     match = re.search(r"\b(?:located in|from|based in)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", text)
     return match.group(1) if match else "N/A"
 
@@ -143,11 +167,11 @@ def extract_info(text: str) -> dict:
 
     return {
         "name": name or "Unnamed Candidate",
-        "email": email,
-        "phone": phone,
+        "email": email or None,
+        "phone": phone or None,
         "skills": skills or [],
         "experience": experience,
-        "projects": projects or [],
+        "projects": projects,
         "raw_text": text,
 
         "resume": {
