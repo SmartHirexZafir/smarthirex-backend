@@ -1,0 +1,948 @@
+{
+  "Accountant": [
+    {
+      "role": "Business Analyst",
+      "match": 56.85
+    },
+    {
+      "role": "Finance",
+      "match": 52.91
+    },
+    {
+      "role": "Banking",
+      "match": 51.41
+    },
+    {
+      "role": "Management",
+      "match": 44.82
+    },
+    {
+      "role": "Operations Manager",
+      "match": 43.45
+    }
+  ],
+  "Advocate": [
+    {
+      "role": "Education",
+      "match": 36.32
+    },
+    {
+      "role": "Consultant",
+      "match": 34.68
+    },
+    {
+      "role": "Management",
+      "match": 34.07
+    },
+    {
+      "role": "Public Relations",
+      "match": 31.56
+    },
+    {
+      "role": "BPO",
+      "match": 30.44
+    }
+  ],
+  "Agriculture": [
+    {
+      "role": "Education",
+      "match": 43.87
+    },
+    {
+      "role": "Finance",
+      "match": 37.97
+    },
+    {
+      "role": "Sales",
+      "match": 34.2
+    },
+    {
+      "role": "Management",
+      "match": 32.68
+    },
+    {
+      "role": "Food and Beverages",
+      "match": 32.32
+    }
+  ],
+  "Apparel": [
+    {
+      "role": "Sales",
+      "match": 38.79
+    },
+    {
+      "role": "Health and Fitness",
+      "match": 37.74
+    },
+    {
+      "role": "Automobile",
+      "match": 36.4
+    },
+    {
+      "role": "Arts",
+      "match": 35.01
+    },
+    {
+      "role": "Education",
+      "match": 34.33
+    }
+  ],
+  "Architecture": [
+    {
+      "role": "Designing",
+      "match": 61.32
+    },
+    {
+      "role": "Building and Construction",
+      "match": 55.92
+    },
+    {
+      "role": "Web Designing",
+      "match": 42.62
+    },
+    {
+      "role": "Arts",
+      "match": 42.44
+    },
+    {
+      "role": "Information Technology",
+      "match": 40.65
+    }
+  ],
+  "Arts": [
+    {
+      "role": "Education",
+      "match": 51.73
+    },
+    {
+      "role": "Designing",
+      "match": 46.74
+    },
+    {
+      "role": "Digital Media",
+      "match": 42.62
+    },
+    {
+      "role": "Architecture",
+      "match": 42.44
+    },
+    {
+      "role": "Human Resources",
+      "match": 37.81
+    }
+  ],
+  "Automobile": [
+    {
+      "role": "Aviation",
+      "match": 42.86
+    },
+    {
+      "role": "Finance",
+      "match": 42.19
+    },
+    {
+      "role": "Mechanical Engineer",
+      "match": 39.4
+    },
+    {
+      "role": "Education",
+      "match": 37.96
+    },
+    {
+      "role": "Apparel",
+      "match": 36.4
+    }
+  ],
+  "Aviation": [
+    {
+      "role": "Automobile",
+      "match": 42.86
+    },
+    {
+      "role": "Mechanical Engineer",
+      "match": 41.41
+    },
+    {
+      "role": "Operations Manager",
+      "match": 36.54
+    },
+    {
+      "role": "Civil Engineer",
+      "match": 36.29
+    },
+    {
+      "role": "Finance",
+      "match": 36.21
+    }
+  ],
+  "BPO": [
+    {
+      "role": "PMO",
+      "match": 59.58
+    },
+    {
+      "role": "Management",
+      "match": 43.23
+    },
+    {
+      "role": "Operations Manager",
+      "match": 39.46
+    },
+    {
+      "role": "Finance",
+      "match": 37.47
+    },
+    {
+      "role": "Sales",
+      "match": 34.14
+    }
+  ],
+  "Banking": [
+    {
+      "role": "Finance",
+      "match": 72.12
+    },
+    {
+      "role": "Accountant",
+      "match": 51.41
+    },
+    {
+      "role": "Blockchain",
+      "match": 43.87
+    },
+    {
+      "role": "Business Analyst",
+      "match": 39.22
+    },
+    {
+      "role": "Education",
+      "match": 35.33
+    }
+  ],
+  "Blockchain": [
+    {
+      "role": "Finance",
+      "match": 44.65
+    },
+    {
+      "role": "Banking",
+      "match": 43.87
+    },
+    {
+      "role": "Information Technology",
+      "match": 42.88
+    },
+    {
+      "role": "Accountant",
+      "match": 38.49
+    },
+    {
+      "role": "Sales",
+      "match": 34.42
+    }
+  ],
+  "Building and Construction": [
+    {
+      "role": "Architecture",
+      "match": 55.92
+    },
+    {
+      "role": "Designing",
+      "match": 51.21
+    },
+    {
+      "role": "Civil Engineer",
+      "match": 44.32
+    },
+    {
+      "role": "Mechanical Engineer",
+      "match": 36.45
+    },
+    {
+      "role": "Electrical Engineering",
+      "match": 34.31
+    }
+  ],
+  "Business Analyst": [
+    {
+      "role": "Accountant",
+      "match": 56.85
+    },
+    {
+      "role": "Consultant",
+      "match": 55.85
+    },
+    {
+      "role": "Finance",
+      "match": 47.99
+    },
+    {
+      "role": "Operations Manager",
+      "match": 46.77
+    },
+    {
+      "role": "Management",
+      "match": 45.22
+    }
+  ],
+  "Civil Engineer": [
+    {
+      "role": "Mechanical Engineer",
+      "match": 79.46
+    },
+    {
+      "role": "Electrical Engineering",
+      "match": 65.17
+    },
+    {
+      "role": "Network Security Engineer",
+      "match": 57.11
+    },
+    {
+      "role": "Building and Construction",
+      "match": 44.32
+    },
+    {
+      "role": "Operations Manager",
+      "match": 39.77
+    }
+  ],
+  "Consultant": [
+    {
+      "role": "Business Analyst",
+      "match": 55.85
+    },
+    {
+      "role": "Management",
+      "match": 49.0
+    },
+    {
+      "role": "Operations Manager",
+      "match": 44.06
+    },
+    {
+      "role": "Accountant",
+      "match": 43.18
+    },
+    {
+      "role": "Human Resources",
+      "match": 42.8
+    }
+  ],
+  "Data Science": [
+    {
+      "role": "Information Technology",
+      "match": 53.76
+    },
+    {
+      "role": "Database",
+      "match": 51.84
+    },
+    {
+      "role": "SQL Developer",
+      "match": 41.59
+    },
+    {
+      "role": "Business Analyst",
+      "match": 39.72
+    },
+    {
+      "role": "Digital Media",
+      "match": 38.92
+    }
+  ],
+  "Database": [
+    {
+      "role": "SQL Developer",
+      "match": 52.56
+    },
+    {
+      "role": "Data Science",
+      "match": 51.84
+    },
+    {
+      "role": "Information Technology",
+      "match": 36.81
+    },
+    {
+      "role": "Architecture",
+      "match": 33.35
+    },
+    {
+      "role": "Management",
+      "match": 32.19
+    }
+  ],
+  "Designing": [
+    {
+      "role": "Web Designing",
+      "match": 70.94
+    },
+    {
+      "role": "Architecture",
+      "match": 61.32
+    },
+    {
+      "role": "Building and Construction",
+      "match": 51.21
+    },
+    {
+      "role": "Arts",
+      "match": 46.74
+    },
+    {
+      "role": "Information Technology",
+      "match": 41.95
+    }
+  ],
+  "DevOps": [
+    {
+      "role": "DotNet Developer",
+      "match": 45.43
+    },
+    {
+      "role": "SAP Developer",
+      "match": 42.35
+    },
+    {
+      "role": "SQL Developer",
+      "match": 41.41
+    },
+    {
+      "role": "React Developer",
+      "match": 40.63
+    },
+    {
+      "role": "Java Developer",
+      "match": 39.91
+    }
+  ],
+  "Digital Media": [
+    {
+      "role": "Information Technology",
+      "match": 55.07
+    },
+    {
+      "role": "Arts",
+      "match": 42.62
+    },
+    {
+      "role": "Data Science",
+      "match": 38.92
+    },
+    {
+      "role": "Education",
+      "match": 35.5
+    },
+    {
+      "role": "Public Relations",
+      "match": 34.69
+    }
+  ],
+  "DotNet Developer": [
+    {
+      "role": "Python Developer",
+      "match": 49.39
+    },
+    {
+      "role": "Java Developer",
+      "match": 46.78
+    },
+    {
+      "role": "SQL Developer",
+      "match": 46.53
+    },
+    {
+      "role": "ETL Developer",
+      "match": 45.59
+    },
+    {
+      "role": "DevOps",
+      "match": 45.43
+    }
+  ],
+  "ETL Developer": [
+    {
+      "role": "SAP Developer",
+      "match": 51.84
+    },
+    {
+      "role": "Python Developer",
+      "match": 50.53
+    },
+    {
+      "role": "SQL Developer",
+      "match": 47.6
+    },
+    {
+      "role": "Java Developer",
+      "match": 47.43
+    },
+    {
+      "role": "DotNet Developer",
+      "match": 45.59
+    }
+  ],
+  "Education": [
+    {
+      "role": "Arts",
+      "match": 51.73
+    },
+    {
+      "role": "Management",
+      "match": 46.78
+    },
+    {
+      "role": "Agriculture",
+      "match": 43.87
+    },
+    {
+      "role": "Mechanical Engineer",
+      "match": 43.17
+    },
+    {
+      "role": "Finance",
+      "match": 42.71
+    }
+  ],
+  "Electrical Engineering": [
+    {
+      "role": "Civil Engineer",
+      "match": 65.17
+    },
+    {
+      "role": "Mechanical Engineer",
+      "match": 62.74
+    },
+    {
+      "role": "Network Security Engineer",
+      "match": 48.98
+    },
+    {
+      "role": "Education",
+      "match": 37.66
+    },
+    {
+      "role": "Designing",
+      "match": 35.46
+    }
+  ],
+  "Finance": [
+    {
+      "role": "Banking",
+      "match": 72.12
+    },
+    {
+      "role": "Accountant",
+      "match": 52.91
+    },
+    {
+      "role": "Business Analyst",
+      "match": 47.99
+    },
+    {
+      "role": "Blockchain",
+      "match": 44.65
+    },
+    {
+      "role": "Sales",
+      "match": 43.8
+    }
+  ],
+  "Food and Beverages": [
+    {
+      "role": "Health and Fitness",
+      "match": 34.62
+    },
+    {
+      "role": "Apparel",
+      "match": 33.95
+    },
+    {
+      "role": "Agriculture",
+      "match": 32.32
+    },
+    {
+      "role": "Automobile",
+      "match": 26.53
+    },
+    {
+      "role": "Finance",
+      "match": 26.34
+    }
+  ],
+  "Health and Fitness": [
+    {
+      "role": "Apparel",
+      "match": 37.74
+    },
+    {
+      "role": "Food and Beverages",
+      "match": 34.62
+    },
+    {
+      "role": "Education",
+      "match": 31.93
+    },
+    {
+      "role": "Arts",
+      "match": 30.07
+    },
+    {
+      "role": "Aviation",
+      "match": 28.17
+    }
+  ],
+  "Human Resources": [
+    {
+      "role": "Management",
+      "match": 49.73
+    },
+    {
+      "role": "Public Relations",
+      "match": 44.42
+    },
+    {
+      "role": "Consultant",
+      "match": 42.8
+    },
+    {
+      "role": "Education",
+      "match": 42.45
+    },
+    {
+      "role": "Arts",
+      "match": 37.81
+    }
+  ],
+  "Information Technology": [
+    {
+      "role": "Digital Media",
+      "match": 55.07
+    },
+    {
+      "role": "Data Science",
+      "match": 53.76
+    },
+    {
+      "role": "Web Designing",
+      "match": 44.75
+    },
+    {
+      "role": "Management",
+      "match": 43.02
+    },
+    {
+      "role": "Blockchain",
+      "match": 42.88
+    }
+  ],
+  "Java Developer": [
+    {
+      "role": "SAP Developer",
+      "match": 56.01
+    },
+    {
+      "role": "SQL Developer",
+      "match": 52.96
+    },
+    {
+      "role": "React Developer",
+      "match": 49.67
+    },
+    {
+      "role": "Python Developer",
+      "match": 49.0
+    },
+    {
+      "role": "ETL Developer",
+      "match": 47.43
+    }
+  ],
+  "Management": [
+    {
+      "role": "Operations Manager",
+      "match": 65.0
+    },
+    {
+      "role": "Human Resources",
+      "match": 49.73
+    },
+    {
+      "role": "Consultant",
+      "match": 49.0
+    },
+    {
+      "role": "Education",
+      "match": 46.78
+    },
+    {
+      "role": "Business Analyst",
+      "match": 45.22
+    }
+  ],
+  "Mechanical Engineer": [
+    {
+      "role": "Civil Engineer",
+      "match": 79.46
+    },
+    {
+      "role": "Electrical Engineering",
+      "match": 62.74
+    },
+    {
+      "role": "Network Security Engineer",
+      "match": 53.6
+    },
+    {
+      "role": "Education",
+      "match": 43.17
+    },
+    {
+      "role": "Aviation",
+      "match": 41.41
+    }
+  ],
+  "Network Security Engineer": [
+    {
+      "role": "Civil Engineer",
+      "match": 57.11
+    },
+    {
+      "role": "Mechanical Engineer",
+      "match": 53.6
+    },
+    {
+      "role": "Electrical Engineering",
+      "match": 48.98
+    },
+    {
+      "role": "Operations Manager",
+      "match": 45.75
+    },
+    {
+      "role": "Java Developer",
+      "match": 43.11
+    }
+  ],
+  "Operations Manager": [
+    {
+      "role": "Management",
+      "match": 65.0
+    },
+    {
+      "role": "Business Analyst",
+      "match": 46.77
+    },
+    {
+      "role": "Network Security Engineer",
+      "match": 45.75
+    },
+    {
+      "role": "Consultant",
+      "match": 44.06
+    },
+    {
+      "role": "Accountant",
+      "match": 43.45
+    }
+  ],
+  "PMO": [
+    {
+      "role": "BPO",
+      "match": 59.58
+    },
+    {
+      "role": "Management",
+      "match": 33.11
+    },
+    {
+      "role": "Finance",
+      "match": 29.07
+    },
+    {
+      "role": "Sales",
+      "match": 27.32
+    },
+    {
+      "role": "Blockchain",
+      "match": 25.72
+    }
+  ],
+  "Public Relations": [
+    {
+      "role": "Human Resources",
+      "match": 44.42
+    },
+    {
+      "role": "Education",
+      "match": 38.15
+    },
+    {
+      "role": "Information Technology",
+      "match": 37.07
+    },
+    {
+      "role": "Management",
+      "match": 36.27
+    },
+    {
+      "role": "Data Science",
+      "match": 35.02
+    }
+  ],
+  "Python Developer": [
+    {
+      "role": "ETL Developer",
+      "match": 50.53
+    },
+    {
+      "role": "DotNet Developer",
+      "match": 49.39
+    },
+    {
+      "role": "Java Developer",
+      "match": 49.0
+    },
+    {
+      "role": "SQL Developer",
+      "match": 47.63
+    },
+    {
+      "role": "SAP Developer",
+      "match": 43.86
+    }
+  ],
+  "React Developer": [
+    {
+      "role": "Java Developer",
+      "match": 49.67
+    },
+    {
+      "role": "Python Developer",
+      "match": 43.14
+    },
+    {
+      "role": "SAP Developer",
+      "match": 41.11
+    },
+    {
+      "role": "DevOps",
+      "match": 40.63
+    },
+    {
+      "role": "ETL Developer",
+      "match": 38.59
+    }
+  ],
+  "SAP Developer": [
+    {
+      "role": "SQL Developer",
+      "match": 59.97
+    },
+    {
+      "role": "Java Developer",
+      "match": 56.01
+    },
+    {
+      "role": "ETL Developer",
+      "match": 51.84
+    },
+    {
+      "role": "Python Developer",
+      "match": 43.86
+    },
+    {
+      "role": "DevOps",
+      "match": 42.35
+    }
+  ],
+  "SQL Developer": [
+    {
+      "role": "SAP Developer",
+      "match": 59.97
+    },
+    {
+      "role": "Java Developer",
+      "match": 52.96
+    },
+    {
+      "role": "Database",
+      "match": 52.56
+    },
+    {
+      "role": "Python Developer",
+      "match": 47.63
+    },
+    {
+      "role": "ETL Developer",
+      "match": 47.6
+    }
+  ],
+  "Sales": [
+    {
+      "role": "Management",
+      "match": 44.41
+    },
+    {
+      "role": "Finance",
+      "match": 43.8
+    },
+    {
+      "role": "Accountant",
+      "match": 38.81
+    },
+    {
+      "role": "Apparel",
+      "match": 38.79
+    },
+    {
+      "role": "Automobile",
+      "match": 36.12
+    }
+  ],
+  "Testing": [
+    {
+      "role": "Education",
+      "match": 29.6
+    },
+    {
+      "role": "Management",
+      "match": 28.57
+    },
+    {
+      "role": "Advocate",
+      "match": 28.23
+    },
+    {
+      "role": "Data Science",
+      "match": 27.84
+    },
+    {
+      "role": "Banking",
+      "match": 25.53
+    }
+  ],
+  "Web Designing": [
+    {
+      "role": "Designing",
+      "match": 70.94
+    },
+    {
+      "role": "Information Technology",
+      "match": 44.75
+    },
+    {
+      "role": "Architecture",
+      "match": 42.62
+    },
+    {
+      "role": "Java Developer",
+      "match": 37.62
+    },
+    {
+      "role": "Data Science",
+      "match": 33.74
+    }
+  ]
+}

@@ -47,7 +47,7 @@ def extract_skills(text: str) -> list:
     doc = nlp(text.lower())
     tokens = set(token.text for token in doc if not token.is_stop and not token.is_punct)
     matched = KNOWN_SKILLS.intersection(tokens)
-    return list(sorted(matched))
+    return sorted(list(matched))
 
 def extract_experience(text: str) -> int:
     year_match = re.findall(r"(\d+)[+\s]*(?:years|yrs)[\s\w]*experience", text, re.IGNORECASE)
@@ -66,6 +66,7 @@ def extract_experience(text: str) -> int:
     calculated_years = round(total_months / 12)
     return max(max_years, calculated_years)
 
+# ✅ Project extractor (clean, short)
 def extract_projects(text: str) -> list:
     project_sections = re.findall(r'(?:Project[s]?:?|Responsibilities:|Description:)[\s\S]{0,1000}', text, re.IGNORECASE)
     projects = []
@@ -73,7 +74,8 @@ def extract_projects(text: str) -> list:
         lines = section.strip().split("\n")
         filtered = [line.strip() for line in lines if len(line.strip()) > 20]
         if filtered:
-            projects.append(" ".join(filtered[:3]))
+            clean = " ".join(filtered[:3]).lower()
+            projects.append(clean)
     return projects
 
 def extract_summary(text: str) -> str:
@@ -115,14 +117,18 @@ def extract_work_history(text: str) -> list:
                 })
     return results
 
-# ✅ NEW: Extracts first found location using NLP (GPE entities)
+# ✅ NLP + fallback for location
 def extract_location(text: str) -> str:
     doc = nlp(text)
-    for ent in doc.ents:
-        if ent.label_ == "GPE":  # Geo-Political Entity
-            return ent.text
-    return "N/A"
+    locations = [ent.text.strip() for ent in doc.ents if ent.label_ == "GPE"]
+    if locations:
+        return locations[0]
+    
+    # Fallback (common city pattern)
+    match = re.search(r"\b(?:located in|from|based in)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", text)
+    return match.group(1) if match else "N/A"
 
+# ✅ Master extractor — resume → structured dict
 def extract_info(text: str) -> dict:
     name = extract_name(text)
     email = extract_email(text)
@@ -133,22 +139,22 @@ def extract_info(text: str) -> dict:
     summary = extract_summary(text)
     education = extract_education(text)
     workHistory = extract_work_history(text)
-    location = extract_location(text)  # ✅ new
+    location = extract_location(text)
 
     return {
-        "name": name or "Unnamed Candidate",  # ✅ fallback for missing names
+        "name": name or "Unnamed Candidate",
         "email": email,
         "phone": phone,
-        "skills": skills,
+        "skills": skills or [],
         "experience": experience,
-        "projects": projects,
+        "projects": projects or [],
         "raw_text": text,
 
         "resume": {
             "summary": summary,
             "education": education,
             "workHistory": workHistory,
-            "projects": projects,
+            "projects": projects
         },
         "currentRole": workHistory[0]["title"] if workHistory else "N/A",
         "company": workHistory[0]["company"] if workHistory else "N/A",
