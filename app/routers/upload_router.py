@@ -32,7 +32,7 @@ async def upload_resumes(files: List[UploadFile] = File(...)):
         confidence = model.predict_proba(features)[0].max()
         predicted_label = label_encoder.inverse_transform(prediction)[0]
 
-        # ✅ Generate unique ID & safe fallback values
+        # ✅ Assign required metadata
         resume_data["_id"] = str(uuid.uuid4())
         resume_data["content_hash"] = compute_cv_hash(raw_text)
         resume_data["predicted_role"] = predicted_label
@@ -44,20 +44,32 @@ async def upload_resumes(files: List[UploadFile] = File(...)):
         resume_data["location"] = resume_data.get("location") or "N/A"
         resume_data["raw_text"] = raw_text
 
-        # ✅ Add common fields if missing
-        resume_data["email"] = resume_data.get("email") or "unknown@example.com"
-        resume_data["phone"] = resume_data.get("phone") or "N/A"
+        # ✅ Ensure required profile fields
+        resume_data["email"] = resume_data.get("email") or None
+        resume_data["phone"] = resume_data.get("phone") or None
         resume_data["skills"] = resume_data.get("skills") or []
         resume_data["resume_url"] = resume_data.get("resume_url", "")  # optional
+        resume_data["currentRole"] = resume_data.get("currentRole") or "N/A"
+        resume_data["company"] = resume_data.get("company") or "N/A"
 
-        # 🧹 Remove any old/unnecessary analysis keys
+        # ✅ Ensure resume subfields (summary, education, workHistory, projects)
+        resume_data["resume"] = resume_data.get("resume", {})
+        resume = resume_data["resume"]
+        resume["summary"] = resume.get("summary", "")
+        resume["education"] = resume.get("education", [])
+        resume["workHistory"] = resume.get("workHistory", [])
+        resume["projects"] = resume.get("projects", [])
+        resume["filename"] = file.filename
+        resume["url"] = resume_data.get("resume_url", "")
+
+        # 🧹 Remove outdated fields if exist
         for key in ["matchedSkills", "missingSkills", "score", "testScore", "rank", "filter_skills"]:
             resume_data.pop(key, None)
 
         # ✅ Save to database
         await db.parsed_resumes.insert_one(resume_data)
 
-        # ✅ Return safe fields to frontend
+        # ✅ Minimal safe fields for frontend
         parsed_resumes.append({
             "_id": resume_data["_id"],
             "name": resume_data["name"],

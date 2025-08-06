@@ -14,7 +14,7 @@ async def get_candidate(candidate_id: str = Path(...)):
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    # Ensure resume structure
+    # Resume object & defaults
     candidate.setdefault("resume", {})
     resume = candidate["resume"]
 
@@ -25,28 +25,28 @@ async def get_candidate(candidate_id: str = Path(...)):
     resume.setdefault("filename", candidate.get("filename", "resume.pdf"))
     resume.setdefault("url", candidate.get("resume_url", ""))  # Optional: download link
 
-    # Defaults for analysis
-    candidate.setdefault("score", 0)
-    candidate.setdefault("testScore", 0)
-    candidate.setdefault("matchedSkills", [])
-    candidate.setdefault("missingSkills", [])
-    candidate.setdefault("strengths", [])
-    candidate.setdefault("redFlags", [])
-    candidate.setdefault("selectionReason", "")
-    candidate.setdefault("rank", 0)
+    # Analysis fields
+    candidate["score"] = candidate.get("score", 0)
+    candidate["testScore"] = candidate.get("testScore", 0)
+    candidate["matchedSkills"] = candidate.get("matchedSkills", [])
+    candidate["missingSkills"] = candidate.get("missingSkills", [])
+    candidate["strengths"] = candidate.get("strengths", [])
+    candidate["redFlags"] = candidate.get("redFlags", [])
+    candidate["selectionReason"] = candidate.get("selectionReason", "")
+    candidate["rank"] = candidate.get("rank", 0)
 
-    # Contact & profile info
-    candidate.setdefault("name", "Unnamed Candidate")  # ✅ fallback
-    candidate.setdefault("location", "N/A")
-    candidate.setdefault("currentRole", "N/A")
-    candidate.setdefault("company", "N/A")
-    candidate.setdefault("avatar", "")
+    # Profile info
+    candidate["name"] = candidate.get("name", "Unnamed Candidate")
+    candidate["location"] = candidate.get("location", "N/A")
+    candidate["currentRole"] = candidate.get("currentRole", "N/A")
+    candidate["company"] = candidate.get("company", "N/A")
+    candidate["avatar"] = candidate.get("avatar", "")
 
-    # ✅ Ensure model output fields for UI
-    candidate.setdefault("category", candidate.get("predicted_role", ""))
-    candidate.setdefault("confidence", 0)
-    candidate.setdefault("match_reason", "ML classified")
-    candidate.setdefault("semantic_score", None)
+    # Model output fields
+    candidate["category"] = candidate.get("category") or candidate.get("predicted_role", "")
+    candidate["confidence"] = candidate.get("confidence", 0)
+    candidate["match_reason"] = candidate.get("match_reason", "ML classified")
+    candidate["semantic_score"] = candidate.get("semantic_score", None)
 
     return candidate
 
