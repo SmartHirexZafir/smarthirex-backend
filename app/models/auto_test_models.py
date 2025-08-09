@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 # -------------------------
-# Your original models (unchanged)
+# Your original models (extended without breaking changes)
 # -------------------------
 
 class Candidate(BaseModel):
@@ -30,6 +30,8 @@ class TestQuestion(BaseModel):
     question: str
     options: Optional[List[str]] = None
     correct_answer: Optional[str] = None  # for mcq -> string; for others -> None
+    # NEW: carry difficulty for MCQs when present (safe, optional)
+    difficulty: Optional[str] = Field(default=None, description="MCQ difficulty: easy|medium|hard|expert")
 
 
 class TestSubmission(BaseModel):
@@ -51,6 +53,13 @@ class TestInviteCreate(BaseModel):
     subject: Optional[str] = "Your SmartHirex Assessment"
     # Optional custom HTML; the backend replaces {TEST_LINK} or {{TEST_LINK}} with the real link.
     body_html: Optional[str] = None
+    # NEW: allow the sender to choose the number of questions
+    question_count: Optional[int] = Field(
+        default=4,
+        ge=1,
+        le=50,
+        description="Desired number of questions (1–50). Defaults to 4."
+    )
 
 
 class TestInviteOut(BaseModel):
@@ -60,6 +69,11 @@ class TestInviteOut(BaseModel):
     email: str
     sent: bool
     expires_at: datetime
+    # NEW: echo back what was stored for transparency
+    question_count: Optional[int] = Field(
+        default=None,
+        description="Number of questions stored on the invite (if provided)."
+    )
 
 
 # -- Start Test --

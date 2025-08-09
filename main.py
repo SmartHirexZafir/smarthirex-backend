@@ -61,6 +61,7 @@ app.include_router(candidate_router.router, prefix="/candidate")
 app.include_router(tests_router, prefix="/tests")
 
 # ✅ (Optional) Proctor router
+# NOTE: The router itself has NO internal prefix now; we add it here only once.
 if proctor_router:
     app.include_router(proctor_router, prefix="/proctor")
 

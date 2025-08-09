@@ -21,7 +21,6 @@ router = APIRouter()
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
 TEST_TOKEN_EXPIRY_MINUTES = int(os.getenv("TEST_TOKEN_EXPIRY_MINUTES", "60"))
 
-
 # ---------- helpers ----------
 
 def _extract_int_years(value: Optional[str]) -> int:
@@ -73,12 +72,26 @@ def _experience_string_from_doc(doc: dict) -> str:
     return f"{years} years"
 
 
+def _sanitize_question_count(n: Optional[int]) -> int:
+    """
+    Clamp to a safe range; default to 4 if not provided.
+    """
+    try:
+        v = int(n or 4)
+    except Exception:
+        v = 4
+    # sensible bounds so users can’t request 1000 questions
+    return max(1, min(50, v))
+
+
 # ---------- request/response models ----------
 
 class InviteRequest(BaseModel):
     candidate_id: str = Field(..., description="Candidate _id from parsed_resumes")
     subject: Optional[str] = "Your SmartHirex Assessment"
     body_html: Optional[str] = None  # optional custom HTML; {TEST_LINK} will be replaced
+    # NEW: allow sender to choose number of questions
+    question_count: Optional[int] = Field(default=4, ge=1, le=50)
 
 
 class InviteResponse(BaseModel):
@@ -135,6 +148,8 @@ async def create_invite(req: InviteRequest):
     expires_at = datetime.utcnow() + timedelta(minutes=TEST_TOKEN_EXPIRY_MINUTES)
     test_link = f"{FRONTEND_BASE_URL.rstrip('/')}/test/{token}"
 
+    question_count = _sanitize_question_count(req.question_count)
+
     invite_doc = {
         "_id": uuid.uuid4().hex,
         "candidateId": candidate["_id"],
@@ -146,6 +161,8 @@ async def create_invite(req: InviteRequest):
         "token": token,
         "expiresAt": expires_at,
         "createdAt": datetime.utcnow(),
+        # NEW
+        "questionCount": question_count,
     }
     await db.test_invites.insert_one(invite_doc)
 
@@ -192,7 +209,9 @@ async def start_test(req: StartTestRequest):
         job_role=_role_from_candidate_doc(candidate),
     )
 
-    questions = generate_test(candidate_model)
+    # NEW: honor the sender-selected question count (default 4)
+    question_count = _sanitize_question_count(invite.get("questionCount", 4))
+    questions = generate_test(candidate_model, question_count=question_count)
 
     test_doc = {
         "_id": uuid.uuid4().hex,
@@ -202,6 +221,8 @@ async def start_test(req: StartTestRequest):
         "questions": questions,
         "status": "active",
         "startedAt": datetime.utcnow(),
+        # NEW: store the count on the test doc as well
+        "questionCount": question_count,
     }
     await db.tests.insert_one(test_doc)
 
