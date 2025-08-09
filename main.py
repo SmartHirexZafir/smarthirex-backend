@@ -11,6 +11,16 @@ from app.routers import history_router
 from app.routers import candidate_router
 from app.utils.mongo import verify_mongo_connection  # ✅ DB check
 
+# NEW: tests router (email invites + test lifecycle)
+from app.routers.tests_router import router as tests_router
+
+# Optional: proctoring endpoints (start/heartbeat/snapshot/end)
+# If you haven't added the file, you can comment the two lines below.
+try:
+    from app.routers.proctor_router import router as proctor_router
+except Exception:
+    proctor_router = None  # graceful if file not present
+
 import uvicorn
 import os
 
@@ -22,8 +32,14 @@ app = FastAPI(
 
 # ✅ CORS for frontend
 origins = [
-    "http://localhost:3000",  # adjust if needed
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
 ]
+
+# Optionally add FRONTEND_BASE_URL from .env without breaking existing list
+_frontend_env = os.getenv("FRONTEND_BASE_URL")
+if _frontend_env and _frontend_env not in origins:
+    origins.append(_frontend_env)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,13 +49,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Register API routers
+# ✅ Register API routers (existing)
 app.include_router(chatbot_router, prefix="/chatbot")
 app.include_router(auto_test_router, prefix="/auto-test")
 app.include_router(upload_router, prefix="/upload")
 app.include_router(auth_router.router, prefix="/auth")
 app.include_router(history_router.router, prefix="/history")
 app.include_router(candidate_router.router, prefix="/candidate")
+
+# ✅ Register NEW tests router
+app.include_router(tests_router, prefix="/tests")
+
+# ✅ (Optional) Proctor router
+if proctor_router:
+    app.include_router(proctor_router, prefix="/proctor")
 
 # ✅ Confirm MongoDB connection at startup
 @app.on_event("startup")
