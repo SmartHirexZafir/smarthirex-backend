@@ -5,12 +5,16 @@ import base64
 import datetime as dt
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.utils.mongo import get_db  # <-- adjust if your helper has a different name
+# Use the same DB handle style as the rest of your app (tests_router, etc.)
+from app.utils.mongo import db  # AsyncIOMotorDatabase
 
-router = APIRouter(prefix="/proctor", tags=["proctoring"])
+# IMPORTANT:
+# Do NOT set a prefix here, because main.py already includes this router with prefix="/proctor".
+# Having a prefix in both places causes routes like "/proctor/proctor/start" -> 404.
+router = APIRouter(tags=["proctoring"])
 
 
 # ---------- Pydantic models ----------
@@ -70,7 +74,6 @@ async def start_proctoring(req: StartProctorRequest):
     """
     Create a proctoring session for a given test & candidate.
     """
-    db = await get_db()
     started_at = _now_iso()
 
     doc = {
@@ -91,10 +94,9 @@ async def start_proctoring(req: StartProctorRequest):
 async def heartbeat(req: HeartbeatRequest):
     """
     Update the session's last-seen timestamp and (optionally) visibility/focus status.
+    Accepts either the stringified ObjectId or the raw ObjectId.
     """
-    db = await get_db()
     now = _now_iso()
-
     update = {
         "$set": {
             "last_heartbeat_at": now,
@@ -103,10 +105,11 @@ async def heartbeat(req: HeartbeatRequest):
         }
     }
 
+    # Try with plain string id (in case session_id is stored as a string)
     result = await db.proctor_sessions.update_one({"_id": req.session_id}, update)
-    # If _id is an ObjectId in your DB, adapt this query to convert to ObjectId
+
     if result.matched_count == 0:
-        # Try ObjectId fallback if needed
+        # Try ObjectId form (most likely)
         try:
             from bson import ObjectId
             result = await db.proctor_sessions.update_one({"_id": ObjectId(req.session_id)}, update)
@@ -123,9 +126,8 @@ async def heartbeat(req: HeartbeatRequest):
 async def snapshot(req: SnapshotRequest):
     """
     Receive a base64-encoded image and store it as part of the session.
+    Accepts either the stringified ObjectId or the raw ObjectId as session_id.
     """
-    db = await get_db()
-
     # Confirm session exists & active
     session = await db.proctor_sessions.find_one({"_id": req.session_id})
     if not session:
@@ -173,11 +175,9 @@ async def snapshot(req: SnapshotRequest):
 @router.post("/end")
 async def end_proctoring(req: EndProctorRequest):
     """
-    Close a session (mark inactive).
+    Close a session (mark inactive). Accepts either the stringified ObjectId or the raw ObjectId.
     """
-    db = await get_db()
     now = _now_iso()
-
     update = {
         "$set": {
             "ended_at": now,
