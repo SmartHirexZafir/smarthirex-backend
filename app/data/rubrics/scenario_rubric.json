@@ -1,0 +1,70 @@
+{
+  "metadata": {
+    "version": "1.0",
+    "description": "Rubrics for scenario-based and free-form test questions",
+    "last_updated": "2025-08-11",
+    "scoring_scale": "0-5 per criterion (0 = not addressed, 5 = fully met)"
+  },
+  "rubrics": [
+    {
+      "question_id": "scenario_network_outage",
+      "title": "Responding to a Network Outage",
+      "criteria": [
+        {
+          "id": "identification",
+          "description": "Identifies the likely cause(s) of the outage accurately",
+          "weight": 0.25,
+          "keywords": ["router", "switch", "DNS", "ISP", "connectivity"]
+        },
+        {
+          "id": "resolution_steps",
+          "description": "Outlines clear, logical steps to resolve the outage",
+          "weight": 0.35,
+          "keywords": ["restart", "check cables", "ping", "diagnose", "replace hardware"]
+        },
+        {
+          "id": "communication",
+          "description": "Includes effective communication with stakeholders during the outage",
+          "weight": 0.2,
+          "keywords": ["notify", "status update", "incident report", "ETA"]
+        },
+        {
+          "id": "prevention",
+          "description": "Suggests preventative measures for future outages",
+          "weight": 0.2,
+          "keywords": ["redundancy", "backup", "monitoring", "training"]
+        }
+      ]
+    },
+    {
+      "question_id": "scenario_data_breach",
+      "title": "Handling a Data Breach",
+      "criteria": [
+        {
+          "id": "containment",
+          "description": "Details immediate steps to contain the breach",
+          "weight": 0.3,
+          "keywords": ["isolate", "disconnect", "quarantine", "patch"]
+        },
+        {
+          "id": "investigation",
+          "description": "Outlines how to investigate the scope and cause of the breach",
+          "weight": 0.3,
+          "keywords": ["logs", "forensics", "audit", "access records"]
+        },
+        {
+          "id": "notification",
+          "description": "Specifies communication to affected parties and regulators",
+          "weight": 0.2,
+          "keywords": ["notify", "regulation", "GDPR", "compliance"]
+        },
+        {
+          "id": "future_prevention",
+          "description": "Proposes measures to prevent future breaches",
+          "weight": 0.2,
+          "keywords": ["training", "encryption", "access control", "monitoring"]
+        }
+      ]
+    }
+  ]
+}
