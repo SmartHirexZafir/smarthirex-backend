@@ -20,10 +20,12 @@ import os
 import ssl
 import smtplib
 import mimetypes
+import re
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Union
 import asyncio
+import html as html_unescape_mod
 
 
 def _env(name: str, default: Optional[str] = None) -> str:
@@ -53,6 +55,60 @@ def _normalize_addresses(addr: Optional[Address]) -> list[str]:
     if isinstance(addr, str):
         return [addr]
     return [a for a in addr if a]
+
+
+def _strip_tags(s: str) -> str:
+    """Very small tag stripper for fallback."""
+    return re.sub(r"<[^>]+>", "", s)
+
+
+def _html_to_text(html: str) -> str:
+    """
+    Lightweight HTML -> plain text converter for email text part.
+    - <br> -> newline
+    - </p> -> blank line
+    - <a href="URL">label</a> -> "label (URL)"
+    - remove remaining tags
+    - unescape HTML entities
+    """
+    if not isinstance(html, str):
+        return ""
+
+    # Normalize newlines for common block elements
+    # <br> → \n
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+
+    # paragraphs → blank line
+    html = re.sub(r"</p\s*>", "\n\n", html, flags=re.I)
+
+    # links → label (href)
+    def _a_sub(m: re.Match) -> str:
+        href = (m.group(1) or "").strip()
+        inner = (m.group(2) or "").strip()
+        # if no label, just return href
+        if inner:
+            return f"{inner} ({href})" if href else inner
+        return href
+
+    html = re.sub(
+        r'<a[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        _a_sub,
+        html,
+        flags=re.I | re.S,
+    )
+
+    # Remove other tags
+    html = _strip_tags(html)
+
+    # Collapse excessive whitespace
+    html = re.sub(r"[ \t]+\n", "\n", html)
+    html = re.sub(r"\n{3,}", "\n\n", html)
+
+    # Unescape entities (&amp; → &)
+    html = html_unescape_mod.unescape(html)
+
+    # Trim
+    return html.strip()
 
 
 def build_message(
@@ -87,8 +143,9 @@ def build_message(
     if reply_to:
         msg["Reply-To"] = reply_to
 
-    if not text:
-        text = "Your email client does not support HTML. Please view this message in an HTML-capable client."
+    # Build text part (fallback to HTML→text)
+    text = text or _html_to_text(html) or "Your email client does not support HTML."
+
     msg.set_content(text)
     msg.add_alternative(html, subtype="html")
 
@@ -104,7 +161,9 @@ def build_message(
             msg.add_attachment(fp.read(), maintype=maintype, subtype=subtype, filename=p.name)
 
     if bcc_list:
+        # keep Bcc out of headers; track via X-Bcc then remove before send
         msg["X-Bcc"] = ", ".join(bcc_list)
+
     return msg
 
 

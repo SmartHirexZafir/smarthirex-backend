@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
-from typing import Optional
+from typing import Optional, Any, Dict
+from fastapi import Body
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 # Use the same DB handle style as the rest of your app (tests_router, etc.)
 from app.utils.mongo import db  # AsyncIOMotorDatabase
@@ -22,6 +23,8 @@ router = APIRouter(tags=["proctoring"])
 class StartProctorRequest(BaseModel):
     test_id: str = Field(..., description="ID of the test")
     candidate_id: str = Field(..., description="Candidate ID")
+    # Optional token (frontend may pass it; we just store for traceability)
+    token: Optional[str] = Field(None, description="Optional association token")
 
 
 class StartProctorResponse(BaseModel):
@@ -29,11 +32,45 @@ class StartProctorResponse(BaseModel):
     started_at: str
 
 
-class HeartbeatRequest(BaseModel):
-    session_id: str = Field(..., description="Proctoring session ID")
-    # optional extra client telemetry
+class HeartbeatLegacy(BaseModel):
+    """
+    Legacy heartbeat shape (from original ProctorGuard.tsx):
+    { session_id: str, page_visible?: bool, focused?: bool }
+    """
+    session_id: Optional[str] = Field(None, description="Proctoring session ID")
     page_visible: Optional[bool] = True
     focused: Optional[bool] = True
+
+
+class HeartbeatBeacon(BaseModel):
+    """
+    New heartbeat shape (from ProctorHeartbeat.ts):
+    {
+      testSessionId?: string,
+      userId?: string,
+      ts?: string,
+      pageUrl?: string,
+      status?: "ok"|"degraded"|"idle"|"error",
+      camera?: object,
+      extra?: { session_id?: string, ... }
+    }
+    """
+    testSessionId: Optional[str] = None
+    userId: Optional[str] = None
+    ts: Optional[str] = None
+    pageUrl: Optional[str] = None
+    status: Optional[str] = None
+    camera: Optional[Dict[str, Any]] = None
+    extra: Optional[Dict[str, Any]] = None
+
+    @validator("status")
+    def _status_ok(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.lower()
+        if v2 not in {"ok", "degraded", "idle", "error"}:
+            raise ValueError("status must be one of: ok, degraded, idle, error")
+        return v2
 
 
 class SnapshotRequest(BaseModel):
@@ -67,6 +104,39 @@ def _strip_data_url_prefix(b64: str) -> str:
     return b64
 
 
+async def _get_session_by_any_id(session_id: str):
+    """
+    Try to fetch a session by either plain string _id or ObjectId.
+    Returns the session doc or None.
+    """
+    session = await db.proctor_sessions.find_one({"_id": session_id})
+    if session:
+        return session
+    try:
+        from bson import ObjectId
+        oid = ObjectId(session_id)
+        session = await db.proctor_sessions.find_one({"_id": oid})
+        return session
+    except Exception:
+        return None
+
+
+async def _update_session_by_any_id(session_id: str, update: Dict[str, Any]):
+    """
+    Update by plain string id, fallback to ObjectId.
+    Returns matched_count.
+    """
+    result = await db.proctor_sessions.update_one({"_id": session_id}, update)
+    if result.matched_count > 0:
+        return result.matched_count
+    try:
+        from bson import ObjectId
+        result = await db.proctor_sessions.update_one({"_id": ObjectId(session_id)}, update)
+        return result.matched_count
+    except Exception:
+        return 0
+
+
 # ---------- Routes ----------
 
 @router.post("/start", response_model=StartProctorResponse)
@@ -83,43 +153,70 @@ async def start_proctoring(req: StartProctorRequest):
         "ended_at": None,
         "last_heartbeat_at": started_at,
         "active": True,
-        "meta": {},
+        # Last-known client telemetry (populated by heartbeats)
+        "last_visibility": None,
+        "last_focus": None,
+        "last_page_url": None,
+        "last_camera_status": None,     # "ok" | "degraded" | "idle" | "error"
+        "last_camera_meta": None,       # arbitrary dict from client
+        "last_client_ts": None,         # client-reported iso ts (if provided)
+        # Extra metadata
+        "meta": {"token": req.token} if req.token else {},
     }
 
     res = await db.proctor_sessions.insert_one(doc)
     return StartProctorResponse(session_id=str(res.inserted_id), started_at=started_at)
 
 
+
 @router.post("/heartbeat")
-async def heartbeat(req: HeartbeatRequest):
+async def heartbeat(payload: dict = Body(...)):
     """
-    Update the session's last-seen timestamp and (optionally) visibility/focus status.
-    Accepts either the stringified ObjectId or the raw ObjectId.
+    Accepts either legacy {session_id, page_visible?, focused?}
+    OR new beacon {testSessionId?, userId?, ts?, pageUrl?, status?, camera?, extra:{session_id?}}
     """
     now = _now_iso()
-    update = {
-        "$set": {
-            "last_heartbeat_at": now,
-            "last_visibility": bool(req.page_visible),
-            "last_focus": bool(req.focused),
-        }
-    }
 
-    # Try with plain string id (in case session_id is stored as a string)
-    result = await db.proctor_sessions.update_one({"_id": req.session_id}, update)
+    # resolve session_id from multiple shapes
+    session_id = None
+    if isinstance(payload, dict):
+        session_id = (
+            payload.get("session_id")
+            or (payload.get("extra") or {}).get("session_id")
+            or payload.get("testSessionId")
+        )
+    session_id = (str(session_id or "").strip()) or None
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session_id")
 
-    if result.matched_count == 0:
-        # Try ObjectId form (most likely)
-        try:
-            from bson import ObjectId
-            result = await db.proctor_sessions.update_one({"_id": ObjectId(req.session_id)}, update)
-        except Exception:
-            pass
+    # build update set
+    set_fields = {"last_heartbeat_at": now}
 
-    if result.matched_count == 0:
+    # legacy flags
+    if "page_visible" in payload:
+        set_fields["last_visibility"] = bool(payload.get("page_visible"))
+    if "focused" in payload:
+        set_fields["last_focus"] = bool(payload.get("focused"))
+
+    # beacon fields
+    if "pageUrl" in payload:
+        set_fields["last_page_url"] = str(payload.get("pageUrl") or "")
+    if "status" in payload:
+        set_fields["last_camera_status"] = str(payload.get("status") or "")
+    if "camera" in payload:
+        cam = payload.get("camera")
+        # keep as-is if JSON-serializable
+        if isinstance(cam, dict):
+            set_fields["last_camera_meta"] = cam
+    if "ts" in payload:
+        set_fields["last_client_ts"] = str(payload.get("ts") or "")
+
+    matched = await _update_session_by_any_id(session_id, {"$set": set_fields})
+    if matched == 0:
         raise HTTPException(status_code=404, detail="Session not found")
 
     return {"status": "ok", "time": now}
+
 
 
 @router.post("/snapshot")
@@ -129,15 +226,7 @@ async def snapshot(req: SnapshotRequest):
     Accepts either the stringified ObjectId or the raw ObjectId as session_id.
     """
     # Confirm session exists & active
-    session = await db.proctor_sessions.find_one({"_id": req.session_id})
-    if not session:
-        # Try ObjectId fallback if needed
-        try:
-            from bson import ObjectId
-            session = await db.proctor_sessions.find_one({"_id": ObjectId(req.session_id)})
-        except Exception:
-            session = None
-
+    session = await _get_session_by_any_id(req.session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -186,16 +275,8 @@ async def end_proctoring(req: EndProctorRequest):
         }
     }
 
-    result = await db.proctor_sessions.update_one({"_id": req.session_id}, update)
-    # ObjectId fallback
-    if result.matched_count == 0:
-        try:
-            from bson import ObjectId
-            result = await db.proctor_sessions.update_one({"_id": ObjectId(req.session_id)}, update)
-        except Exception:
-            pass
-
-    if result.matched_count == 0:
+    matched = await _update_session_by_any_id(req.session_id, update)
+    if matched == 0:
         raise HTTPException(status_code=404, detail="Session not found")
 
     return {"status": "ended", "time": now}
