@@ -16,6 +16,9 @@ from app.utils.mongo import verify_mongo_connection  # ✅ DB check
 # NEW: tests router (email invites + test lifecycle)
 from app.routers.tests_router import router as tests_router
 
+# ✅ NEW: interviews router (schedule interview + listings)
+from app.routers.interviews_router import router as interviews_router
+
 # Optional: proctoring endpoints (start/heartbeat/snapshot/end)
 try:
     from app.routers.proctor_router import router as proctor_router
@@ -78,6 +81,9 @@ app.include_router(candidate_router.router, prefix="/candidate")
 # ✅ Register NEW tests router
 app.include_router(tests_router, prefix="/tests")
 
+# ✅ Register NEW interviews router (has internal prefix '/interviews')
+app.include_router(interviews_router)
+
 # ✅ (Optional) Proctor router
 # NOTE: The router itself has NO internal prefix now; we add it here only once.
 if proctor_router:
@@ -113,15 +119,9 @@ _DEF_AVATAR_CANDIDATES = [
     _root / "default-avatar.png",
 ]
 
-# 80x80 simple placeholder PNG (base64)
+# 80x80 simple placeholder PNG (base64) — valid and minimal
 _DEFAULT_AVATAR_B64 = (
-    b"iVBORw0KGgoAAAANSUhEUgAAAFAAAABQCAQAAABuC6+eAAAACXBIWXMAAAsTAAALEwEAmpwYAAAB"
-    b"VUlEQVR4nO3UsQ3CMBQF0W9a0o9a0o8F7l2Sg0pQF3b4mF3mWw7jVq2p6o6w2QXfFZqg8JmQm+eZ"
-    b"eQ4n6q9H3f5vXh4M2Gf8kYw3k0v86nK8f6v2oO5w2mW3Sg5K0Bf8It6mCwqkQ8wF1mC8Q5n2Qf0C"
-    b"0N9E1gqS3Q8oA3oH0vH8q3wX8gDtxr4V0G4yJc1Cz8qF3p9y7a3d7M0y3lJj8l1Fh7k2Kq8cD8fQ"
-    b"mQkQkQkQkQkQkQkQkQkQkQkQkQkQkQkQkQkQmQkQkQkQkQkQkQkQmQm3vN8k4g2O3J0c8c2l0"
-    b"QKZs7f3jzq7r8CwJgq7z2K2kCk7w2b3kQ8OaU8c3cRyOuwcYJwCw7jO6b8E1g3wQkQkQkQkQkQkQ"
-    b"kQkQkQkQkQkQkQkQkQkQkQkQkQkQmQkQkQkQkQkQkQkQmQn0P7M2v4Qe6mQAAAAAElFTkSuQmCC"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
 )
 
 @app.get("/default-avatar.png")
@@ -130,6 +130,7 @@ async def default_avatar() -> Response:
         if p.is_file():
             return FileResponse(str(p), media_type="image/png")
     return Response(content=base64.b64decode(_DEFAULT_AVATAR_B64), media_type="image/png")
+
 
 # ---------------------------
 # Small health endpoint
