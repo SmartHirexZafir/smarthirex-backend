@@ -12,6 +12,11 @@ Provides:
 - send_email(...)       -> sync
 - async_send_email(...) -> async wrapper (for FastAPI)
 - render_invite_html(...) -> default HTML template for test invites
+
+# ✅ Added for Interview Scheduling (non-breaking):
+- render_interview_invite_html(...)  -> default HTML for interview invites
+- send_interview_invite(...)         -> thin wrapper around send_email for interviews
+- async_send_interview_invite(...)   -> async wrapper for interviews
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import mimetypes
 import re
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Union
+from typing import Iterable, Optional, Sequence, Union, Dict, Any
 import asyncio
 import html as html_unescape_mod
 
@@ -228,3 +233,109 @@ def render_invite_html(*, candidate_name: str, role: str, test_link: str) -> str
       <p style="color:#6b7280;">Best of luck!<br/>SmartHirex Team</p>
     </div>
     """.strip()
+
+
+# -----------------------------------------------------------------------------
+# ✅ NEW: Interview invite helpers (non-breaking additions)
+# -----------------------------------------------------------------------------
+
+def render_interview_invite_html(
+    *,
+    candidate_name: str | None,
+    title: str,
+    local_datetime_str: str,
+    timezone_name: str,
+    meeting_url: str,
+    duration_mins: int,
+    notes: str | None = None,
+    company_name: str | None = None,
+) -> str:
+    """
+    Render a clean HTML email for interview invitations.
+    Minimal dependencies; no template engine required.
+    """
+    who = candidate_name or "Candidate"
+    company = company_name or os.getenv("FROM_NAME", "SmartHirex Team")
+    notes_block = f"<tr><td style='padding:4px 0; color:#6b7280; vertical-align:top;'>Notes</td><td style='padding:4px 0;'>{notes}</td></tr>" if notes else ""
+    return f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f6f7fb;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f6f7fb;">
+      <tr>
+        <td align="center" style="padding:24px;">
+          <table width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#ffffff;border-radius:14px;box-shadow:0 2px 10px rgba(16,24,40,0.06);overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif;">
+            <tr>
+              <td style="background:linear-gradient(135deg,#6366f1,#8b5cf6);padding:20px 24px;color:#fff;">
+                <div style="font-size:18px;font-weight:700;">{company}</div>
+                <div style="font-size:12px;opacity:.9;margin-top:4px;">Interview Invitation</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;">
+                <p style="margin:0 0 12px 0;font-size:16px;color:#111827;">Hi <strong>{who}</strong>,</p>
+                <p style="margin:0 0 16px 0;font-size:14px;color:#374151;line-height:1.6;">
+                  You're invited to an interview.
+                </p>
+                <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f9fafb;border:1px solid #eef2f7;border-radius:10px;">
+                  <tr>
+                    <td style="padding:16px 18px;">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="font-size:14px;color:#111827;">
+                        <tr><td style="padding:4px 0;width:120px;color:#6b7280;">Title</td><td style="padding:4px 0;font-weight:600;">{title}</td></tr>
+                        <tr><td style="padding:4px 0;color:#6b7280;">When</td><td style="padding:4px 0;">{local_datetime_str} <span style="color:#6b7280;">({timezone_name})</span></td></tr>
+                        <tr><td style="padding:4px 0;color:#6b7280;">Duration</td><td style="padding:4px 0;">{duration_mins} minutes</td></tr>
+                        {notes_block}
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+                <table cellpadding="0" cellspacing="0" border="0" align="center" style="margin:22px auto 8px auto;">
+                  <tr>
+                    <td align="center" bgcolor="#4f46e5" style="border-radius:10px;">
+                      <a href="{meeting_url}" target="_blank" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:600;color:#ffffff;background:#4f46e5;border-radius:10px;text-decoration:none;">
+                        Join Interview
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:14px 0 0 0;font-size:12px;color:#6b7280;line-height:1.6;">
+                  If the button doesn’t work, copy and paste this link into your browser:<br />
+                  <a href="{meeting_url}" target="_blank" style="color:#4f46e5;word-break:break-all;">{meeting_url}</a>
+                </p>
+                <hr style="border:none;border-top:1px solid #eef2f7;margin:20px 0;" />
+                <p style="margin:0;font-size:12px;color:#6b7280;">We look forward to speaking with you!</p>
+              </td>
+            </tr>
+            <tr><td style="padding:0 24px 20px 24px;"><p style="margin:0;font-size:11px;color:#9ca3af;">© {os.getenv('EMAIL_COPYRIGHT_YEAR', '')} {company}. This message was intended for {who}.</p></td></tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>""".strip()
+
+
+def send_interview_invite(
+    *,
+    to: str,
+    subject: str,
+    html: str,
+    meta: Optional[Dict[str, Any]] = None,  # kept for API compatibility; ignored here
+) -> None:
+    """
+    Thin, backward-compatible wrapper used by interview routes/services.
+    Matches the expected signature:
+        send_interview_invite(to=..., subject=..., html=..., meta={...})
+    """
+    # You can attach ICS/metadata here later if desired.
+    send_email(to=to, subject=subject, html=html)
+
+
+async def async_send_interview_invite(
+    *,
+    to: str,
+    subject: str,
+    html: str,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    await async_send_email(to=to, subject=subject, html=html)

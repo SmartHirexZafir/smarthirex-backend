@@ -1,0 +1,137 @@
+<!-- app/templates/interview_invite.html -->
+<!doctype html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title or 'Interview Invitation' }}</title>
+    <!-- Hidden preheader text -->
+    <style>
+      .preheader { display: none !important; visibility: hidden; opacity: 0; color: transparent; height: 0; width: 0; overflow: hidden; mso-hide: all; }
+      a { text-decoration: none; }
+      @media (max-width: 600px) {
+        .container { width: 100% !important; }
+        .p-24 { padding: 16px !important; }
+        .btn { display: block !important; width: 100% !important; }
+      }
+    </style>
+  </head>
+  <body style="margin:0; padding:0; background:#f6f7fb;">
+    <div class="preheader">
+      Your interview is scheduled for {{ local_datetime_str }} ({{ timezone_name }}).
+    </div>
+
+    <!-- Outer wrapper -->
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f6f7fb;">
+      <tr>
+        <td align="center" style="padding: 24px;">
+          <!-- Card -->
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" class="container" style="max-width:600px; width:600px; background:#ffffff; border-radius:14px; box-shadow:0 2px 10px rgba(16,24,40,0.06); overflow:hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;">
+            <!-- Header -->
+            <tr>
+              <td style="background:linear-gradient(135deg,#6366f1,#8b5cf6); padding: 20px 24px;">
+                <table width="100%" role="presentation">
+                  <tr>
+                    <td align="left">
+                      <div style="font-size:18px; font-weight:700; color:#ffffff;">
+                        {{ company_name or 'SmartHirex' }}
+                      </div>
+                      <div style="font-size:12px; color:#e9e7ff; opacity:.9; margin-top:4px;">
+                        Interview Invitation
+                      </div>
+                    </td>
+                    <td align="right" style="color:#fff; font-size:12px;">
+                      <span>{{ local_datetime_str }}</span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Body -->
+            <tr>
+              <td class="p-24" style="padding: 24px;">
+                <p style="margin:0 0 12px 0; font-size:16px; color:#111827;">
+                  Hi <strong>{{ candidate_name or 'Candidate' }}</strong>,
+                </p>
+
+                <p style="margin:0 0 16px 0; font-size:14px; color:#374151; line-height:1.6;">
+                  You're invited to an interview.
+                </p>
+
+                <!-- Details card -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f9fafb; border:1px solid #eef2f7; border-radius:10px;">
+                  <tr>
+                    <td style="padding:16px 18px;">
+                      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:14px; color:#111827;">
+                        <tr>
+                          <td style="padding:4px 0; width:120px; color:#6b7280;">Title</td>
+                          <td style="padding:4px 0; font-weight:600;">{{ title or 'Interview' }}</td>
+                        </tr>
+                        <tr>
+                          <td style="padding:4px 0; color:#6b7280;">When</td>
+                          <td style="padding:4px 0;">
+                            {{ local_datetime_str }}
+                            <span style="color:#6b7280;">({{ timezone_name }})</span>
+                          </td>
+                        </tr>
+                        <tr>
+                          <td style="padding:4px 0; color:#6b7280;">Duration</td>
+                          <td style="padding:4px 0;">{{ duration_mins }} minutes</td>
+                        </tr>
+                        {% if notes %}
+                        <tr>
+                          <td style="padding:4px 0; color:#6b7280; vertical-align: top;">Notes</td>
+                          <td style="padding:4px 0;">{{ notes }}</td>
+                        </tr>
+                        {% endif %}
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+
+                <!-- CTA -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin: 22px auto 8px auto;">
+                  <tr>
+                    <td align="center" bgcolor="#4f46e5" style="border-radius:10px;">
+                      <a href="{{ meeting_url }}" target="_blank" class="btn"
+                         style="display:inline-block; padding:12px 22px; font-size:14px; font-weight:600; color:#ffffff; background:#4f46e5; border-radius:10px;">
+                        Join Interview
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+
+                <!-- Plain link fallback -->
+                <p style="margin:14px 0 0 0; font-size:12px; color:#6b7280; line-height:1.6;">
+                  If the button doesn’t work, copy and paste this link into your browser:<br />
+                  <a href="{{ meeting_url }}" target="_blank" style="color:#4f46e5; word-break:break-all;">{{ meeting_url }}</a>
+                </p>
+
+                <hr style="border:none; border-top:1px solid #eef2f7; margin:20px 0;" />
+
+                <p style="margin:0; font-size:12px; color:#6b7280;">
+                  We look forward to speaking with you!
+                </p>
+              </td>
+            </tr>
+
+            <!-- Footer -->
+            <tr>
+              <td style="padding: 0 24px 20px 24px;">
+                <p style="margin:0; font-size:11px; color:#9ca3af;">
+                  © {{ current_year or now().year if now is defined else '' }} {{ company_name or 'SmartHirex' }}.
+                  This message was intended for {{ candidate_name or 'the recipient' }}. If you weren’t expecting this,
+                  you can ignore it.
+                </p>
+              </td>
+            </tr>
+
+          </table>
+          <!-- /Card -->
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
