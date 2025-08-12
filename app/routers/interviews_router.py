@@ -162,6 +162,15 @@ def build_meeting_url(token: str) -> str:
     return f"{base.rstrip('/')}/meetings/{token}"
 
 
+def build_external_meet_url(token: str) -> str:
+    """
+    External Google Meet (or provider) URL. Override with:
+      GOOGLE_MEET_URL_TEMPLATE="https://meet.google.com/lookup/{token}"
+    """
+    template = os.getenv("GOOGLE_MEET_URL_TEMPLATE", "https://meet.google.com/lookup/{token}")
+    return template.replace("{token}", token)
+
+
 def format_local_dt(dt_utc: datetime, tz_name: str) -> str:
     """
     Format datetime into a human-friendly string in the specified timezone for email copy.
@@ -234,13 +243,16 @@ def send_invite_email(
 def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
     """
     Create a meeting record, generate a join URL, and send the invite email to the candidate.
+    The join URL is the FRONTEND "gate" page (/meetings/{token}). We also store
+    an external Google Meet URL which the gate will open at the right time.
     """
     now_utc = datetime.now(timezone.utc)
     if req.starts_at <= now_utc:
         raise HTTPException(status_code=400, detail="startsAt must be in the future.")
 
     token = uuid.uuid4().hex
-    meeting_url = build_meeting_url(token)
+    meeting_url = build_meeting_url(token)          # gate page
+    external_url = build_external_meet_url(token)   # provider (Google Meet) URL
 
     # Store UTC-naive datetime in Mongo (PyMongo friendly)
     starts_at_utc_naive = req.starts_at.astimezone(timezone.utc).replace(tzinfo=None)
@@ -255,7 +267,9 @@ def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
         "notes": req.notes,
         "status": "scheduled",
         "token": token,
-        "meeting_url": meeting_url,
+        "meeting_url": meeting_url,          # frontend gate
+        "google_meet_url": external_url,     # explicit
+        "external_url": external_url,        # generic alias
         "created_at": now_utc.replace(tzinfo=None),
         "email_sent": False,
     }
@@ -274,7 +288,7 @@ def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
         candidate_name=req.candidate_name,
         title=subject,
         local_datetime_str=local_dt_str,
-        meeting_url=meeting_url,
+        meeting_url=meeting_url,  # always email the gate page
         notes=req.notes,
         timezone_name=req.timezone,
         duration_mins=req.duration_mins,
@@ -297,6 +311,7 @@ def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
                     "timezone": req.timezone,
                     "duration_mins": req.duration_mins,
                     "token": token,
+                    "google_meet_url": external_url,
                 },
             )
             db["meetings"].update_one(
@@ -350,3 +365,65 @@ def list_interviews_for_candidate(candidate_id: str, db=Depends(get_db)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"DB query failed: {e}")
+
+
+# -------- New: gate page data for /meetings/[token] --------
+@router.get("/by-token/{token}")
+def get_meeting_by_token(token: str, db=Depends(get_db)):
+    """
+    Returns meeting details for the gate page (no auth).
+    Includes BOTH snake_case and camelCase keys for compatibility with different frontends.
+    """
+    doc = db["meetings"].find_one({"token": token})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Normalize starts_at (stored as UTC naive) to ISO 'Z'
+    starts_at = doc.get("starts_at")
+    if isinstance(starts_at, datetime):
+        if starts_at.tzinfo is None:
+            starts_iso = starts_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        else:
+            starts_iso = starts_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    else:
+        starts_iso = None
+
+    # Prefer explicit google_meet_url, fallback to external_url
+    external = doc.get("google_meet_url") or doc.get("external_url")
+
+    # --- snake_case (current Next.js page.tsx expects these) ---
+    data_snake = {
+        "token": doc.get("token"),
+        "title": doc.get("title"),
+        "status": doc.get("status"),
+        "email": doc.get("email"),
+        "candidate_id": doc.get("candidate_id"),
+        "starts_at": starts_iso,
+        "timezone": doc.get("timezone"),
+        "duration_mins": doc.get("duration_mins"),
+        "meeting_url": doc.get("meeting_url"),
+        "external_url": external,
+        "google_meet_url": doc.get("google_meet_url"),
+        "notes": doc.get("notes"),
+        "now": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+    # --- camelCase (kept for backward compatibility) ---
+    data_camel = {
+        "token": data_snake["token"],
+        "title": data_snake["title"],
+        "status": data_snake["status"],
+        "email": data_snake["email"],
+        "candidateId": data_snake["candidate_id"],
+        "startsAt": data_snake["starts_at"],
+        "timezone": data_snake["timezone"],
+        "durationMins": data_snake["duration_mins"],
+        "meetingUrl": data_snake["meeting_url"],
+        "externalUrl": data_snake["external_url"],
+        "googleMeetUrl": data_snake["google_meet_url"],
+        "notes": data_snake["notes"],
+        "now": data_snake["now"],
+    }
+
+    # Merge; snake_case fields take precedence for duplicate keys with same meaning
+    return {**data_camel, **data_snake}
