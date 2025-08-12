@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-# Schemas
+# Schemas (unchanged)
 from app.schemas.interviews import (
     ScheduleInterviewRequest,
     ScheduleInterviewResponse,
@@ -66,7 +66,7 @@ def _default_invite_html(
 <p><strong>Title:</strong> {title}<br/>
 <strong>When:</strong> {local_datetime_str} ({timezone_name})<br/>
 <strong>Duration:</strong> {duration_mins} minutes</p>
-{safe_notes}
+{saf e_notes}
 <p>Join using this link:<br/>
 <a href="{meeting_url}">{meeting_url}</a></p>
 <p>Best,<br/>SmartHirex Team</p>
@@ -74,8 +74,21 @@ def _default_invite_html(
 
 
 def _fallback_build_meeting_url(token: str) -> str:
+    """
+    Frontend "gate" URL – user lands here first.
+    """
     base = os.getenv("FRONTEND_BASE_URL") or os.getenv("WEB_BASE_URL") or "http://localhost:3000"
     return f"{base.rstrip('/')}/meetings/{token}"
+
+
+def _build_google_meet_url(token: str) -> str:
+    """
+    External Google Meet (or any provider) URL. Default template is lookup-based Meet link.
+    Override with env GOOGLE_MEET_URL_TEMPLATE, e.g.:
+      GOOGLE_MEET_URL_TEMPLATE=https://meet.google.com/lookup/{token}
+    """
+    template = os.getenv("GOOGLE_MEET_URL_TEMPLATE", "https://meet.google.com/lookup/{token}")
+    return template.replace("{token}", token)
 
 
 # -----------------------------
@@ -94,7 +107,7 @@ class InterviewsService:
             emailer(to: str, subject: str, html: str, meta: Dict[str, Any]) -> Any
         If not provided, tries to use app.utils.emailer.send_interview_invite.
     url_builder : Optional[Callable[[str], str]]
-        Custom meeting URL builder override. Given a token, returns full URL.
+        Custom meeting URL (frontend gate) builder override. Given a token, returns full URL.
     """
 
     def __init__(
@@ -117,7 +130,8 @@ class InterviewsService:
     # -------- Core actions --------
     def schedule(self, req: ScheduleInterviewRequest) -> ScheduleInterviewResponse:
         """
-        Create a meeting record, generate a join URL, and send the invite email.
+        Create a meeting record, generate a join URL (frontend gate),
+        and send the invite email.
 
         Returns
         -------
@@ -128,23 +142,30 @@ class InterviewsService:
             # Ensure future datetime; request validator already normalized to UTC
             raise ValueError("startsAt must be in the future.")
 
-        # Token + URL
+        # Token + URLs
         token = uuid.uuid4().hex
-        meeting_url = self.url_builder(token)
+        meeting_url = self.url_builder(token)            # your gate page (/meetings/{token})
+        google_meet_url = _build_google_meet_url(token)  # external provider URL
+
+        # Store UTC-naive fields to match router & PyMongo-friendly style
+        starts_at_utc_naive = req.starts_at.astimezone(timezone.utc).replace(tzinfo=None)
+        created_at_utc_naive = now_utc.replace(tzinfo=None)
 
         # Persist meeting
         doc = {
             "candidate_id": req.candidate_id,
             "email": str(req.email),
-            "starts_at": req.starts_at,  # aware UTC datetime
+            "starts_at": starts_at_utc_naive,   # UTC-naive datetime
             "timezone": req.timezone,
             "duration_mins": req.duration_mins,
             "title": req.title,
             "notes": req.notes,
             "status": "scheduled",
             "token": token,
-            "meeting_url": meeting_url,
-            "created_at": now_utc,
+            "meeting_url": meeting_url,           # frontend gate
+            "google_meet_url": google_meet_url,   # external meet link
+            "external_url": google_meet_url,      # generic alias
+            "created_at": created_at_utc_naive,   # UTC-naive
             "email_sent": False,
         }
 
@@ -161,7 +182,7 @@ class InterviewsService:
             candidate_name=req.candidate_name,
             title=subject,
             local_datetime_str=local_dt_str,
-            meeting_url=meeting_url,
+            meeting_url=meeting_url,  # always send the gate URL in email
             notes=req.notes,
             timezone_name=req.timezone,
             duration_mins=req.duration_mins,
@@ -180,6 +201,7 @@ class InterviewsService:
                     "timezone": req.timezone,
                     "duration_mins": req.duration_mins,
                     "token": token,
+                    "google_meet_url": google_meet_url,
                 },
             )
             self.db["meetings"].update_one(
@@ -223,3 +245,53 @@ class InterviewsService:
                 )
             )
         return items
+
+    # -------- Extra helper for the /meetings/[token] gate page --------
+    def get_by_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single meeting document by token.
+        Returns a dict with all fields (including google_meet_url / external_url),
+        or None if not found. This is intentionally not tied to MeetingOut, so we
+        don't break existing types that don't include the new fields.
+        """
+        if not token:
+            return None
+        doc = self.db["meetings"].find_one({"token": token})
+        if not doc:
+            return None
+
+        # Normalize for JSON responses in routers
+        _id = str(doc.get("_id"))
+        starts_at = doc.get("starts_at")
+        # Prepare camel + snake friendly shape if router wants it
+        if isinstance(starts_at, datetime):
+            if starts_at.tzinfo is None:
+                starts_iso = starts_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+            else:
+                starts_iso = starts_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        else:
+            starts_iso = None
+
+        base = {
+            "_id": _id,
+            "token": doc.get("token"),
+            "title": doc.get("title"),
+            "email": doc.get("email"),
+            "candidate_id": doc.get("candidate_id"),
+            "status": doc.get("status"),
+            "starts_at": starts_at,  # raw (UTC-naive) for internal uses
+            "startsAt": starts_iso,  # ISO 'Z' for clients
+            "timezone": doc.get("timezone"),
+            "duration_mins": doc.get("duration_mins"),
+            "durationMins": doc.get("duration_mins"),
+            "meeting_url": doc.get("meeting_url"),
+            "meetingUrl": doc.get("meeting_url"),
+            "google_meet_url": doc.get("google_meet_url"),
+            "googleMeetUrl": doc.get("google_meet_url"),
+            "external_url": doc.get("external_url"),
+            "externalUrl": doc.get("external_url"),
+            "notes": doc.get("notes"),
+            "created_at": doc.get("created_at"),
+            "now": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        return base
