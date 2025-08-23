@@ -1,14 +1,18 @@
-from fastapi import APIRouter, File, UploadFile, HTTPException
+from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
 from typing import List
 from app.logic.resume_parser import parse_resume_file
 from app.utils.mongo import db, compute_cv_hash, check_duplicate_cv_hash
 from app.logic.ml_interface import clean_text, model, vectorizer, label_encoder
+from app.routers.auth_router import get_current_user  # ✅ added import
 import uuid
 
 router = APIRouter()
 
 @router.post("/upload-resumes")
-async def upload_resumes(files: List[UploadFile] = File(...)):
+async def upload_resumes(
+    files: List[UploadFile] = File(...),
+    current_user = Depends(get_current_user),  # ✅ inject current logged-in user
+):
     parsed_resumes = []
 
     for file in files:
@@ -65,6 +69,9 @@ async def upload_resumes(files: List[UploadFile] = File(...)):
         # 🧹 Remove outdated fields if exist
         for key in ["matchedSkills", "missingSkills", "score", "testScore", "rank", "filter_skills"]:
             resume_data.pop(key, None)
+
+        # ✅ Assign ownership to current user
+        resume_data["ownerUserId"] = str(current_user.id)
 
         # ✅ Save to database
         await db.parsed_resumes.insert_one(resume_data)

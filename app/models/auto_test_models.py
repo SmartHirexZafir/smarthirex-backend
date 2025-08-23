@@ -20,6 +20,8 @@ class Candidate(BaseModel):
     experience: Optional[str] = ""
     resume_text: Optional[str] = ""
     job_role: Optional[str] = ""  # ✅ Used for filtering & test generation
+    # ✅ NEW: multi-tenant ownership (backward compatible)
+    ownerUserId: Optional[str] = None
 
     class Config:
         allow_population_by_field_name = True  # lets us pass _id or id
@@ -74,6 +76,8 @@ class TestInviteOut(BaseModel):
         default=None,
         description="Number of questions stored on the invite (if provided)."
     )
+    # ✅ NEW: ownership echo (optional; won’t break existing clients)
+    ownerUserId: Optional[str] = None
 
 
 # -- Start Test --
