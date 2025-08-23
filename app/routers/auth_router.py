@@ -1,13 +1,16 @@
 # app/routers/auth_router.py
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, status, Body, Query
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from app.utils.mongo import db
+from app.utils.emailer import send_verification_email
 from dotenv import load_dotenv
-import jwt, uuid, os
 from types import SimpleNamespace
 from typing import Optional
+from datetime import datetime, timedelta
+import jwt, uuid, os
 
 load_dotenv()
 
@@ -17,6 +20,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 SECRET_KEY = os.getenv("JWT_SECRET", "smarthirex-secret")
 ALGORITHM = "HS256"
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+VERIFICATION_TTL_HOURS = 24
 
 # ----------- Models -----------
 
@@ -32,6 +37,47 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+# ----------- Helpers -----------
+
+def _verify_link(token: str) -> str:
+    """
+    Link sent to the user's email. It points to the Next.js page:
+    /verify/[token] which will call the backend and then redirect to login.
+    """
+    return f"{FRONTEND_BASE_URL}/verify/{token}"
+
+async def _create_verify_token(user_id: str) -> str:
+    token = str(uuid.uuid4())
+    await db.email_verification_tokens.insert_one({
+        "user_id": user_id,
+        "token": token,
+        "expires_at": datetime.utcnow() + timedelta(hours=VERIFICATION_TTL_HOURS),
+        "used": False,
+        "created_at": datetime.utcnow(),
+    })
+    return token
+
+async def _verify_token_and_mark_used(token: str):
+    tok = await db.email_verification_tokens.find_one({"token": token})
+    if (not tok) or tok.get("used"):
+        raise HTTPException(status_code=400, detail="Invalid or used token")
+    if tok["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Token expired")
+
+    # mark user as verified + token as used
+    await db.users.update_one({"_id": tok["user_id"]}, {"$set": {"is_verified": True}})
+    await db.email_verification_tokens.update_one({"_id": tok["_id"]}, {"$set": {"used": True}})
+
+def _wants_json(request: Request, redirect_param: Optional[str] = None) -> bool:
+    """
+    If the client is a fetch/XHR (Accept includes application/json) OR
+    explicitly asks with ?redirect=0, return JSON instead of Redirect.
+    """
+    if redirect_param is not None and redirect_param == "0":
+        return True
+    accept = (request.headers.get("accept") or "").lower()
+    return "application/json" in accept
+
 # ----------- Signup -----------
 
 @router.post("/signup")
@@ -44,26 +90,70 @@ async def signup(data: SignupRequest):
     user = data.dict()
     user["_id"] = str(uuid.uuid4())
     user["password"] = hashed
+    user["is_verified"] = False
+    user["created_at"] = datetime.utcnow()
 
     await db.users.insert_one(user)
 
-    token = jwt.encode(
-        {"email": data.email, "id": user["_id"]},
-        SECRET_KEY,
-        algorithm=ALGORITHM
-    )
+    # create token + send verification email (no login token yet)
+    token = await _create_verify_token(user["_id"])
+    verify_url = _verify_link(token)
+    try:
+        send_verification_email(data.email, verify_url)
+    except Exception:
+        # if email sending fails, you may want to delete user or allow resend
+        # here we keep user and allow "resend" from UI
+        pass
 
     return {
-        "token": token,
-        "message": "Signup successful",
-        "user": {
-            "email": data.email,
-            "firstName": data.firstName,
-            "lastName": data.lastName,
-            "company": data.company,
-            "jobTitle": data.jobTitle
-        }
+        "message": "Signup successful. Please check your email to verify your account."
     }
+
+# ----------- Verify (JSON when fetched, Redirect when navigated) -----------
+
+@router.get("/verify/{token}")
+async def verify_path(token: str, request: Request):
+    await _verify_token_and_mark_used(token)
+    if _wants_json(request):
+        return JSONResponse({"ok": True, "message": "Email verified successfully"})
+    return RedirectResponse(url=f"{FRONTEND_BASE_URL}/login?verified=1", status_code=307)
+
+@router.get("/verify")
+async def verify_query(request: Request, token: str = Query(...), redirect: Optional[str] = Query(None)):
+    await _verify_token_and_mark_used(token)
+    if _wants_json(request, redirect_param=redirect):
+        return JSONResponse({"ok": True, "message": "Email verified successfully"})
+    return RedirectResponse(url=f"{FRONTEND_BASE_URL}/login?verified=1", status_code=307)
+
+@router.post("/verify")
+async def verify_post(payload: dict = Body(...)):
+    token = payload.get("token")
+    if not token:
+        raise HTTPException(status_code=400, detail="token required")
+    await _verify_token_and_mark_used(token)
+    return {"ok": True, "message": "Email verified successfully"}
+
+# ----------- Resend verification -----------
+
+@router.post("/resend-verification")
+async def resend_verification(payload: dict = Body(...)):
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.get("is_verified"):
+        return {"ok": True, "message": "Already verified"}
+
+    token = await _create_verify_token(user["_id"])
+    verify_url = _verify_link(token)
+    try:
+        send_verification_email(email, verify_url)
+    except Exception:
+        pass
+    return {"ok": True, "message": "Verification email sent"}
 
 # ----------- Login -----------
 
@@ -75,6 +165,10 @@ async def login(data: LoginRequest):
 
     if not pwd_context.verify(data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # block unverified users (your login page already handles 403 & shows resend button)
+    if not user.get("is_verified"):
+        raise HTTPException(status_code=403, detail="Email not verified")
 
     token = jwt.encode(
         {"email": user["email"], "id": str(user["_id"])},
@@ -94,7 +188,7 @@ async def login(data: LoginRequest):
         }
     }
 
-# ----------- Auth Dependency (NEW) -----------
+# ----------- Auth Dependency (unchanged) -----------
 
 async def get_current_user(request: Request):
     """
