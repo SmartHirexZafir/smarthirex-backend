@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Verify your email</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      Template variables (Jinja-style):
+        - verify_url   (required) : absolute URL to verification endpoint/page
+        - brand_name   (optional) : e.g. "SmartHirex"
+    -->
+    <style>
+      /* Basic reset for email clients */
+      html, body { margin:0; padding:0; height:100%; }
+      img { border:0; outline:none; text-decoration:none; -ms-interpolation-mode:bicubic; }
+      table { border-collapse:collapse; }
+      a { text-decoration:none; }
+
+      /* Dark mode support for clients that honor prefers-color-scheme */
+      @media (prefers-color-scheme: dark) {
+        body { background:#0b1220 !important; }
+        .card { background:#0f172a !important; color:#e5e7eb !important; }
+        .muted { color:#94a3b8 !important; }
+        .cta { background:#3b82f6 !important; }
+        .brandbar { background: linear-gradient(135deg,#1d4ed8,#1e40af) !important; }
+        .divider { border-top-color:#1f2937 !important; }
+      }
+
+      /* Mobile */
+      @media only screen and (max-width: 620px) {
+        .container { width:100% !important; }
+        .p-24 { padding:20px !important; }
+        .btn { display:block !important; width:100% !important; }
+      }
+    </style>
+  </head>
+
+  <body style="background:#f6f7fb; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif; color:#111827;">
+    <!-- Preheader text (hidden preview in inbox) -->
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+      Confirm your email to activate your account.
+    </div>
+
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f7fb;">
+      <tr>
+        <td align="center" style="padding:24px;">
+          <table role="presentation" class="container" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:14px;box-shadow:0 2px 10px rgba(16,24,40,0.06);overflow:hidden;">
+            <!-- Brand bar -->
+            <tr>
+              <td class="brandbar" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);padding:20px 24px;color:#ffffff;">
+                <div style="font-size:18px;font-weight:700;">
+                  {{ brand_name or 'SmartHirex' }}
+                </div>
+                <div style="font-size:12px;opacity:.9;margin-top:4px;">
+                  Verify your email
+                </div>
+              </td>
+            </tr>
+
+            <!-- Content -->
+            <tr>
+              <td class="card p-24" style="padding:24px;">
+                <p style="margin:0 0 12px 0;font-size:16px;">Welcome!</p>
+                <p class="muted" style="margin:0 0 16px 0;font-size:14px;color:#374151;line-height:1.6;">
+                  Please confirm your email address to activate your account.
+                </p>
+
+                <!-- CTA Button -->
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:8px auto 8px auto;">
+                  <tr>
+                    <td align="center" class="cta" style="border-radius:10px;background:#2563eb;">
+                      <a class="btn" href="{{ verify_url }}" target="_blank"
+                         style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:600;color:#ffffff;border-radius:10px;">
+                        Verify my email
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+
+                <!-- Fallback link -->
+                <p class="muted" style="margin:16px 0 0 0;font-size:12px;color:#6b7280;line-height:1.6;">
+                  If the button doesn’t work, copy and paste this link into your browser:<br />
+                  <a href="{{ verify_url }}" target="_blank" style="color:#2563eb;word-break:break-all;">{{ verify_url }}</a>
+                </p>
+
+                <hr class="divider" style="border:none;border-top:1px solid #eef2f7;margin:20px 0;" />
+
+                <p class="muted" style="margin:0;font-size:12px;color:#6b7280;">
+                  Having trouble? Reply to this email and we’ll help you out.
+                </p>
+              </td>
+            </tr>
+
+            <!-- Footer -->
+            <tr>
+              <td style="padding:0 24px 20px 24px;">
+                <p class="muted" style="margin:0;font-size:11px;color:#9ca3af;">
+                  © {{ email_copyright_year or '' }} {{ brand_name or 'SmartHirex' }}.
+                </p>
+              </td>
+            </tr>
+          </table>
+
+          <!-- Safe fallback link for plain clients -->
+          <div style="max-width:600px;margin-top:16px;font-size:11px;color:#9ca3af;">
+            If you didn’t request this, you can safely ignore this email.
+          </div>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

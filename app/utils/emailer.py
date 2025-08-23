@@ -9,14 +9,17 @@ Env vars:
 - SMTP_SSL (optional: "true"/"false", default false → STARTTLS)
 
 Provides:
-- send_email(...)       -> sync
-- async_send_email(...) -> async wrapper (for FastAPI)
-- render_invite_html(...) -> default HTML template for test invites
-
-# ✅ Added for Interview Scheduling (non-breaking):
+- send_email(...)                 -> sync
+- async_send_email(...)           -> async wrapper (for FastAPI)
+- render_invite_html(...)         -> default HTML template for test invites
 - render_interview_invite_html(...)  -> default HTML for interview invites
 - send_interview_invite(...)         -> thin wrapper around send_email for interviews
 - async_send_interview_invite(...)   -> async wrapper for interviews
+
+# ✅ NEW (non-breaking) for account verification:
+- render_verify_email_html(verify_url)     -> HTML template for email verification
+- send_verification_email(to, verify_url)  -> sends verification email
+- async_send_verification_email(...)       -> async wrapper
 """
 
 from __future__ import annotations
@@ -236,7 +239,70 @@ def render_invite_html(*, candidate_name: str, role: str, test_link: str) -> str
 
 
 # -----------------------------------------------------------------------------
-# ✅ NEW: Interview invite helpers (non-breaking additions)
+# ✅ NEW: Account verification helpers (non-breaking additions)
+# -----------------------------------------------------------------------------
+
+def render_verify_email_html(*, verify_url: str) -> str:
+    """Minimal branded HTML for account verification."""
+    brand = os.getenv("FROM_NAME", "SmartHirex Team")
+    return f"""
+<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f6f7fb;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f6f7fb;">
+      <tr>
+        <td align="center" style="padding:24px;">
+          <table width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#ffffff;border-radius:14px;box-shadow:0 2px 10px rgba(16,24,40,0.06);overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif;">
+            <tr>
+              <td style="background:linear-gradient(135deg,#2563eb,#1d4ed8);padding:20px 24px;color:#fff;">
+                <div style="font-size:18px;font-weight:700;">{brand}</div>
+                <div style="font-size:12px;opacity:.9;margin-top:4px;">Verify your email</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;">
+                <p style="margin:0 0 12px 0;font-size:16px;color:#111827;">Welcome!</p>
+                <p style="margin:0 0 16px 0;font-size:14px;color:#374151;line-height:1.6;">
+                  Please confirm your email address to activate your account.
+                </p>
+                <table cellpadding="0" cellspacing="0" border="0" align="center" style="margin:8px auto 8px auto;">
+                  <tr>
+                    <td align="center" bgcolor="#2563eb" style="border-radius:10px;">
+                      <a href="{verify_url}" target="_blank" style="display:inline-block;padding:12px 22px;font-size:14px;font-weight:600;color:#ffffff;background:#2563eb;border-radius:10px;text-decoration:none;">
+                        Verify my email
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:14px 0 0 0;font-size:12px;color:#6b7280;line-height:1.6;">
+                  If the button doesn’t work, copy and paste this link into your browser:<br />
+                  <a href="{verify_url}" target="_blank" style="color:#2563eb;word-break:break-all;">{verify_url}</a>
+                </p>
+              </td>
+            </tr>
+            <tr><td style="padding:0 24px 20px 24px;"><p style="margin:0;font-size:11px;color:#9ca3af;">© {os.getenv('EMAIL_COPYRIGHT_YEAR', '')} {brand}.</p></td></tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+""".strip()
+
+
+def send_verification_email(to: str, verify_url: str) -> None:
+    """Send account verification email using the shared SMTP helper."""
+    subject = "Verify your email"
+    html = render_verify_email_html(verify_url=verify_url)
+    send_email(to=to, subject=subject, html=html)
+
+
+async def async_send_verification_email(*, to: str, verify_url: str) -> None:
+    await async_send_email(to=to, subject="Verify your email", html=render_verify_email_html(verify_url=verify_url))
+
+
+# -----------------------------------------------------------------------------
+# ✅ Interview invite helpers (existing, kept as non-breaking additions)
 # -----------------------------------------------------------------------------
 
 def render_interview_invite_html(
