@@ -1,7 +1,10 @@
 # app/routers/candidate_router.py
-from fastapi import APIRouter, HTTPException, Path, Body
+from fastapi import APIRouter, HTTPException, Path, Body, Depends
 from typing import Literal, Optional, Any, Dict
 from app.utils.mongo import db
+
+# ✅ Auth (for ownership scoping)
+from app.routers.auth_router import get_current_user  # <-- added
 
 # ✅ NEW imports for scheduling
 from pydantic import BaseModel, Field, EmailStr, validator
@@ -29,12 +32,18 @@ router = APIRouter()
 
 
 @router.get("/{candidate_id}")
-async def get_candidate(candidate_id: str = Path(...)):
+async def get_candidate(
+    candidate_id: str = Path(...),
+    current_user: Any = Depends(get_current_user),  # <-- added
+):
     """
     Fetch full candidate detail by ID.
     Ensures all expected frontend fields are populated, even with defaults.
     """
-    candidate = await db.parsed_resumes.find_one({"_id": candidate_id})
+    # 🔒 scope to owner
+    candidate = await db.parsed_resumes.find_one(
+        {"_id": candidate_id, "ownerUserId": str(getattr(current_user, "id", None))}
+    )
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
@@ -78,13 +87,15 @@ async def get_candidate(candidate_id: str = Path(...)):
 @router.patch("/{candidate_id}/status")
 async def update_candidate_status(
     candidate_id: str = Path(...),
-    status: Literal["shortlisted", "rejected", "new", "interviewed"] = Body(..., embed=True)
+    status: Literal["shortlisted", "rejected", "new", "interviewed"] = Body(..., embed=True),
+    current_user: Any = Depends(get_current_user),  # <-- added
 ):
     """
     Update candidate status (shortlisted, rejected, etc).
     """
+    # 🔒 scope to owner in update filter
     result = await db.parsed_resumes.update_one(
-        {"_id": candidate_id},
+        {"_id": candidate_id, "ownerUserId": str(getattr(current_user, "id", None))},
         {"$set": {"status": status}}
     )
 
@@ -215,13 +226,16 @@ class ScheduleResp(TypedDict, total=False):
 async def schedule_interview_for_candidate(
     candidate_id: str = Path(...),
     body: ScheduleInterviewBody = Body(...),
+    current_user: Any = Depends(get_current_user),  # <-- added
 ) -> ScheduleResp:
     """
     Create a meeting record for this candidate, generate a meeting URL,
     and send the invite email.
     """
-    # Ensure the candidate exists and fetch fallback email if not provided
-    candidate = await db.parsed_resumes.find_one({"_id": candidate_id})
+    # 🔒 ensure candidate belongs to current user
+    candidate = await db.parsed_resumes.find_one(
+        {"_id": candidate_id, "ownerUserId": str(getattr(current_user, "id", None))}
+    )
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
@@ -257,6 +271,8 @@ async def schedule_interview_for_candidate(
         "meeting_url": meeting_url,
         "created_at": now_utc,
         "email_sent": False,
+        # 🔎 helpful for auditing/queries
+        "ownerUserId": str(getattr(current_user, "id", None)),
     }
 
     try:
@@ -290,6 +306,7 @@ async def schedule_interview_for_candidate(
                 "timezone": body.timezone,
                 "duration_mins": body.duration_mins,
                 "token": token,
+                "ownerUserId": str(getattr(current_user, "id", None)),
             },
         )
         await db.meetings.update_one(

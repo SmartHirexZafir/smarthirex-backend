@@ -1,15 +1,19 @@
 # ✅ File: app/chatbot_router.py
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
 from app.logic.intent_parser import parse_prompt
 from app.logic.response_builder import build_response
 from app.utils.mongo import db
 from datetime import datetime
+from app.routers.auth_router import get_current_user  # ✅ added
 
 router = APIRouter()
 
 @router.post("/query")
-async def handle_chatbot_query(request: Request):
+async def handle_chatbot_query(
+    request: Request,
+    current_user = Depends(get_current_user),  # ✅ enforce logged-in user
+):
     """
     Receives a natural language prompt from user,
     identifies intent, processes it, and responds accordingly.
@@ -26,12 +30,13 @@ async def handle_chatbot_query(request: Request):
     # Step 2: Get bot response
     response = await build_response(parsed)
 
-    # Step 3: Log analytics (always)
+    # Step 3: Log analytics (always) with ownership
     await db.chat_queries.insert_one({
         "prompt": prompt,
         "parsed": parsed,
         "response": response,
-        "timestamp": datetime.utcnow()
+        "timestamp": datetime.utcnow(),
+        "ownerUserId": str(current_user.id),  # ✅ scoped
     })
 
     # Step 4: Save history if this was a CV filtering prompt
@@ -45,7 +50,8 @@ async def handle_chatbot_query(request: Request):
             "timestamp_raw": timestamp_raw,
             "timestamp_display": timestamp_display,
             "totalMatches": len(response["resumes_preview"]),
-            "candidates": response["resumes_preview"]
+            "candidates": response["resumes_preview"],
+            "ownerUserId": str(current_user.id),  # ✅ scoped
         })
 
     # ✅ Step 5: Return resumes with response so frontend gets candidates

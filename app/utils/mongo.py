@@ -32,7 +32,7 @@ client = AsyncIOMotorClient(MONGODB_URI, tlsCAFile=certifi.where())
 db = client[MONGO_DB_NAME]
 
 # -----------------------------------------------------------------------------
-# Existing helpers (UNCHANGED behavior)
+# Existing helpers (UNCHANGED behavior, with additive ownership support)
 # -----------------------------------------------------------------------------
 
 # ✅ Optional: Called at app startup to confirm DB
@@ -40,8 +40,9 @@ async def verify_mongo_connection():
     try:
         collections = await db.list_collection_names()
         print(f"✅ MongoDB connected to '{MONGO_DB_NAME}'. Collections: {collections}")
-        # ✅ NEW (non-breaking): ensure useful indexes for meetings collection
+        # ✅ NEW (non-breaking): ensure useful indexes
         await ensure_meetings_indexes()
+        await ensure_parsed_resumes_indexes()
     except Exception as e:
         print("❌ MongoDB connection failed:", str(e))
         raise
@@ -54,19 +55,33 @@ def compute_cv_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-# ✅ NEW: Check if a resume already exists in DB by hash
-async def check_duplicate_cv_hash(text: str) -> bool:
+# ✅ UPDATED: Check if a resume already exists in DB by hash (scoped per user if provided)
+async def check_duplicate_cv_hash(text: str, owner_user_id: Optional[str] = None) -> bool:
+    """
+    If owner_user_id is provided, duplicate check is scoped to that user.
+    If not provided, falls back to legacy global check (backward-compatible).
+    """
     hash_val = compute_cv_hash(text)
-    existing = await db.parsed_resumes.find_one({"content_hash": hash_val})
+    query: Dict[str, Any] = {"content_hash": hash_val}
+    if owner_user_id:
+        query["ownerUserId"] = str(owner_user_id)
+    existing = await db.parsed_resumes.find_one(query)
     return existing is not None
 
 
-# ✅ NEW: Insert if not duplicate (returns inserted_id or None)
-async def insert_unique_resume(doc: dict) -> Optional[str]:
+# ✅ UPDATED: Insert if not duplicate (returns inserted_id or None); supports ownership
+async def insert_unique_resume(doc: dict, owner_user_id: Optional[str] = None) -> Optional[str]:
+    """
+    If owner_user_id is provided, the doc is attributed to that user and
+    duplicate detection is performed per-user. Otherwise retains legacy behavior.
+    """
     text = doc.get("raw_text", "")
     doc["content_hash"] = compute_cv_hash(text)
 
-    if await check_duplicate_cv_hash(text):
+    if owner_user_id:
+        doc["ownerUserId"] = str(owner_user_id)
+
+    if await check_duplicate_cv_hash(text, owner_user_id=owner_user_id):
         print("⚠️ Duplicate resume detected. Skipping insert.")
         return None
 
@@ -75,7 +90,7 @@ async def insert_unique_resume(doc: dict) -> Optional[str]:
 
 
 # -----------------------------------------------------------------------------
-# ✅ NEW: Meetings helpers for Schedule feature (non-breaking additions)
+# ✅ NEW: Index helpers
 # -----------------------------------------------------------------------------
 
 async def ensure_meetings_indexes() -> None:
@@ -87,9 +102,29 @@ async def ensure_meetings_indexes() -> None:
         await db.meetings.create_index("candidate_id")
         await db.meetings.create_index([("starts_at", 1)])
         await db.meetings.create_index("token", unique=True)
+        # Optional but useful if you added ownership to meetings:
+        await db.meetings.create_index("ownerUserId")
     except Exception as e:  # don't fail app startup if index creation fails
         print("⚠️ Failed to create meetings indexes:", e)
 
+
+async def ensure_parsed_resumes_indexes() -> None:
+    """
+    Helpful indexes for isolation & performance on parsed_resumes.
+    Safe to call multiple times.
+    """
+    try:
+        await db.parsed_resumes.create_index("ownerUserId")
+        await db.parsed_resumes.create_index("content_hash")
+        # Composite index to speed up per-user duplicate checks:
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("content_hash", 1)])
+    except Exception as e:
+        print("⚠️ Failed to create parsed_resumes indexes:", e)
+
+
+# -----------------------------------------------------------------------------
+# ✅ Meetings helpers for Schedule feature (non-breaking additions)
+# -----------------------------------------------------------------------------
 
 async def create_meeting(doc: Dict[str, Any]) -> str:
     """
@@ -111,12 +146,17 @@ async def get_meeting_by_token(token: str) -> Optional[Dict[str, Any]]:
     return await db.meetings.find_one({"token": token})
 
 
-async def list_meetings_by_candidate(candidate_id: str) -> List[Dict[str, Any]]:
+async def list_meetings_by_candidate(candidate_id: str, owner_user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     List meetings for a given candidate, most recent first.
+    If owner_user_id is provided, results are scoped to that owner (recommended).
     """
+    query: Dict[str, Any] = {"candidate_id": candidate_id}
+    if owner_user_id:
+        query["ownerUserId"] = str(owner_user_id)
+
     out: List[Dict[str, Any]] = []
-    cursor = db.meetings.find({"candidate_id": candidate_id}).sort("starts_at", -1)
+    cursor = db.meetings.find(query).sort("starts_at", -1)
     async for m in cursor:
         m["_id"] = str(m.get("_id"))
         out.append(m)
