@@ -5,8 +5,12 @@ from app.utils.mongo import db, compute_cv_hash, check_duplicate_cv_hash
 from app.logic.ml_interface import clean_text, model, vectorizer, label_encoder
 from app.routers.auth_router import get_current_user  # ✅ added import
 import uuid
+import os
 
 router = APIRouter()
+
+ALLOWED_EXTS = {".pdf", ".doc", ".docx"}
+MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10MB (frontend copy says 10MB)
 
 @router.post("/upload-resumes")
 async def upload_resumes(
@@ -15,21 +19,50 @@ async def upload_resumes(
 ):
     parsed_resumes = []
 
+    # counters to help UI show "X of Y"
+    received_count = len(files)
+    inserted_count = 0
+    skipped_duplicates = 0
+    skipped_unsupported = 0
+    skipped_empty = 0
+    skipped_too_large = 0
+    skipped_parse_error = 0
+
     for file in files:
-        if not (file.filename.endswith(".pdf") or file.filename.endswith(".docx")):
-            raise HTTPException(status_code=400, detail=f"Unsupported file format: {file.filename}")
+        # ✅ allow pdf, doc, docx (align with frontend)
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in ALLOWED_EXTS:
+            skipped_unsupported += 1
+            continue
 
         contents = await file.read()
-        resume_data = parse_resume_file(file.filename, contents)
+        if not contents:
+            skipped_empty += 1
+            continue
 
-        raw_text = resume_data.get("raw_text", "")
+        # ✅ enforce 10MB to match frontend hint
+        if len(contents) > MAX_SIZE_BYTES:
+            skipped_too_large += 1
+            continue
+
+        # Parse safely
+        try:
+            resume_data = parse_resume_file(file.filename, contents)
+        except Exception:
+            skipped_parse_error += 1
+            continue
+
+        raw_text = resume_data.get("raw_text", "") or ""
         if not raw_text.strip():
+            skipped_empty += 1
             continue
 
-        # 🚫 Skip duplicates
-        if await check_duplicate_cv_hash(raw_text):
+        # 🚫 Skip duplicates (scoped per-user)
+        if await check_duplicate_cv_hash(raw_text, owner_user_id=current_user.id):
+            skipped_duplicates += 1
             continue
 
+        # --- ML prediction (unchanged) ---
         cleaned = clean_text(raw_text)
         features = vectorizer.transform([cleaned])
         prediction = model.predict(features)
@@ -75,6 +108,7 @@ async def upload_resumes(
 
         # ✅ Save to database
         await db.parsed_resumes.insert_one(resume_data)
+        inserted_count += 1
 
         # ✅ Minimal safe fields for frontend
         parsed_resumes.append({
@@ -93,5 +127,15 @@ async def upload_resumes(
 
     return {
         "message": "Resumes processed successfully",
-        "resumes": parsed_resumes
+        "resumes": parsed_resumes,          # keep existing shape for frontend
+        # ➕ extra counters (non-breaking) — helpful for progress UI
+        "received": received_count,
+        "inserted": inserted_count,
+        "skipped": {
+            "duplicates": skipped_duplicates,
+            "unsupported": skipped_unsupported,
+            "empty": skipped_empty,
+            "too_large": skipped_too_large,
+            "parse_error": skipped_parse_error,
+        },
     }
