@@ -40,7 +40,7 @@ async def upload_resumes(
             skipped_empty += 1
             continue
 
-        # ✅ enforce 10MB to match frontend hint
+        # ✅ enforce 10MB to match frontend hint/constraint
         if len(contents) > MAX_SIZE_BYTES:
             skipped_too_large += 1
             continue
@@ -77,7 +77,10 @@ async def upload_resumes(
         resume_data["confidence"] = round(confidence * 100, 2)
         resume_data["filename"] = file.filename
         resume_data["experience"] = resume_data.get("experience", 0)
-        resume_data["name"] = resume_data.get("name") or "Unnamed Candidate"
+
+        # 🔁 IMPORTANT: aap ki requirement ke mutabiq missing name => "No Name"
+        resume_data["name"] = (resume_data.get("name") or "").strip() or "No Name"
+
         resume_data["location"] = resume_data.get("location") or "N/A"
         resume_data["raw_text"] = raw_text
 
@@ -113,8 +116,9 @@ async def upload_resumes(
         # ✅ Minimal safe fields for frontend
         parsed_resumes.append({
             "_id": resume_data["_id"],
-            "name": resume_data["name"],
+            "name": resume_data["name"],  # "No Name" if missing
             "predicted_role": resume_data["predicted_role"],
+            "category": resume_data["category"],  # ➕ included for frontend convenience
             "experience": resume_data["experience"],
             "location": resume_data["location"],
             "confidence": resume_data["confidence"],

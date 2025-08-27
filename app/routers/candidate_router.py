@@ -1,19 +1,18 @@
 # app/routers/candidate_router.py
 from fastapi import APIRouter, HTTPException, Path, Body, Depends
-from typing import Literal, Optional, Any, Dict
+from typing import Literal, Optional, Any, Dict, TypedDict
 from app.utils.mongo import db
 
-# ✅ Auth (for ownership scoping)
-from app.routers.auth_router import get_current_user  # <-- added
+# ✅ Auth (ownership scoping)
+from app.routers.auth_router import get_current_user
 
-# ✅ NEW imports for scheduling
-from pydantic import BaseModel, Field, EmailStr, validator
+# ✅ Scheduling / validation
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from datetime import datetime, timezone
 import uuid
-from typing import TypedDict
 
 try:
-    # Optional helpers if you already have them in your project
+    # Optional helpers if already present in your project
     from app.utils.emailer import send_interview_invite as _send_interview_invite  # type: ignore
 except Exception:
     _send_interview_invite = None  # type: ignore
@@ -34,31 +33,27 @@ router = APIRouter()
 @router.get("/{candidate_id}")
 async def get_candidate(
     candidate_id: str = Path(...),
-    current_user: Any = Depends(get_current_user),  # <-- added
+    current_user: Any = Depends(get_current_user),
 ):
     """
-    Fetch full candidate detail by ID.
-    Ensures all expected frontend fields are populated, even with defaults.
+    Fetch full candidate detail by ID (scoped to owner).
+    Ensures all expected frontend fields are present with safe defaults.
     """
-    # 🔒 scope to owner
-    candidate = await db.parsed_resumes.find_one(
-        {"_id": candidate_id, "ownerUserId": str(getattr(current_user, "id", None))}
-    )
+    owner_id = str(getattr(current_user, "id", None))
+    candidate = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     # Resume object & defaults
-    candidate.setdefault("resume", {})
-    resume = candidate["resume"]
-
+    resume = candidate.setdefault("resume", {})
     resume.setdefault("summary", "")
     resume.setdefault("education", [])
     resume.setdefault("workHistory", [])
     resume.setdefault("projects", [])
     resume.setdefault("filename", candidate.get("filename", "resume.pdf"))
-    resume.setdefault("url", candidate.get("resume_url", ""))  # Optional: download link
+    resume.setdefault("url", candidate.get("resume_url", ""))  # optional download link
 
-    # Analysis fields
+    # Analysis fields (safe defaults)
     candidate["score"] = candidate.get("score", 0)
     candidate["testScore"] = candidate.get("testScore", 0)
     candidate["matchedSkills"] = candidate.get("matchedSkills", [])
@@ -69,7 +64,7 @@ async def get_candidate(
     candidate["rank"] = candidate.get("rank", 0)
 
     # Profile info
-    candidate["name"] = candidate.get("name", "Unnamed Candidate")
+    candidate["name"] = candidate.get("name", "No Name")
     candidate["location"] = candidate.get("location", "N/A")
     candidate["currentRole"] = candidate.get("currentRole", "N/A")
     candidate["company"] = candidate.get("company", "N/A")
@@ -88,36 +83,38 @@ async def get_candidate(
 async def update_candidate_status(
     candidate_id: str = Path(...),
     status: Literal["shortlisted", "rejected", "new", "interviewed"] = Body(..., embed=True),
-    current_user: Any = Depends(get_current_user),  # <-- added
+    current_user: Any = Depends(get_current_user),
 ):
     """
-    Update candidate status (shortlisted, rejected, etc).
+    Update candidate status (scoped to owner).
+    Returns 404 only if the candidate doesn't exist or isn't owned by user.
     """
-    # 🔒 scope to owner in update filter
+    owner_id = str(getattr(current_user, "id", None))
     result = await db.parsed_resumes.update_one(
-        {"_id": candidate_id, "ownerUserId": str(getattr(current_user, "id", None))},
-        {"$set": {"status": status}}
+        {"_id": candidate_id, "ownerUserId": owner_id},
+        {"$set": {"status": status}},
     )
 
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Candidate not found or status unchanged")
+    # In Mongo, modified_count may be 0 if value was already the same.
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Candidate not found")
 
-    return {"message": f"Candidate status updated to '{status}'."}
+    return {"message": f"Candidate status set to '{status}'."}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ✅ NEW: Schedule Interview (scoped to a candidate)
 #     POST /candidate/{candidate_id}/schedule
-#     This mirrors the discussed flow and works with Motor (async Mongo).
+#     Motor (async Mongo) friendly, with email + meeting URL support.
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ScheduleInterviewBody(BaseModel):
     """
-    Body expected from the frontend ScheduleInterviewModal.tsx
-    (camelCase aliases kept for parity with UI service).
+    Body expected from the frontend ScheduleInterviewModal.tsx.
+    camelCase aliases kept for parity with UI service.
     """
     email: Optional[EmailStr] = None
-    starts_at: datetime = Field(alias="startsAt")               # ISO-8601, treated/converted to UTC
+    starts_at: datetime = Field(alias="startsAt")               # ISO-8601, converted to UTC
     timezone: str                                               # IANA TZ, e.g., "Asia/Karachi"
     duration_mins: int = Field(alias="durationMins", ge=1, le=480)
     title: str
@@ -126,14 +123,16 @@ class ScheduleInterviewBody(BaseModel):
 
     model_config = {"populate_by_name": True}
 
-    @validator("starts_at")
-    def normalize_to_utc(cls, v: datetime) -> datetime:
+    @field_validator("starts_at")
+    @classmethod
+    def _normalize_to_utc(cls, v: datetime) -> datetime:
         if v.tzinfo is None:
             return v.replace(tzinfo=timezone.utc)
         return v.astimezone(timezone.utc)
 
-    @validator("timezone")
-    def validate_tz(cls, v: str) -> str:
+    @field_validator("timezone")
+    @classmethod
+    def _validate_tz(cls, v: str) -> str:
         if not v:
             raise ValueError("timezone is required")
         if ZoneInfo:
@@ -161,13 +160,12 @@ async def _send_invite_email(
     meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Thin async wrapper around your email utility. If your util is sync, we'll
-    run it in a thread so we don't block the event loop.
+    Thin async wrapper around your email utility.
+    If your util is sync, run in a thread to avoid blocking the event loop.
     """
     if _send_interview_invite is None:
         raise RuntimeError("Email utility not available. Implement app.utils.emailer.send_interview_invite().")
 
-    # Run sync function without blocking the event loop
     try:
         import anyio
         await anyio.to_thread.run_sync(
@@ -226,16 +224,14 @@ class ScheduleResp(TypedDict, total=False):
 async def schedule_interview_for_candidate(
     candidate_id: str = Path(...),
     body: ScheduleInterviewBody = Body(...),
-    current_user: Any = Depends(get_current_user),  # <-- added
+    current_user: Any = Depends(get_current_user),
 ) -> ScheduleResp:
     """
     Create a meeting record for this candidate, generate a meeting URL,
-    and send the invite email.
+    and send the invite email (all scoped to the current owner).
     """
-    # 🔒 ensure candidate belongs to current user
-    candidate = await db.parsed_resumes.find_one(
-        {"_id": candidate_id, "ownerUserId": str(getattr(current_user, "id", None))}
-    )
+    owner_id = str(getattr(current_user, "id", None))
+    candidate = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
@@ -248,7 +244,8 @@ async def schedule_interview_for_candidate(
         raise HTTPException(status_code=400, detail="startsAt must be in the future.")
 
     token = uuid.uuid4().hex
-    # Use project helper if available
+
+    # Build meeting URL (prefer project helper)
     if _build_meeting_url:
         try:
             meeting_url = _build_meeting_url(token)  # type: ignore
@@ -271,8 +268,8 @@ async def schedule_interview_for_candidate(
         "meeting_url": meeting_url,
         "created_at": now_utc,
         "email_sent": False,
-        # 🔎 helpful for auditing/queries
-        "ownerUserId": str(getattr(current_user, "id", None)),
+        # Auditing / scoping
+        "ownerUserId": owner_id,
     }
 
     try:
@@ -306,7 +303,7 @@ async def schedule_interview_for_candidate(
                 "timezone": body.timezone,
                 "duration_mins": body.duration_mins,
                 "token": token,
-                "ownerUserId": str(getattr(current_user, "id", None)),
+                "ownerUserId": owner_id,
             },
         )
         await db.meetings.update_one(
