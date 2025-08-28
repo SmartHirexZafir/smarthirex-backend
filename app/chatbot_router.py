@@ -74,6 +74,56 @@ def _candidate_text_blob(c: Dict[str, Any]) -> str:
     return " • ".join(parts).lower()
 
 
+def _candidate_title_text(c: Dict[str, Any]) -> str:
+    """Collect title-like fields for strict role checks."""
+    r = c.get("resume") or {}
+    parts = [
+        c.get("predicted_role"),
+        c.get("category"),
+        c.get("currentRole"),
+        r.get("title"),
+        r.get("job_title"),
+        r.get("current_title"),
+        r.get("headline"),
+    ]
+    return " ".join(str(x) for x in parts if x).lower()
+
+
+def _role_matches(wanted_role: Optional[str], c: Dict[str, Any]) -> bool:
+    """
+    Returns True if:
+      - no role requested, or
+      - requested role (or its suffix word) appears in candidate title text
+    """
+    if not wanted_role:
+        return True
+    want = wanted_role.strip().lower()
+    title_blob = _candidate_title_text(c)
+
+    # direct substring
+    if want and want in title_blob:
+        return True
+
+    # suffix-based (designer|developer|engineer|scientist|analyst|manager|architect)
+    # and presence of a leading keyword (e.g., "web", "data", "ui/ux")
+    m = re.search(
+        r"\b([a-z][a-z ]*?)\s+(designer|developer|engineer|scientist|analyst|manager|architect)\b",
+        want,
+    )
+    if m:
+        lead = m.group(1).strip()
+        suffix = m.group(2).strip()
+        if suffix in title_blob and (not lead or lead in title_blob):
+            return True
+
+    # light synonyms for design roles
+    if "designer" in want or "design" in want:
+        if any(tok in title_blob for tok in ["designer", "design", "ui", "ux"]):
+            return True
+
+    return False
+
+
 def _candidate_years(c: Dict[str, Any]) -> float:
     """
     Try to convert experience into a number of years.
@@ -141,11 +191,16 @@ async def _fallback_filter_for_owner(
     """
     If primary pipeline returns no results, try a lightweight fuzzy filter
     over the owner's resumes to avoid false 'no results'.
+    - Adds a strict *role/title* check so irrelevant roles are not returned.
     """
     # 🔧 use imported normalize helpers (fixed names)
     norm = normalize_prompt(prompt_like)
     keywords = provided_keywords or norm["keywords"]
     min_years = extract_min_years(norm["normalized_prompt"])
+
+    # parse a concrete job title (e.g. 'web designer', 'data scientist')
+    parsed = parse_prompt(prompt_like) or {}
+    wanted_role = parsed.get("job_title")
 
     # fetch a reasonable slice (you can index later for scale)
     cursor = db.parsed_resumes.find(
@@ -174,13 +229,18 @@ async def _fallback_filter_for_owner(
 
     scored: List[Dict[str, Any]] = []
     for c in docs:
+        # 🚫 discard if role/title clearly doesn't match
+        if not _role_matches(wanted_role, c):
+            continue
+
         hay = _candidate_text_blob(c)
         score = 0.0
 
         for k in keywords:
             if k in hay:
                 score += 10
-            if re.search(r"(developer|engineer|scientist|designer|manager)", k):
+            # tiny preference for role-ish tokens
+            if re.search(r"(developer|engineer|scientist|designer|manager|architect|analyst)", k):
                 score += 5
 
         yrs = _candidate_years(c)
@@ -269,6 +329,7 @@ async def handle_chatbot_query(
             "reply": "You haven't uploaded any resumes yet.",
             "message": "no_cvs_uploaded",
             "no_cvs_uploaded": True,
+            "no_results": False,
             "resumes_preview": [],
             "matchMeta": {"strictCount": 0, "closeCount": 0, "total": 0, "hasExact": False, "hasClose": False},
         }
@@ -285,6 +346,7 @@ async def handle_chatbot_query(
     parsed = parse_prompt(prompt) or {}
     parsed.setdefault("normalized_prompt", normalized_prompt)
     parsed.setdefault("keywords", keywords)
+    parsed.setdefault("ownerUserId", owner_id)  # 👈 pass owner for downstream filtering
 
     # Step 2: Build response (existing pipeline)
     response = await build_response(parsed)  # keep as-is
@@ -293,7 +355,7 @@ async def handle_chatbot_query(
     raw_preview = response.get("resumes_preview", []) or []
     filtered_preview = await _owner_preview_filter(raw_preview, owner_id)
 
-    # ✅ Server-side fallback fuzzy filter if nothing left
+    # ✅ Server-side fallback fuzzy filter if nothing left (now role-aware)
     if not filtered_preview:
         filtered_preview = await _fallback_filter_for_owner(
             owner_id=owner_id,
@@ -303,6 +365,7 @@ async def handle_chatbot_query(
 
     # Summarize matches for UI messaging
     match_meta = _summarize_matches(filtered_preview)
+    no_results = match_meta["total"] == 0  # 👈 add this flag
 
     # Step 3: Log analytics (scoped)
     await db.chat_queries.insert_one(
@@ -333,20 +396,23 @@ async def handle_chatbot_query(
             }
         )
 
-    # Step 5: Context-aware reply (no blunt "No exact matching")
-    reply_text: str
-    if match_meta["total"] == 0:
-        reply_text = "No candidates matched your filters."
-    elif match_meta["hasExact"]:
-        # Use model's reply if present; else provide a helpful default
-        reply_text = response.get("reply") or f"Found {match_meta['strictCount']} exact match(es)."
-    else:
-        reply_text = "No exact matches found, showing closest results instead."
+    # Step 5: Context-aware reply text for UI banners
+    count = match_meta["total"]
+    reply_text = f"Showing {count} result{'s' if count != 1 else ''} for your query."
+    if count == 0:
+        reply_text = "Showing 0 results for your query."
 
     return {
-        "reply": reply_text,
-        "resumes_preview": filtered_preview,
+        "reply": reply_text,                     # for the chat bubble
+        "resumes_preview": filtered_preview,     # cards
         "normalized_prompt": normalized_prompt,  # extra context for UI
         "keywords": keywords,                    # extra context for UI
-        "matchMeta": match_meta,                 # ✅ UI can decide banners/messages
+        "matchMeta": match_meta,                 # counts for banners
+        "no_results": no_results,                # 👈 NEW flag for UI (hide analyzing + 3s toast)
+        "no_cvs_uploaded": False,
+        # convenience for candidate filter header
+        "ui": {
+            "primaryMessage": reply_text,        # "Showing N results for your query."
+            "query": prompt,                     # original query text (to print under header)
+        },
     }

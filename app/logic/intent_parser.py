@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional, Tuple, Any
 
 # ---------------------------
-# Existing logic (unchanged)
+# Existing logic (unchanged APIs preserved)
 # ---------------------------
 
 def detect_usage_help(prompt: str) -> bool:
@@ -45,21 +45,62 @@ def detect_show_all(prompt: str) -> bool:
 # New helpers (additive only)
 # ---------------------------
 
+# NOTE: keep a broad suffix list (singular) and allow plural via regex.
 _TITLE_SUFFIXES = (
     "engineer|developer|scientist|analyst|manager|architect|specialist|consultant|"
     "researcher|designer|administrator|lead|head|officer|intern"
 )
+
+# Canonical role families to help the backend do a strict role gate.
+# Order matters (more specific before generic).
+_ROLE_FAMILY_PATTERNS: List[Tuple[str, str]] = [
+    (r"\b(ui/?ux|ux/?ui)\s+designer(?:s|es)?\b",                "ui/ux designer"),
+    (r"\bproduct\s+designer(?:s|es)?\b",                        "product designer"),
+    (r"\b(web|visual|graphic)\s+designer(?:s|es)?\b",           "web designer"),
+    (r"\bfront[\- ]?end\s+(developer|engineer)(?:s|es)?\b",     "frontend developer"),
+    (r"\bback[\- ]?end\s+(developer|engineer)(?:s|es)?\b",      "backend developer"),
+    (r"\bfull[\- ]?stack\s+(developer|engineer)(?:s|es)?\b",    "full stack developer"),
+    (r"\bmobile\s+(developer|engineer)(?:s|es)?\b",             "mobile developer"),
+    (r"\b(android|ios)\s+(developer|engineer)(?:s|es)?\b",      "mobile developer"),
+    (r"\b(etl)\s+(developer|engineer)(?:s|es)?\b",              "etl developer"),
+    (r"\bdevops\b|\bsre\b|\bsite reliability\b",                "devops/sre"),
+    (r"\bqa\b|\bquality assurance\b|\btest(ing)?\s+engineer\b", "qa engineer"),
+    (r"\bdata\s+scientist(?:s|es)?\b",                          "data scientist"),
+    (r"\bdata\s+engineer(?:s|es)?\b",                           "data engineer"),
+    (r"\b(machine learning|ml)\s+(engineer|scientist)(?:s|es)?\b","ml engineer"),
+    (r"\bai\s+(engineer|scientist)(?:s|es)?\b",                 "ai engineer"),
+]
+
+def _normalize_role_family(title: Optional[str]) -> Optional[str]:
+    """
+    Map a free-text title to a canonical role family string (best-effort).
+    Returns None if we cannot confidently classify.
+    """
+    if not title:
+        return None
+    t = title.lower().strip()
+    for pattern, family in _ROLE_FAMILY_PATTERNS:
+        if re.search(pattern, t):
+            return family
+    # generic fallbacks if nothing matched but we have a known suffix
+    if re.search(r"\bdesigner(?:s|es)?\b", t):
+        return "designer"
+    if re.search(r"\b(developer|engineer)(?:s|es)?\b", t):
+        return "software developer"
+    if re.search(r"\bscientist(?:s|es)?\b", t):
+        return "scientist"
+    if re.search(r"\banalyst(?:s|es)?\b", t):
+        return "analyst"
+    return None
 
 def _clean_list(text: str) -> List[str]:
     """
     Split comma/pipe/slash/plus/semicolon and also break on 'and' when used as list glue.
     Keep lowercased trimmed tokens, ignore empties.
     """
-    # First split by common delimiters
     parts = re.split(r"[,\|/;+]", text)
     items: List[str] = []
     for part in parts:
-        # Then split by ' and ' if it looks like a list
         subparts = re.split(r"\band\b", part, flags=re.IGNORECASE)
         for sp in subparts:
             t = re.sub(r"\s+", " ", sp).strip().lower()
@@ -69,15 +110,15 @@ def _clean_list(text: str) -> List[str]:
 
 def _extract_title(prompt: str) -> Optional[str]:
     """
-    Try to pick a professional title like 'data scientist', 'ml engineer', etc.
+    Try to pick a professional title like 'web designer', 'ml engineer', etc.
     Strategy:
-      1) Look for longest phrase ending with a known title suffix.
+      1) Look for longest phrase ending with a known title suffix (allow plural).
       2) Fallback: phrase after 'for' (short).
     """
     p = prompt.lower()
 
-    # 1) Suffix-based longest match
-    matches = list(re.finditer(rf"\b([a-z][a-z ]*?)\s+({_TITLE_SUFFIXES})\b", p))
+    # 1) Suffix-based longest match (allow plural 's' or 'es')
+    matches = list(re.finditer(rf"\b([a-z][a-z ]*?)\s+((?:{_TITLE_SUFFIXES})(?:es|s)?)\b", p))
     if matches:
         best = max(matches, key=lambda m: len(m.group(0)))
         return re.sub(r"\s+", " ", best.group(0)).strip()
@@ -96,18 +137,19 @@ def _extract_locations(prompt: str) -> List[str]:
     p = prompt.lower()
     locs: List[str] = []
 
-    # patterns like: "in Lahore", "based in Karachi", "from Islamabad", "located in Dubai, UAE"
+    # patterns like: "in Lahore", "based in Karachi", etc.
     for pat in [
         r"\bbased in\s+([a-z ,/\-]+)",
         r"\blocated in\s+([a-z ,/\-]+)",
         r"\bfrom\s+([a-z ,/\-]+)",
-        r"\bin\s+([a-z ,/\-]+)",
+        # guard: avoid 'experience in <tech>' by requiring delimiter or start
+        r"(?:(?:^)|(?:\s))(?:in)\s+([a-z ,/\-]+)",
     ]:
         for m in re.finditer(pat, p):
             chunk = m.group(1)
-            chunk = re.split(r"\b(with|having|and|skills?|experience|projects?|for|,|\.|;)\b", chunk)[0]
+            # stop at common non-location tokens
+            chunk = re.split(r"\b(with|having|and|skills?|experience|projects?|for|using|on|of|,|\.|;)\b", chunk)[0]
             for item in _clean_list(chunk):
-                # keep city/country tokens; ignore generic words
                 if item and not re.fullmatch(r"(with|and|or|the|a|an|remote|onsite|on site|wfh)", item):
                     locs.append(item)
 
@@ -345,6 +387,7 @@ def _extract_experience(prompt: str) -> Dict[str, float]:
 def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize collected fields into keys expected by downstream.
+    (Additive: we keep existing keys and supply a few helpful aliases.)
     """
     out: Dict[str, Any] = {
         "intent": "filter_cv",
@@ -352,10 +395,16 @@ def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
     }
     if parsed.get("job_title"):
         out["job_title"] = parsed["job_title"]
+        # helpful aliases for strict gating downstream
+        out["job_title_normalized"] = parsed["job_title"]
+    if parsed.get("role_family"):
+        out["role_family"] = parsed["role_family"]
     if parsed.get("locations"):
         out["locations"] = parsed["locations"]
     if parsed.get("skills_all"):
         out["skills_all"] = parsed["skills_all"]
+        # alias to emphasize MUST-have list (UI/ML may prefer this name)
+        out["must_have_skills"] = parsed["skills_all"]
     if parsed.get("skills_any"):
         out["skills_any"] = parsed["skills_any"]
     if parsed.get("skills_exclude"):
@@ -368,6 +417,11 @@ def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
         out["experience"] = parsed["experience"]
     if "skills_all_strict" in parsed:
         out["skills_all_strict"] = bool(parsed["skills_all_strict"])
+    # convenience numeric bounds (additive; safely ignored if unused)
+    if "min_years" in parsed and parsed["min_years"] is not None:
+        out["min_years"] = parsed["min_years"]
+    if "max_years" in parsed and parsed["max_years"] is not None:
+        out["max_years"] = parsed["max_years"]
     return out
 
 # ---------------------------
@@ -382,15 +436,18 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
     {
       "intent": "filter_cv",
       "query": "...",
-      "job_title": "data scientist",
-      "locations": ["karachi","pakistan"],
-      "skills_all": ["excel","powerpoint","flora"],
-      "skills_all_strict": true,          # <- detected from “must include”
-      "skills_any": ["python","r"],
+      "job_title": "web designer",
+      "role_family": "web designer",
+      "locations": ["lahore","pakistan"],
+      "skills_all": ["figma","html","css"],
+      "skills_all_strict": true,
+      "skills_any": ["react","illustrator"],
       "skills_exclude": ["php"],
-      "projects_required": true,          # <- detected from wording
-      "projects_keywords": ["fraud detection"],
-      "experience": {"gte": 7, "lte": 9}  # or {"op": "<=", "years": 5}, etc.
+      "projects_required": true,
+      "projects_keywords": ["portfolio redesign"],
+      "experience": {"gte": 2, "lte": 5},
+      "min_years": 2,
+      "max_years": 5
     }
     """
     prompt = prompt.strip()
@@ -404,15 +461,28 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
 
     # Structured extraction
     title = _extract_title(prompt)
+    role_family = _normalize_role_family(title)
     locations = _extract_locations(prompt)
     skills_all, skills_any, skills_exclude, skills_all_strict = _extract_skills(prompt)
     projects_keywords = _extract_projects_keywords(prompt)
     projects_required = _projects_required_flag(prompt)
     experience = _extract_experience(prompt)
 
+    # derive min/max if present (additive convenience for scorers)
+    min_years = None
+    max_years = None
+    if isinstance(experience, dict):
+        if "gte" in experience:
+            min_years = experience["gte"]
+        if "lte" in experience:
+            max_years = experience["lte"]
+        if experience.get("op") == "=" and "years" in experience:
+            min_years = max_years = experience["years"]
+
     parsed: Dict[str, Any] = {
         "query": prompt.lower(),
         "job_title": title or None,
+        "role_family": role_family or None,
         "locations": locations or None,
         "skills_all": skills_all or None,
         "skills_any": skills_any or None,
@@ -421,6 +491,8 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
         "projects_keywords": projects_keywords or None,
         "projects_required": projects_required,  # boolean
         "experience": experience or None,
+        "min_years": min_years,
+        "max_years": max_years,
     }
 
     # return normalized structure (intent = filter_cv by default)

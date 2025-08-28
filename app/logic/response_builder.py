@@ -40,12 +40,15 @@ def _as_set(items: Any) -> Set[str]:
 
 
 def _get_job_title(resume: Dict[str, Any]) -> str:
-    # try common keys, fallback to empty
+    # include common aliases seen in parsed resumes
     return _lower(
         resume.get("title")
         or resume.get("job_title")
         or resume.get("current_title")
         or resume.get("headline")
+        or resume.get("currentRole")          # 👈 added
+        or resume.get("predicted_role")       # 👈 added
+        or resume.get("category")             # 👈 added
         or ""
     )
 
@@ -76,11 +79,20 @@ def _get_skills(resume: Dict[str, Any]) -> Set[str]:
 
 
 def _get_projects_text(resume: Dict[str, Any]) -> str:
-    # Combine different project fields
+    # Combine different project fields; handle dict/list shapes robustly
     parts: List[str] = []
     projects = resume.get("projects")
+
     if isinstance(projects, list):
-        parts.extend([str(p) for p in projects])
+        for p in projects:
+            if isinstance(p, dict):
+                parts.append(str(p.get("name", "")))
+                parts.append(str(p.get("description", "")))
+            else:
+                parts.append(str(p))
+    elif isinstance(projects, dict):
+        parts.append(str(projects.get("name", "")))
+        parts.append(str(projects.get("description", "")))
     elif isinstance(projects, str):
         parts.append(projects)
 
@@ -239,10 +251,10 @@ def _match_experience(years_value: Optional[float], parsed: Dict[str, Any], *, r
 
     # Form 4: explicit more_than / less_than
     if parsed.get("experience_more_than") is not None:
-        if not _cmp_years(years_value, "gt", float(parsed["experience_more_than"])):
+        if not _cmp_years(years_value, "gt", float(parsed["experience_more_than"])):  # pyright: ignore
             return False
     if parsed.get("experience_less_than") is not None:
-        if not _cmp_years(years_value, "lt", float(parsed["experience_less_than"])):
+        if not _cmp_years(years_value, "lt", float(parsed["experience_less_than"])):  # pyright: ignore
             return False
 
     # No constraints found
@@ -277,12 +289,15 @@ def _collect_filter_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 def _has_any_filters(parsed: Dict[str, Any]) -> bool:
     spec = _collect_filter_intent(parsed)
-    # remove booleans from the check; presence of any non-empty set counts
+    # presence of any non-empty set counts
     if spec["titles"] or spec["locations"] or spec["skills_all"] or spec["skills_any"] or spec["skills_exclude"] or spec["projects_terms"]:
         return True
-    # experience counts as a filter as well
-    exp = parsed.get("experience")
-    return bool(exp)
+    # experience counts as a filter as well (support all shapes)
+    if parsed.get("experience"):
+        return True
+    if any(parsed.get(k) is not None for k in ("min_experience", "max_experience", "experience_more_than", "experience_less_than")):
+        return True
+    return False
 
 
 def _apply_structured_filters(
@@ -322,15 +337,38 @@ def _apply_structured_filters(
 
 
 # ---------------------------
+# Match summary for UI
+# ---------------------------
+def _summarize_matches(preview: List[Dict[str, Any]]) -> Dict[str, Any]:
+    strict_count = 0
+    close_count = 0
+    for p in preview or []:
+        if p.get("is_strict_match") is True or p.get("match_type") == "exact":
+            strict_count += 1
+        elif p.get("is_strict_match") is False or p.get("match_type") == "close":
+            close_count += 1
+        else:
+            strict_count += 1  # default to strict if flags missing
+    total = len(preview or [])
+    return {
+        "strictCount": strict_count,
+        "closeCount": close_count,
+        "total": total,
+        "hasExact": strict_count > 0,
+        "hasClose": close_count > 0 or (total > 0 and strict_count < total),
+    }
+
+
+# ---------------------------
 # Main entry
 # ---------------------------
 async def build_response(parsed_data: dict) -> dict:
     intent = parsed_data.get("intent")
-    prompt = parsed_data.get("query", "")
+    # prefer original query if present else normalized_prompt (prevents blank UI text)
+    prompt = (parsed_data.get("query") or parsed_data.get("normalized_prompt") or "").strip()
 
     if intent in ("filter_cv", "show_all"):
         # 1) Get semantic candidates (existing behavior preserved)
-        #    We pass normalized inputs when available to stay consistent with ml_interface scoring.
         resumes = await get_semantic_matches(
             prompt,
             owner_user_id=parsed_data.get("ownerUserId"),  # may be None; fine
@@ -343,11 +381,13 @@ async def build_response(parsed_data: dict) -> dict:
         # SHOW ALL → no structured filters (but keep original match flags)
         if intent == "show_all":
             count = len(resumes or [])
-            reply_text = f"Found {count} candidate{'s' if count != 1 else ''}."
+            reply_text = f"Showing {count} results for your query."
             return {
                 "reply": reply_text,
                 "redirect": redirect_url,
                 "resumes_preview": resumes or [],
+                "matchMeta": _summarize_matches(resumes or []),  # ✅ handy for UI header
+                "ui": {"primaryMessage": reply_text, "query": prompt},
             }
 
         # 2) Apply strict structured filters if the parser provided any
@@ -362,11 +402,13 @@ async def build_response(parsed_data: dict) -> dict:
                 if "match_type" not in it:
                     it["match_type"] = "exact"
             count = len(filtered_resumes)
-            reply_text = f"Found {count} candidate{'s' if count != 1 else ''} matching your filters."
+            reply_text = f"Showing {count} results for your query."
             return {
                 "reply": reply_text,
                 "redirect": redirect_url,
                 "resumes_preview": filtered_resumes,
+                "matchMeta": _summarize_matches(filtered_resumes),
+                "ui": {"primaryMessage": reply_text, "query": prompt},
             }
 
         # 3) If nothing found but filters were present, try a *soft* fallback:
@@ -378,38 +420,40 @@ async def build_response(parsed_data: dict) -> dict:
                     it["is_strict_match"] = False
                     it["match_type"] = "close"
                 count = len(relaxed)
-                reply_text = (
-                    "No exact matches for your experience criteria. "
-                    f"Showing {count} closest match{'es' if count != 1 else ''} (experience relaxed)."
-                )
+                reply_text = f"Showing {count} results for your query."
                 return {
                     "reply": reply_text,
                     "redirect": redirect_url,
                     "resumes_preview": relaxed,
+                    "matchMeta": _summarize_matches(relaxed),
+                    "ui": {"primaryMessage": reply_text, "query": prompt},
+                    "relaxedFlags": {"experience": True},  # ✅ optional hint for a subtle UI note (no “no exact” text)
                 }
 
-            # If still empty → return semantic list as last resort, with clear wording
+            # If still empty → return semantic list as last resort (still neutral wording)
             count_sem = len(resumes or [])
             for it in (resumes or []):
                 it["is_strict_match"] = False
                 it["match_type"] = "close"
-            reply_text = (
-                # "No exact matches for your filters. "
-                f"Showing {count_sem} closest semantic match{'es' if count_sem != 1 else ''}."
-            )
+            reply_text = f"Showing {count_sem} results for your query."
             return {
                 "reply": reply_text,
                 "redirect": redirect_url,
                 "resumes_preview": resumes or [],
+                "matchMeta": _summarize_matches(resumes or []),
+                "ui": {"primaryMessage": reply_text, "query": prompt},
+                "relaxedFlags": {"semanticFallback": True},
             }
 
         # No filters provided at all → just report semantic count
         count = len(resumes or [])
-        reply_text = f"Found {count} candidate{'s' if count != 1 else ''}."
+        reply_text = f"Showing {count} results for your query."
         return {
             "reply": reply_text,
             "redirect": redirect_url,
             "resumes_preview": resumes or [],
+            "matchMeta": _summarize_matches(resumes or []),
+            "ui": {"primaryMessage": reply_text, "query": prompt},
         }
 
     if intent == "usage_help":
