@@ -5,10 +5,12 @@ import docx2txt
 import io
 import re
 import tempfile
+import os
 from datetime import datetime
 from dateutil import parser as dateparser
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from PIL import Image  # <-- added: needed for robust OCR with pytesseract
 
 # ----------------------------
 # SpaCy: load safely with fallback
@@ -34,6 +36,16 @@ except Exception:
     _HAS_NER = False
 
 # ----------------------------
+# OCR toggle (via env)
+# ----------------------------
+_ENABLE_OCR = str(os.getenv("ENABLE_OCR", "0")).strip() not in {"", "0", "false", "False"}
+try:
+    import pytesseract  # optional
+    _HAS_TESS = True
+except Exception:
+    _HAS_TESS = False
+
+# ----------------------------
 # Load known skills vocabulary
 # ----------------------------
 SKILL_FILE = Path(__file__).parent.parent / "resources" / "skills.txt"
@@ -42,34 +54,119 @@ if SKILL_FILE.exists():
     with open(SKILL_FILE, "r", encoding="utf-8") as f:
         KNOWN_SKILLS = set(line.strip().lower() for line in f if line.strip())
 
+# ----------------------------
+# Helpers
+# ----------------------------
+def _safe_join(lines: List[str]) -> str:
+    return "\n".join([l for l in lines if isinstance(l, str)])
+
+def _strip_text(s: str) -> str:
+    s = s.replace("\x00", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 # ----------------------------
 # File text extraction helpers
 # ----------------------------
-def extract_text_from_pdf(content: bytes) -> str:
-    doc = fitz.open(stream=content, filetype="pdf")
+def _pdf_text_pymupdf(content: bytes) -> str:
+    """
+    Primary PDF extractor (fast). Never raises outwards.
+    """
     try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception:
+        return ""
+    try:
+        # try empty password auth for some locked PDFs
+        try:
+            if doc.needs_pass:
+                doc.authenticate("")
+        except Exception:
+            pass
         texts = []
         for page in doc:
-            texts.append(page.get_text())
-        return "\n".join(texts)
+            # 'text' is good default; 'blocks' sometimes captures more
+            page_text = page.get_text("text") or page.get_text()
+            if page_text:
+                texts.append(page_text)
+        return _safe_join(texts)
+    except Exception:
+        return ""
     finally:
-        doc.close()
+        try:
+            doc.close()
+        except Exception:
+            pass
 
+def _pdf_text_ocr_with_fitz(content: bytes) -> str:
+    """
+    OCR fallback using PyMuPDF rasterization + pytesseract.
+    Requires ENABLE_OCR=1 and pytesseract installed.
+    Never raises outwards; returns "" if anything fails.
+    """
+    if not (_ENABLE_OCR and _HAS_TESS):
+        return ""
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception:
+        return ""
+    try:
+        texts = []
+        zoom = 2.0  # ~144 DPI
+        mat = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            try:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img_bytes = pix.tobytes("png")
+                # ✅ FIX: ensure pytesseract receives a Pillow Image (not a BytesIO)
+                img = Image.open(io.BytesIO(img_bytes)).convert("L")
+                txt = pytesseract.image_to_string(img)
+                if txt:
+                    texts.append(txt)
+            except Exception:
+                continue
+        return _safe_join(texts)
+    except Exception:
+        return ""
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+def extract_text_from_pdf(content: bytes) -> str:
+    """
+    Try text extraction; if blank and OCR enabled, OCR fallback.
+    """
+    text = _pdf_text_pymupdf(content)
+    if _strip_text(text):
+        return text
+    # OCR fallback
+    ocr_text = _pdf_text_ocr_with_fitz(content)
+    return ocr_text
 
 def extract_text_from_docx(content: bytes) -> str:
     """
     Use a temp file path for docx2txt to avoid file-like compatibility issues.
+    Never raises outwards.
     """
-    with tempfile.NamedTemporaryFile(suffix=".docx") as tmp:
-        tmp.write(content)
-        tmp.flush()
-        return docx2txt.process(tmp.name) or ""
-
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".docx") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            t = docx2txt.process(tmp.name) or ""
+            return t
+    except Exception:
+        # minimal salvage: try naive decode
+        try:
+            return content.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
 def extract_text_from_doc_legacy(content: bytes) -> str:
     """
     Simple fallback for legacy .doc files.
+    Never raises outwards.
     """
     try:
         raw = content.decode("latin-1", errors="ignore")
@@ -87,21 +184,23 @@ def extract_text_from_doc_legacy(content: bytes) -> str:
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
-
 # ----------------------------
 # Core field extractors
 # ----------------------------
 def extract_name(text: str) -> Optional[str]:
     # 1) NER-based (PERSON)
     if _HAS_NER:
-        doc = nlp(text)
-        names = [
-            ent.text.strip()
-            for ent in doc.ents
-            if getattr(ent, "label_", "") == "PERSON" and 2 <= len(ent.text.strip().split()) <= 4
-        ]
-        if names:
-            return names[0]
+        try:
+            doc = nlp(text)
+            names = [
+                ent.text.strip()
+                for ent in doc.ents
+                if getattr(ent, "label_", "") == "PERSON" and 2 <= len(ent.text.strip().split()) <= 4
+            ]
+            if names:
+                return names[0]
+        except Exception:
+            pass
 
     # 2) Top lines regex
     lines = text.strip().split("\n")
@@ -114,16 +213,13 @@ def extract_name(text: str) -> Optional[str]:
     match = re.search(r"(?i)^Name[:\s]+([A-Z][a-z]+(?: [A-Z][a-z]+)+)", text)
     return match.group(1) if match else None
 
-
 def extract_email(text: str) -> Optional[str]:
     match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
     return match.group() if match else None
 
-
 def extract_phone(text: str) -> Optional[str]:
     match = re.search(r"(\+?\d{1,3}[-.\s]?)?(\(?\d{2,4}\)?[-.\s]?)?\d{3,5}[-.\s]?\d{4,5}", text)
     return match.group() if match else None
-
 
 def extract_skills(text: str) -> List[str]:
     """
@@ -137,8 +233,11 @@ def extract_skills(text: str) -> List[str]:
     # Phrase contains (longest first)
     if KNOWN_SKILLS:
         for skill in sorted(KNOWN_SKILLS, key=len, reverse=True):
-            if skill and skill in low:
-                matched.add(skill)
+            try:
+                if skill and skill in low:
+                    matched.add(skill)
+            except Exception:
+                continue
 
     # Token-level fallback
     try:
@@ -149,11 +248,9 @@ def extract_skills(text: str) -> List[str]:
         )
         matched |= (KNOWN_SKILLS.intersection(tokens))
     except Exception:
-        # If spaCy disabled, skip token fallback
         pass
 
     return sorted({m.strip().lower() for m in matched if m and m.strip()})
-
 
 def extract_experience(text: str) -> float:
     """
@@ -162,44 +259,52 @@ def extract_experience(text: str) -> float:
       B) Sum date ranges like "Jan 2020 - Mar 2023" or "May 2019 to Present"
     """
     # A) Explicit mentions (anchor to 'experience' to avoid random numbers)
-    year_match = re.findall(
-        r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)[\s\w]*experience",
-        text,
-        re.IGNORECASE
-    )
-    explicit_years = max(map(float, year_match)) if year_match else 0.0
+    try:
+        year_match = re.findall(
+            r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)[\s\w]*experience",
+            text,
+            re.IGNORECASE
+        )
+        explicit_years = max(map(float, year_match)) if year_match else 0.0
+    except Exception:
+        explicit_years = 0.0
 
     # B) Date ranges
-    # Use non-capturing group for separators: -, – (en-dash), — (em-dash), to
-    date_ranges = re.findall(
-        r'(\w+\s\d{4})\s*(?:-|–|—|to)\s*(\w+\s\d{4}|present)',
-        text,
-        re.IGNORECASE
-    )
-    total_months = 0
-    for start, end in date_ranges:
-        try:
-            start_date = dateparser.parse(start)
-            end_date = datetime.now() if re.search(r"present", end, re.IGNORECASE) else dateparser.parse(end)
-            months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
-            total_months += max(months, 0)
-        except Exception:
-            continue
-    calculated_years = round(total_months / 12, 1)
+    try:
+        date_ranges = re.findall(
+            r'(\w+\s\d{4})\s*(?:-|–|—|to)\s*(\w+\s\d{4}|present)',
+            text,
+            re.IGNORECASE
+        )
+        total_months = 0
+        for start, end in date_ranges:
+            try:
+                start_date = dateparser.parse(start)
+                end_date = datetime.now() if re.search(r"present", end, re.IGNORECASE) else dateparser.parse(end)
+                months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
+                total_months += max(months, 0)
+            except Exception:
+                continue
+        calculated_years = round(total_months / 12, 1)
+    except Exception:
+        calculated_years = 0.0
 
     return float(max(explicit_years, calculated_years))
-
 
 def extract_projects(text: str) -> List[Dict[str, Any]]:
     """
     Extract up to 5 projects from recognizable sections, tagging technologies
     using the skills vocabulary.
     """
-    raw_sections = re.findall(
-        r'(?:Project[s]?:?|Responsibilities:|Description:)[\s\S]{0,800}',
-        text,
-        re.IGNORECASE
-    )
+    try:
+        raw_sections = re.findall(
+            r'(?:Project[s]?:?|Responsibilities:|Description:)[\s\S]{0,800}',
+            text,
+            re.IGNORECASE
+        )
+    except Exception:
+        raw_sections = []
+
     projects: List[Dict[str, Any]] = []
     seen = set()
 
@@ -233,15 +338,17 @@ def extract_projects(text: str) -> List[Dict[str, Any]]:
 
     return projects
 
-
 def extract_summary(text: str) -> str:
-    match = re.search(
-        r"(Summary|Objective)[:\n\s]*(.*?)(?:\n\n|\n[A-Z][a-z]+:|\n[A-Z ]{3,}|Education|Experience|Projects|Skills|$)",
-        text,
-        re.IGNORECASE | re.DOTALL
-    )
-    if match:
-        return match.group(2).strip()[:600]
+    try:
+        match = re.search(
+            r"(Summary|Objective)[:\n\s]*(.*?)(?:\n\n|\n[A-Z][a-z]+:|\n[A-Z ]{3,}|Education|Experience|Projects|Skills|$)",
+            text,
+            re.IGNORECASE | re.DOTALL
+        )
+        if match:
+            return match.group(2).strip()[:600]
+    except Exception:
+        pass
 
     # NLP fallback: first paragraph with >=2 verbs (when NER pipeline available)
     paragraphs = [p.strip() for p in text.split("\n\n") if len(p.strip().split()) > 10]
@@ -255,9 +362,11 @@ def extract_summary(text: str) -> str:
             break
     return ""
 
-
 def extract_education(text: str) -> list:
-    sections = re.findall(r"(Bachelor|Master|B\.Tech|M\.Tech|BSc|MSc|Ph\.D)[\s\S]{0,200}", text, re.IGNORECASE)
+    try:
+        sections = re.findall(r"(Bachelor|Master|B\.Tech|M\.Tech|BSc|MSc|Ph\.D)[\s\S]{0,200}", text, re.IGNORECASE)
+    except Exception:
+        sections = []
     results = []
     for section in sections:
         match = re.search(r"(?P<degree>[A-Za-z .]+)[,|\n\s]*(?P<school>[A-Za-z ]+)[,|\n\s]*(?P<year>\d{4})", section)
@@ -270,9 +379,11 @@ def extract_education(text: str) -> list:
             })
     return results
 
-
 def extract_work_history(text: str) -> list:
-    jobs = re.findall(r"(?:Experience|Work)[\s\S]{0,1000}", text, re.IGNORECASE)
+    try:
+        jobs = re.findall(r"(?:Experience|Work)[\s\S]{0,1000}", text, re.IGNORECASE)
+    except Exception:
+        jobs = []
     results = []
     for job in jobs:
         lines = [line.strip() for line in job.strip().split('\n') if line.strip()]
@@ -289,7 +400,6 @@ def extract_work_history(text: str) -> list:
                 })
     return results
 
-
 def extract_location(text: str) -> str:
     if _HAS_NER:
         try:
@@ -302,7 +412,6 @@ def extract_location(text: str) -> str:
 
     match = re.search(r"\b(?:located in|from|based in)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", text)
     return match.group(1) if match else "N/A"
-
 
 # ----------------------------
 # Master extractor
@@ -340,11 +449,11 @@ def extract_info(text: str) -> dict:
         "skills_text": (summary or "")[:300],      # small blob to help skill pickup if needed
 
         # Experience (multiple aliases so any consumer can read it)
-        "experience": experience_float,                 # original key
-        "total_experience_years": experience_float,     # primary for filters
-        "years_of_experience": experience_float,        # alias
-        "experience_years": experience_float,           # alias
-        "yoe": experience_float,                        # alias
+        "experience": experience_float,
+        "total_experience_years": experience_float,
+        "years_of_experience": experience_float,
+        "experience_years": experience_float,
+        "yoe": experience_float,
 
         # Title/Role (multiple aliases)
         "title": (current_title or "N/A"),
@@ -352,10 +461,10 @@ def extract_info(text: str) -> dict:
         "current_title": (current_title or "N/A"),
 
         # Projects
-        "projects": projects,                           # structured list
-        "project_summary": project_summary_text,        # blob for project keyword filter
-        "project_details": project_summary_text,        # alias
-        "portfolio": project_summary_text,              # alias
+        "projects": projects,
+        "project_summary": project_summary_text,
+        "project_details": project_summary_text,
+        "portfolio": project_summary_text,
 
         # Location
         "location": location,
@@ -363,7 +472,7 @@ def extract_info(text: str) -> dict:
         # Raw text
         "raw_text": text,
 
-        # Nested resume section (unchanged)
+        # Nested resume section
         "resume": {
             "summary": summary,
             "education": education,
@@ -376,20 +485,27 @@ def extract_info(text: str) -> dict:
         "company": company or "N/A",
     }
 
-
 def parse_resume_file(filename: str, content: bytes) -> dict:
-    lower = (filename or "").lower()
-    if lower.endswith(".pdf"):
-        text = extract_text_from_pdf(content)
-    elif lower.endswith(".docx"):
-        text = extract_text_from_docx(content)
-    elif lower.endswith(".doc"):
-        text = extract_text_from_doc_legacy(content)
-    else:
-        # Unknown; try docx first, then legacy
-        try:
+    """
+    Never lets exceptions bubble up. If everything fails, returns extract_info("")
+    so caller can treat as 'empty' rather than a hard 'parse_error'.
+    """
+    try:
+        lower = (filename or "").lower()
+        text = ""
+        if lower.endswith(".pdf"):
+            text = extract_text_from_pdf(content)
+        elif lower.endswith(".docx"):
             text = extract_text_from_docx(content)
-        except Exception:
+        elif lower.endswith(".doc"):
             text = extract_text_from_doc_legacy(content)
-
-    return extract_info(text)
+        else:
+            # Unknown; try docx first, then legacy
+            try:
+                text = extract_text_from_docx(content)
+            except Exception:
+                text = extract_text_from_doc_legacy(content)
+        return extract_info(text or "")
+    except Exception:
+        # last-resort safe return
+        return extract_info("")
