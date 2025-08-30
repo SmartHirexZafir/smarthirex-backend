@@ -1,6 +1,8 @@
 # app/logic/normalize.py
 from __future__ import annotations
 import re
+import os
+import json
 from typing import Dict, Any, List, Optional, Set
 
 # ------------------------------
@@ -77,6 +79,39 @@ SYNONYMS: Dict[str, str] = {
     "ps": "photoshop",
     "tailwindcss": "tailwind",
 }
+
+# ---- NEW: Optional custom synonyms merge (non-breaking) ---------------------
+_CUSTOM_SYNONYMS_PATH = os.path.join("app", "resources", "synonyms_custom.json")
+
+def _merge_custom_synonyms() -> None:
+    """
+    Load app/resources/synonyms_custom.json and merge into SYNONYMS.
+    - Keys/values are lowercased and stripped.
+    - Invalid entries are ignored.
+    - Custom entries override defaults.
+    Silently no-ops if file is missing or invalid.
+    """
+    try:
+        with open(_CUSTOM_SYNONYMS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        cleaned: Dict[str, str] = {}
+        for k, v in data.items():
+            if isinstance(k, str) and isinstance(v, str):
+                kk = k.strip().lower()
+                vv = v.strip().lower()
+                if kk and vv:
+                    cleaned[kk] = vv
+        if cleaned:
+            SYNONYMS.update(cleaned)
+    except Exception:
+        # Optional file — ignore any errors to preserve old behavior
+        pass
+
+# Attempt merge at import time (safe if file is absent)
+_merge_custom_synonyms()
+# -----------------------------------------------------------------------------
 
 # Words we ignore while generating keywords
 STOPWORDS: Set[str] = {
@@ -215,7 +250,7 @@ def _apply_plural_and_synonyms(s: str) -> str:
     # 1) plural→singular (word-boundary safe)
     for pl, sg in PLURAL_SINGULAR.items():
         s = re.sub(rf"\b{re.escape(pl)}\b", sg, s)
-    # 2) token-level synonyms
+    # 2) token-level synonyms (defaults + optional custom merged above)
     for k, v in SYNONYMS.items():
         s = re.sub(rf"\b{re.escape(k)}\b", v, s)
     return s
@@ -224,8 +259,7 @@ def _apply_plural_and_synonyms(s: str) -> str:
 def _inject_keep_phrase_markers(s: str) -> str:
     """
     Wrap keep-phrases with markers so they stay as one token during tokenization.
-    Example: 'machine learning' -> '__ml__machine learning__ml__'
-    (We will strip markers later but split will respect them.)
+    Example: 'machine learning' -> '__PHRASE__machine learning__PHRASE__'
     """
     for phrase in sorted(_KEEP_PHRASES, key=len, reverse=True):
         p = re.escape(phrase)
@@ -372,7 +406,7 @@ def normalize_prompt(raw: str) -> Dict[str, Any]:
     # Phrase fixes first (react-native, ms excel, ui/ux, etc.)
     s = _apply_phrase_normalizers(s)
 
-    # Then plurals/synonyms (token level)
+    # Then plurals/synonyms (token level) — includes optional custom overrides
     s = _apply_plural_and_synonyms(s)
 
     # Finally, generate keywords (keeps bigrams like "machine learning", "ui ux")

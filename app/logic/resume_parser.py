@@ -65,6 +65,71 @@ def _strip_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+def _clean_text_for_blob(text: str) -> str:
+    """
+    Light normalization for search_blob (non-destructive).
+    Keeps alphanumerics and spaces, lowercases, collapses whitespace.
+    """
+    if not isinstance(text, str):
+        return ""
+    t = text.lower()
+    t = re.sub(r"http\S+|www\S+|https\S+", " ", t)
+    t = re.sub(r"\S+@\S+", " ", t)
+    t = re.sub(r"[^a-z0-9\s+/.,_-]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+# ----------------------------
+# Degree & school detectors (additive; for convenience/analytics)
+# ----------------------------
+_DEGREE_TOKENS = [
+    # legal & business
+    "llb", "ll.m", "llm", "jd", "bar", "bar-at-law", "bar at law",
+    "mba", "bba",
+    # generic
+    "bs", "b.s", "b.sc", "bsc", "ba", "b.a", "b.tech", "btech",
+    "ms", "m.s", "m.sc", "msc", "ma", "m.a", "m.tech", "mtech",
+    "phd", "dphil", "doctorate", "bachelors", "masters"
+]
+
+def _normalize_degree_string(s: str) -> str:
+    return s.replace(".", "").replace("-", "").replace(" ", "").lower()
+
+def _detect_degrees(raw: str) -> List[str]:
+    low = raw.lower()
+    found = set()
+    norm_full = _normalize_degree_string(low)
+    for token in _DEGREE_TOKENS:
+        t_low = token.lower()
+        if t_low in low or _normalize_degree_string(t_low) in norm_full:
+            found.add(t_low)
+    return sorted(found)
+
+_SCHOOL_PATTERNS = [
+    r"\bgraduated from\s+([a-z][a-z0-9&\-\. ]{2,80})",
+    r"\bgraduate of\s+([a-z][a-z0-9&\-\. ]{2,80})",
+    r"\bfrom\s+([a-z][a-z0-9&\-\. ]{2,80})(?: university| college| law school)\b",
+    r"\b([a-z][a-z0-9&\-\. ]{2,80})\s+(?:university|college|law school)\b",
+]
+
+def _detect_schools(raw: str) -> List[str]:
+    low = raw.lower()
+    schools: List[str] = []
+    for pat in _SCHOOL_PATTERNS:
+        for m in re.finditer(pat, low, flags=re.IGNORECASE):
+            sch = m.group(1).strip().lower()
+            sch = re.split(r"[.;,]| and | but | however ", sch, flags=re.IGNORECASE)[0]
+            sch = re.sub(r"\s+", " ", sch).strip()
+            if sch:
+                schools.append(sch)
+    # de-dup preserve order
+    out, seen = [], set()
+    for s in schools:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
 # ----------------------------
 # File text extraction helpers
 # ----------------------------
@@ -118,7 +183,7 @@ def _pdf_text_ocr_with_fitz(content: bytes) -> str:
             try:
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img_bytes = pix.tobytes("png")
-                # ✅ FIX: ensure pytesseract receives a Pillow Image (not a BytesIO)
+                # ✅ ensure pytesseract receives a Pillow Image (not a BytesIO)
                 img = Image.open(io.BytesIO(img_bytes)).convert("L")
                 txt = pytesseract.image_to_string(img)
                 if txt:
@@ -252,20 +317,56 @@ def extract_skills(text: str) -> List[str]:
 
     return sorted({m.strip().lower() for m in matched if m and m.strip()})
 
+def _round_experience_value(years: float) -> float:
+    """
+    Round to 1 decimal; clamp negatives; reduce tiny noise.
+    """
+    try:
+        if years < 0:
+            years = 0.0
+        # snap very small positive noise to 0
+        if 0 < years < 0.05:
+            years = 0.0
+        return round(float(years), 1)
+    except Exception:
+        return 0.0
+
+def _format_experience_display(years: float) -> str:
+    """
+    Pretty display string without '0.' or trailing '.0' issues.
+    """
+    y = _round_experience_value(years)
+    if abs(y - int(y)) < 1e-9:
+        y_int = int(y)
+        return f"{y_int} year" if y_int == 1 else f"{y_int} years"
+    return f"{y} years"
+
 def extract_experience(text: str) -> float:
     """
     Estimate total years of experience using two strategies:
       A) Parse explicit "X years experience" mentions (max value wins)
       B) Sum date ranges like "Jan 2020 - Mar 2023" or "May 2019 to Present"
+
+    Tweaks:
+      - tolerate forms like '0. years experience' (missing decimal digit)
+      - clamp negatives; return rounded 1-decimal
     """
     # A) Explicit mentions (anchor to 'experience' to avoid random numbers)
     try:
+        # allow optional decimals with missing fractional digits (e.g., '0. years')
         year_match = re.findall(
-            r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)[\s\w]*experience",
+            r"(\d+(?:\.\d*)?)\s*\+?\s*(?:years|yrs)[\s\w]*experience",
             text,
             re.IGNORECASE
         )
-        explicit_years = max(map(float, year_match)) if year_match else 0.0
+        explicit_years = 0.0
+        for m in year_match or []:
+            try:
+                # '0.' -> float('0.') works; but guard just in case
+                val = float(m if m[-1].isdigit() else m.rstrip(".") or "0")
+                explicit_years = max(explicit_years, val)
+            except Exception:
+                continue
     except Exception:
         explicit_years = 0.0
 
@@ -285,11 +386,12 @@ def extract_experience(text: str) -> float:
                 total_months += max(months, 0)
             except Exception:
                 continue
-        calculated_years = round(total_months / 12, 1)
+        calculated_years = total_months / 12.0
     except Exception:
         calculated_years = 0.0
 
-    return float(max(explicit_years, calculated_years))
+    years = max(explicit_years, calculated_years)
+    return _round_experience_value(years)
 
 def extract_projects(text: str) -> List[Dict[str, Any]]:
     """
@@ -421,7 +523,7 @@ def extract_info(text: str) -> dict:
     email = extract_email(text)
     phone = extract_phone(text)
     skills = extract_skills(text)
-    experience = extract_experience(text)          # float years
+    experience = extract_experience(text)          # float years (rounded 1-decimal)
     projects = extract_projects(text)
     summary = extract_summary(text)
     education = extract_education(text)
@@ -438,8 +540,14 @@ def extract_info(text: str) -> dict:
     ).strip()
 
     experience_float = float(experience)
+    experience_display = _format_experience_display(experience_float)  # ✅ clean display
+    experience_rounded = _round_experience_value(experience_float)     # ✅ numeric rounded
 
-    return {
+    # Additive detections (for strong filtering convenience)
+    degrees_detected = _detect_degrees(text or "")
+    schools_detected = _detect_schools(text or "")
+
+    info = {
         "name": name or "No Name",                 # ✅ fallback
         "email": email or None,
         "phone": phone or None,
@@ -454,6 +562,9 @@ def extract_info(text: str) -> dict:
         "years_of_experience": experience_float,
         "experience_years": experience_float,
         "yoe": experience_float,
+        # Additive nice-to-have fields to fix UI like "0. years"
+        "experience_rounded": experience_rounded,  # float (1-decimal)
+        "experience_display": experience_display,  # string ("2 years", "0.5 years", "1 year")
 
         # Title/Role (multiple aliases)
         "title": (current_title or "N/A"),
@@ -483,7 +594,56 @@ def extract_info(text: str) -> dict:
         # Convenience fields
         "currentRole": current_title or "N/A",
         "company": company or "N/A",
+
+        # Additive: strong-filter helpers (education)
+        "degrees_detected": degrees_detected,
+        "schools_detected": schools_detected,
     }
+
+    # ----------------------------
+    # NEW: Precompute search_blob for fast ANN/text recall
+    # ----------------------------
+    # Compose a compact, normalized blob using salient fields.
+    # This is non-breaking (just an extra field).
+    try:
+        parts: List[str] = []
+        parts.append(info.get("name") or "")
+        parts.append(info.get("currentRole") or info.get("title") or "")
+        parts.append(info.get("location") or "")
+        # skills
+        if info.get("skills"):
+            parts.append(" ".join([s for s in info["skills"] if isinstance(s, str)]))
+        # projects
+        if projects:
+            proj_bits: List[str] = []
+            for p in projects[:6]:
+                if isinstance(p, dict):
+                    proj_bits.append(str(p.get("name") or ""))
+                    proj_bits.append(str(p.get("description") or ""))
+                elif isinstance(p, str):
+                    proj_bits.append(p)
+            parts.append(" ".join([x for x in proj_bits if x]))
+        # summary (short)
+        if summary:
+            parts.append(summary[:600])
+        # total experience (numeric)
+        parts.append(str(experience_float))
+        # raw text (truncate to keep blob compact)
+        raw = text or ""
+        truncate_chars = int(os.getenv("SEARCH_BLOB_TRUNCATE_CHARS", "4000"))
+        if raw:
+            parts.append(raw[:truncate_chars])
+
+        search_blob = _clean_text_for_blob(" ".join([p for p in parts if p]).strip())
+        info["search_blob"] = search_blob
+    except Exception:
+        # Safe fallback: at least include raw_text cleaned
+        try:
+            info["search_blob"] = _clean_text_for_blob((text or "")[:4000])
+        except Exception:
+            info["search_blob"] = ""
+
+    return info
 
 def parse_resume_file(filename: str, content: bytes) -> dict:
     """
