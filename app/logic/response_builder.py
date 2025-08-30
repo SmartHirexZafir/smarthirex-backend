@@ -141,6 +141,13 @@ def _get_total_years(resume: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _get_raw_text(resume: Dict[str, Any]) -> str:
+    """
+    Safely fetch raw_text (lower-cased). Fallback to empty string.
+    """
+    return _lower(resume.get("raw_text") or "")
+
+
 # ---------------------------------
 # Filters & flags
 # ---------------------------------
@@ -261,6 +268,45 @@ def _match_experience(years_value: Optional[float], parsed: Dict[str, Any], *, r
     return True
 
 
+# ---------------------------
+# NEW: Strong filtering helpers (education + phrases)
+# ---------------------------
+def _match_phrases(raw_text: str, must_phrases: Set[str], exclude_phrases: Set[str]) -> bool:
+    """
+    All must_phrases must appear (substring). No exclude_phrases may appear.
+    """
+    if must_phrases and not all(p in raw_text for p in must_phrases):
+        return False
+    if exclude_phrases and any(p in raw_text for p in exclude_phrases):
+        return False
+    return True
+
+
+def _normalize_degree_string(s: str) -> str:
+    # remove dots, hyphens, and spaces to catch variants like "LL.B" / "llb" / "LL B"
+    return s.replace(".", "").replace("-", "").replace(" ", "")
+
+
+def _match_education(raw_text: str, schools: Set[str], degrees: Set[str]) -> bool:
+    """
+    Schools: substring in raw_text
+    Degrees: substring in raw_text, with a relaxed normalized comparison
+    """
+    if schools and not all(s in raw_text for s in schools):
+        return False
+    if degrees:
+        norm_rt = _normalize_degree_string(raw_text)
+        for d in degrees:
+            d_lc = d.lower()
+            d_norm = _normalize_degree_string(d_lc)
+            if (d_lc not in raw_text) and (d_norm not in norm_rt):
+                return False
+    return True
+
+
+# ---------------------------
+# Filter intent & detection
+# ---------------------------
 def _collect_filter_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize possibly-varied keys from intent_parser into a single filter spec.
@@ -275,6 +321,12 @@ def _collect_filter_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
     # Projects (as search terms)
     projects_terms = _as_set(parsed.get("projects") or parsed.get("project_terms") or parsed.get("projects_keywords"))
 
+    # NEW: Strong filters
+    must_have_phrases = _as_set(parsed.get("must_have_phrases"))
+    exclude_phrases = _as_set(parsed.get("exclude_phrases"))
+    schools_required = _as_set(parsed.get("schools_required"))
+    degrees_required = _as_set(parsed.get("degrees_required"))
+
     return {
         "titles": titles,
         "locations": locations,
@@ -284,13 +336,23 @@ def _collect_filter_intent(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "projects_terms": projects_terms,
         "skills_all_strict": bool(parsed.get("skills_all_strict", False)),
         "projects_required": bool(parsed.get("projects_required", False)),
+        # NEW
+        "must_have_phrases": must_have_phrases,
+        "exclude_phrases": exclude_phrases,
+        "schools_required": schools_required,
+        "degrees_required": degrees_required,
     }
 
 
 def _has_any_filters(parsed: Dict[str, Any]) -> bool:
     spec = _collect_filter_intent(parsed)
     # presence of any non-empty set counts
-    if spec["titles"] or spec["locations"] or spec["skills_all"] or spec["skills_any"] or spec["skills_exclude"] or spec["projects_terms"]:
+    if (
+        spec["titles"] or spec["locations"] or spec["skills_all"] or spec["skills_any"]
+        or spec["skills_exclude"] or spec["projects_terms"]
+        or spec["must_have_phrases"] or spec["exclude_phrases"]
+        or spec["schools_required"] or spec["degrees_required"]
+    ):
         return True
     # experience counts as a filter as well (support all shapes)
     if parsed.get("experience"):
@@ -331,7 +393,12 @@ def _apply_structured_filters(
         )
         exp_ok = _match_experience(_get_total_years(r), parsed, relax=relax_experience)
 
-        if title_ok and loc_ok and skills_ok and projects_ok and exp_ok:
+        # NEW: phrase & education gates (operate over raw_text)
+        rt = _get_raw_text(r)
+        phr_ok = _match_phrases(rt, spec["must_have_phrases"], spec["exclude_phrases"])
+        edu_ok = _match_education(rt, spec["schools_required"], spec["degrees_required"])
+
+        if title_ok and loc_ok and skills_ok and projects_ok and exp_ok and phr_ok and edu_ok:
             out.append(r)
     return out
 
@@ -374,25 +441,26 @@ async def build_response(parsed_data: dict) -> dict:
             owner_user_id=parsed_data.get("ownerUserId"),  # may be None; fine
             normalized_prompt=parsed_data.get("normalized_prompt"),
             keywords=parsed_data.get("keywords"),
-        )
+        ) or []
 
         redirect_url = build_redirect_url(parsed_data)
 
         # SHOW ALL → no structured filters (but keep original match flags)
         if intent == "show_all":
-            count = len(resumes or [])
+            count = len(resumes)
             reply_text = f"Showing {count} results for your query."
             return {
                 "reply": reply_text,
                 "redirect": redirect_url,
-                "resumes_preview": resumes or [],
-                "matchMeta": _summarize_matches(resumes or []),  # ✅ handy for UI header
+                "resumes_preview": resumes,
+                "matchMeta": _summarize_matches(resumes),  # ✅ handy for UI header
                 "ui": {"primaryMessage": reply_text, "query": prompt},
+                "no_results": count == 0,  # ✅ FE can stop spinner immediately on zero
             }
 
         # 2) Apply strict structured filters if the parser provided any
         filters_present = _has_any_filters(parsed_data)
-        filtered_resumes = _apply_structured_filters(resumes or [], parsed_data, relax_experience=False)
+        filtered_resumes = _apply_structured_filters(resumes, parsed_data, relax_experience=False)
 
         if filtered_resumes:
             # Mark these as exact (if ml_interface didn't already)
@@ -409,12 +477,13 @@ async def build_response(parsed_data: dict) -> dict:
                 "resumes_preview": filtered_resumes,
                 "matchMeta": _summarize_matches(filtered_resumes),
                 "ui": {"primaryMessage": reply_text, "query": prompt},
+                "no_results": False,
             }
 
         # 3) If nothing found but filters were present, try a *soft* fallback:
         #    relax ONLY the experience filter (keep title/location/skills/projects strict)
         if filters_present:
-            relaxed = _apply_structured_filters(resumes or [], parsed_data, relax_experience=True)
+            relaxed = _apply_structured_filters(resumes, parsed_data, relax_experience=True)
             if relaxed:
                 for it in relaxed:
                     it["is_strict_match"] = False
@@ -427,33 +496,36 @@ async def build_response(parsed_data: dict) -> dict:
                     "resumes_preview": relaxed,
                     "matchMeta": _summarize_matches(relaxed),
                     "ui": {"primaryMessage": reply_text, "query": prompt},
-                    "relaxedFlags": {"experience": True},  # ✅ optional hint for a subtle UI note (no “no exact” text)
+                    "relaxedFlags": {"experience": True},  # ✅ optional hint for a subtle UI note
+                    "no_results": False,
                 }
 
             # If still empty → return semantic list as last resort (still neutral wording)
-            count_sem = len(resumes or [])
-            for it in (resumes or []):
+            count_sem = len(resumes)
+            for it in resumes:
                 it["is_strict_match"] = False
                 it["match_type"] = "close"
             reply_text = f"Showing {count_sem} results for your query."
             return {
                 "reply": reply_text,
                 "redirect": redirect_url,
-                "resumes_preview": resumes or [],
-                "matchMeta": _summarize_matches(resumes or []),
+                "resumes_preview": resumes,
+                "matchMeta": _summarize_matches(resumes),
                 "ui": {"primaryMessage": reply_text, "query": prompt},
                 "relaxedFlags": {"semanticFallback": True},
+                "no_results": count_sem == 0,
             }
 
         # No filters provided at all → just report semantic count
-        count = len(resumes or [])
+        count = len(resumes)
         reply_text = f"Showing {count} results for your query."
         return {
             "reply": reply_text,
             "redirect": redirect_url,
-            "resumes_preview": resumes or [],
-            "matchMeta": _summarize_matches(resumes or []),
+            "resumes_preview": resumes,
+            "matchMeta": _summarize_matches(resumes),
             "ui": {"primaryMessage": reply_text, "query": prompt},
+            "no_results": count == 0,
         }
 
     if intent == "usage_help":
@@ -462,9 +534,11 @@ async def build_response(parsed_data: dict) -> dict:
         return {
             "reply": reply if reply else "Sorry, is feature ke bare me mujhe info nahi mili.",
             "redirect": None,
+            "no_results": False,
         }
 
     return {
         "reply": "Sorry, I couldn't understand your query.",
         "redirect": None,
+        "no_results": True,
     }

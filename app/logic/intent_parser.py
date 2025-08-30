@@ -1,6 +1,8 @@
 # ✅ File: app/logic/intent_parser.py
 
 import re
+import os
+import json
 from typing import Dict, List, Optional, Tuple, Any
 
 # ---------------------------
@@ -42,13 +44,70 @@ def detect_show_all(prompt: str) -> bool:
     ]
 
 # ---------------------------
+# NEW: Optional roles lexicon (non-breaking)
+# ---------------------------
+
+_ROLES_LEXICON_PATH = os.path.join("app", "resources", "roles_lexicon.json")
+_ROLES_LEXICON: Dict[str, str] = {}  # variant -> canonical
+
+def _norm_space(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[\s_\-\/]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _load_roles_lexicon() -> None:
+    """
+    Load roles_lexicon.json if present. Expected shape:
+      { "variants_to_canonical": { "<variant>": "<canonical>", ... } }
+    Silently no-op if file missing/invalid. Custom entries override built-ins if added later.
+    """
+    global _ROLES_LEXICON
+    try:
+        with open(_ROLES_LEXICON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        map_ = data.get("variants_to_canonical", {})
+        if isinstance(map_, dict):
+            cleaned: Dict[str, str] = {}
+            for k, v in map_.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    nk = _norm_space(k)
+                    nv = _norm_space(v)
+                    if nk and nv:
+                        cleaned[nk] = nv
+            if cleaned:
+                _ROLES_LEXICON.update(cleaned)
+    except Exception:
+        # optional file; ignore errors to preserve old behavior
+        pass
+
+_load_roles_lexicon()
+
+def _lexicon_lookup(text: str) -> Optional[str]:
+    """
+    Try to find a canonical role by scanning text against lexicon variants.
+    Returns the canonical string if a variant appears (longest match wins), else None.
+    """
+    if not _ROLES_LEXICON:
+        return None
+    t = f" {_norm_space(text)} "
+    best_key = None
+    for variant in _ROLES_LEXICON.keys():
+        # word-ish boundary check by spaces (post-normalization)
+        v = f" {variant} "
+        if v in t:
+            # pick the longest matching variant to avoid 'qa' beating 'qa engineer'
+            if best_key is None or len(variant) > len(best_key):
+                best_key = variant
+    return _ROLES_LEXICON.get(best_key) if best_key else None
+
+# ---------------------------
 # New helpers (additive only)
 # ---------------------------
 
 # NOTE: keep a broad suffix list (singular) and allow plural via regex.
 _TITLE_SUFFIXES = (
     "engineer|developer|scientist|analyst|manager|architect|specialist|consultant|"
-    "researcher|designer|administrator|lead|head|officer|intern"
+    "researcher|designer|administrator|lead|head|officer|intern|lawyer|attorney|advocate|barrister"
 )
 
 # Canonical role families to help the backend do a strict role gate.
@@ -68,7 +127,9 @@ _ROLE_FAMILY_PATTERNS: List[Tuple[str, str]] = [
     (r"\bdata\s+scientist(?:s|es)?\b",                          "data scientist"),
     (r"\bdata\s+engineer(?:s|es)?\b",                           "data engineer"),
     (r"\b(machine learning|ml)\s+(engineer|scientist)(?:s|es)?\b","ml engineer"),
-    (r"\bai\s+(engineer|scientist)(?:s|es)?\b",                 "ai engineer"),
+    (r"\bai\s+(engineer|scientist)(?:s|es)?\b",                 "ml engineer"),
+    # ✅ Additive: Legal roles (for "advocate/lawyer" style prompts)
+    (r"\b(advocate|lawyer|attorney|barrister)(?:s|es)?\b",      "advocate"),
 ]
 
 def _normalize_role_family(title: Optional[str]) -> Optional[str]:
@@ -78,11 +139,19 @@ def _normalize_role_family(title: Optional[str]) -> Optional[str]:
     """
     if not title:
         return None
+
+    # 0) Try lexicon direct first (exact/contained variant -> canonical)
+    canon = _lexicon_lookup(title)
+    if canon:
+        return canon
+
+    # 1) Pattern-based mapping
     t = title.lower().strip()
     for pattern, family in _ROLE_FAMILY_PATTERNS:
         if re.search(pattern, t):
             return family
-    # generic fallbacks if nothing matched but we have a known suffix
+
+    # 2) generic fallbacks if nothing matched but we have a known suffix
     if re.search(r"\bdesigner(?:s|es)?\b", t):
         return "designer"
     if re.search(r"\b(developer|engineer)(?:s|es)?\b", t):
@@ -91,7 +160,11 @@ def _normalize_role_family(title: Optional[str]) -> Optional[str]:
         return "scientist"
     if re.search(r"\banalyst(?:s|es)?\b", t):
         return "analyst"
-    return None
+    if re.search(r"\b(advocate|lawyer|attorney|barrister)(?:s|es)?\b", t):
+        return "advocate"
+
+    # 3) As a last attempt, scan the whole title via lexicon normalization again
+    return _lexicon_lookup(t)
 
 def _clean_list(text: str) -> List[str]:
     """
@@ -112,18 +185,24 @@ def _extract_title(prompt: str) -> Optional[str]:
     """
     Try to pick a professional title like 'web designer', 'ml engineer', etc.
     Strategy:
-      1) Look for longest phrase ending with a known title suffix (allow plural).
-      2) Fallback: phrase after 'for' (short).
+      1) Lexicon scan (best-effort, longest variant match).
+      2) Longest phrase ending with a known title suffix (allow plural).
+      3) Fallback: phrase after 'for' (short).
     """
     p = prompt.lower()
 
-    # 1) Suffix-based longest match (allow plural 's' or 'es')
+    # 1) Lexicon scan across the whole prompt
+    lex = _lexicon_lookup(p)
+    if lex:
+        return lex
+
+    # 2) Suffix-based longest match (allow plural 's' or 'es')
     matches = list(re.finditer(rf"\b([a-z][a-z ]*?)\s+((?:{_TITLE_SUFFIXES})(?:es|s)?)\b", p))
     if matches:
         best = max(matches, key=lambda m: len(m.group(0)))
         return re.sub(r"\s+", " ", best.group(0)).strip()
 
-    # 2) Phrase after 'for'
+    # 3) Phrase after 'for'
     m = re.search(r"\bfor\s+([a-z][a-z ]{2,})\b", p)
     if m:
         chunk = m.group(1)
@@ -384,6 +463,122 @@ def _extract_experience(prompt: str) -> Dict[str, float]:
 
     return exp
 
+# ---------------------------
+# Strong filtering (NEW additive fields)
+# ---------------------------
+
+def _extract_exact_phrases(prompt: str) -> List[str]:
+    p = prompt
+    phrases: List[str] = []
+
+    # quoted "..." phrases (keep as-is, lowercased)
+    for m in re.finditer(r"\"([^\"]{2,120})\"", p):
+        ph = m.group(1).strip().lower()
+        if ph:
+            phrases.append(ph)
+
+    # contains/containing/about/phrase
+    for pat in [
+        r"\bcontains?\s+([a-z0-9 \-_/\.#\+]{2,120})",
+        r"\bcontaining\s+([a-z0-9 \-_/\.#\+]{2,120})",
+        r"\babout\s+([a-z0-9 \-_/\.#\+]{2,120})",
+        r"\binclude(?:s|)\s+(?:phrase|text)\s+([a-z0-9 \-_/\.#\+]{2,120})",
+    ]:
+        for m in re.finditer(pat, p, flags=re.IGNORECASE):
+            span = m.group(1)
+            span = re.split(r"[.;,]| and | but | however ", span, flags=re.IGNORECASE)[0]
+            span = re.sub(r"\s+", " ", span).strip().lower()
+            if span:
+                phrases.append(span)
+
+    # normalize + de-dup
+    seen = set()
+    out: List[str] = []
+    for ph in phrases:
+        if ph and ph not in seen:
+            seen.add(ph)
+            out.append(ph)
+    return out
+
+def _extract_exclude_phrases(prompt: str) -> List[str]:
+    p = prompt
+    negs: List[str] = []
+    for pat in [
+        r"\bexclude(?:s|)\s+([a-z0-9 \-_/\.#\+]{2,120})",
+        r"\bno\s+([a-z0-9 \-_/\.#\+]{2,120})",
+        r"\bwithout\s+([a-z0-9 \-_/\.#\+]{2,120})",
+        r"\bexcept\s+([a-z0-9 \-_/\.#\+]{2,120})",
+    ]:
+        for m in re.finditer(pat, p, flags=re.IGNORECASE):
+            span = m.group(1)
+            span = re.split(r"[.;,]| and | but | however ", span, flags=re.IGNORECASE)[0]
+            span = re.sub(r"\s+", " ", span).strip().lower()
+            if span:
+                negs.append(span)
+
+    seen = set()
+    out: List[str] = []
+    for ph in negs:
+        if ph and ph not in seen:
+            seen.add(ph)
+            out.append(ph)
+    return out
+
+# — Education/university & degree constraints —
+_DEGREE_TOKENS = [
+    # legal & business
+    "llb", "ll.m", "llm", "jd", "bar", "bar-at-law", "bar at law",
+    "mba", "bba",
+    # generic
+    "bs", "b.s", "b.sc", "bsc", "ba", "b.a", "b.tech", "btech",
+    "ms", "m.s", "m.sc", "msc", "ma", "m.a", "m.tech", "mtech",
+    "phd", "dphil", "doctorate", "bachelors", "masters"
+]
+
+def _extract_education_requirements(prompt: str) -> Tuple[List[str], List[str]]:
+    """
+    Returns (schools_required, degrees_required).
+    """
+    p = prompt.lower()
+    schools: List[str] = []
+    degrees: List[str] = []
+
+    # degree tokens presence anywhere
+    for token in _DEGREE_TOKENS:
+        if re.search(rf"\b{re.escape(token)}\b", p):
+            degrees.append(token)
+
+    # explicit “graduated from / from <school> / <Law School>”
+    for pat in [
+        r"\bgraduated from\s+([a-z][a-z0-9&\-\. ]{2,80})",
+        r"\bgraduate of\s+([a-z][a-z0-9&\-\. ]{2,80})",
+        r"\bfrom\s+([a-z][a-z0-9&\-\. ]{2,80})(?: university| college| law school)\b",
+        r"\b([a-z][a-z0-9&\-\. ]{2,80})\s+(?:university|college|law school)\b",
+    ]:
+        for m in re.finditer(pat, p, flags=re.IGNORECASE):
+            sch = m.group(1).strip().lower()
+            sch = re.split(r"[.;,]| and | but | however ", sch, flags=re.IGNORECASE)[0]
+            sch = re.sub(r"\s+", " ", sch).strip()
+            if sch:
+                schools.append(sch)
+
+    # de-dup
+    schools_dedup: List[str] = []
+    seen = set()
+    for s in schools:
+        if s not in seen:
+            seen.add(s)
+            schools_dedup.append(s)
+
+    degrees_dedup: List[str] = []
+    seen.clear()
+    for d in degrees:
+        if d not in seen:
+            seen.add(d)
+            degrees_dedup.append(d)
+
+    return schools_dedup, degrees_dedup
+
 def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize collected fields into keys expected by downstream.
@@ -422,6 +617,17 @@ def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
         out["min_years"] = parsed["min_years"]
     if "max_years" in parsed and parsed["max_years"] is not None:
         out["max_years"] = parsed["max_years"]
+
+    # ✅ NEW additive normalizations for strong filtering
+    if parsed.get("must_have_phrases"):
+        out["must_have_phrases"] = parsed["must_have_phrases"]
+    if parsed.get("exclude_phrases"):
+        out["exclude_phrases"] = parsed["exclude_phrases"]
+    if parsed.get("schools_required"):
+        out["schools_required"] = parsed["schools_required"]
+    if parsed.get("degrees_required"):
+        out["degrees_required"] = parsed["degrees_required"]
+
     return out
 
 # ---------------------------
@@ -431,24 +637,6 @@ def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
 def parse_prompt(prompt: str) -> Dict[str, Any]:
     """
     Parses the user's prompt to detect intent + structured filters.
-
-    Returns (example):
-    {
-      "intent": "filter_cv",
-      "query": "...",
-      "job_title": "web designer",
-      "role_family": "web designer",
-      "locations": ["lahore","pakistan"],
-      "skills_all": ["figma","html","css"],
-      "skills_all_strict": true,
-      "skills_any": ["react","illustrator"],
-      "skills_exclude": ["php"],
-      "projects_required": true,
-      "projects_keywords": ["portfolio redesign"],
-      "experience": {"gte": 2, "lte": 5},
-      "min_years": 2,
-      "max_years": 5
-    }
     """
     prompt = prompt.strip()
 
@@ -461,12 +649,17 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
 
     # Structured extraction
     title = _extract_title(prompt)
-    role_family = _normalize_role_family(title)
+    role_family = _normalize_role_family(title if title else prompt)  # pass prompt for lexicon fallback
     locations = _extract_locations(prompt)
     skills_all, skills_any, skills_exclude, skills_all_strict = _extract_skills(prompt)
     projects_keywords = _extract_projects_keywords(prompt)
     projects_required = _projects_required_flag(prompt)
     experience = _extract_experience(prompt)
+
+    # ✅ NEW: Strong filters
+    must_have_phrases = _extract_exact_phrases(prompt)
+    exclude_phrases = _extract_exclude_phrases(prompt)
+    schools_required, degrees_required = _extract_education_requirements(prompt)
 
     # derive min/max if present (additive convenience for scorers)
     min_years = None
@@ -481,7 +674,7 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
 
     parsed: Dict[str, Any] = {
         "query": prompt.lower(),
-        "job_title": title or None,
+        "job_title": (title or role_family or None),
         "role_family": role_family or None,
         "locations": locations or None,
         "skills_all": skills_all or None,
@@ -493,6 +686,11 @@ def parse_prompt(prompt: str) -> Dict[str, Any]:
         "experience": experience or None,
         "min_years": min_years,
         "max_years": max_years,
+        # NEW additive strong filters
+        "must_have_phrases": must_have_phrases or None,
+        "exclude_phrases": exclude_phrases or None,
+        "schools_required": schools_required or None,
+        "degrees_required": degrees_required or None,
     }
 
     # return normalized structure (intent = filter_cv by default)

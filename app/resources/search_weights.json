@@ -1,0 +1,54 @@
+{
+  "weights": {
+    "role": 0.50,
+    "skills": 0.25,
+    "experience": 0.15,
+    "projects": 0.10
+  },
+  "thresholds": {
+    "semantic_floor_role_like": 40,
+    "semantic_floor_general": 40,
+    "paragraph_floor": 35
+  },
+  "boosts": {
+    "literal_semantic": 99.5,
+    "near_literal_semantic": 92.0,
+    "role_similarity_strict": 0.50,
+    "role_similarity_high": 0.75,
+    "role_similarity_related": 0.65
+  },
+  "ann": {
+    "use_ann_index": true,
+    "topk": 800,
+    "emb_batch_size": 128,
+    "truncate_chars": 4000
+  },
+  "baseline_skill_keywords": [
+    "react",
+    "aws",
+    "node",
+    "excel",
+    "django",
+    "figma",
+    "pandas",
+    "tensorflow",
+    "keras",
+    "java",
+    "python",
+    "pytorch",
+    "spark",
+    "sql",
+    "scikit",
+    "mlflow",
+    "docker",
+    "kubernetes",
+    "typescript",
+    "next",
+    "nextjs",
+    "next.js",
+    "powerpoint",
+    "flora",
+    "html",
+    "css"
+  ]
+}

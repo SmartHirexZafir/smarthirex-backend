@@ -1,8 +1,14 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
-from typing import List, Dict
+from typing import List, Dict, Any
 from app.logic.resume_parser import parse_resume_file
 from app.utils.mongo import db, compute_cv_hash, check_duplicate_cv_hash
-from app.logic.ml_interface import clean_text, model, vectorizer, label_encoder
+from app.logic.ml_interface import (
+    clean_text,
+    model,
+    vectorizer,
+    label_encoder,
+    add_to_index,  # ✅ ANN: add newly inserted resume to owner-scoped in-memory index
+)
 from app.routers.auth_router import get_current_user  # ✅ auth required
 import uuid
 import os
@@ -22,7 +28,7 @@ async def upload_resumes(
     files: List[UploadFile] = File(...),
     current_user = Depends(get_current_user),  # ✅ enforce login/ownership
 ):
-    parsed_resumes: List[Dict] = []
+    parsed_resumes: List[Dict[str, Any]] = []
 
     received_count = len(files)
     inserted_count = 0
@@ -81,19 +87,32 @@ async def upload_resumes(
             skipped_files["duplicates"].append(filename)
             continue
 
-        # --- ML prediction (unchanged) ---
+        # --- ML prediction (kept backward-compatible; guard if assets missing) ---
         cleaned = clean_text(raw_text)
-        features = vectorizer.transform([cleaned])
-        prediction = model.predict(features)
-        confidence = model.predict_proba(features)[0].max()
-        predicted_label = label_encoder.inverse_transform(prediction)[0]
+        predicted_label: str = "Unknown"
+        confidence_pct: float = 0.0
+        try:
+            if vectorizer is not None and model is not None and label_encoder is not None:
+                features = vectorizer.transform([cleaned])
+                prediction = model.predict(features)
+                confidence = getattr(model, "predict_proba", lambda x: [[0.0]])(features)[0]
+                if isinstance(confidence, (list, tuple)) and len(confidence) > 0:
+                    confidence = float(max(confidence))
+                else:
+                    confidence = 0.0
+                predicted_label = label_encoder.inverse_transform(prediction)[0]
+                confidence_pct = round(float(confidence) * 100.0, 2)
+        except Exception:
+            # If classic ML assets fail, fallback to Unknown gracefully
+            predicted_label = "Unknown"
+            confidence_pct = 0.0
 
         # ✅ Required metadata
         resume_data["_id"] = str(uuid.uuid4())
         resume_data["content_hash"] = compute_cv_hash(raw_text)
         resume_data["predicted_role"] = predicted_label
         resume_data["category"] = predicted_label
-        resume_data["confidence"] = round(confidence * 100, 2)
+        resume_data["confidence"] = confidence_pct
         resume_data["filename"] = filename
         resume_data["experience"] = resume_data.get("experience", 0)
 
@@ -125,9 +144,40 @@ async def upload_resumes(
         # ✅ Ownership
         resume_data["ownerUserId"] = str(current_user.id)
 
-        # ✅ Insert
+        # ✅ Insert into DB
         await db.parsed_resumes.insert_one(resume_data)
         inserted_count += 1
+
+        # ✅ ANN: Update in-memory owner-scoped vector index immediately (best-effort, non-fatal)
+        try:
+            # Compact blob similar to backend indexer (clean/trim happens inside add_to_index)
+            projects_blob = ""
+            if isinstance(resume.get("projects"), list):
+                parts = []
+                for p in resume["projects"][:6]:
+                    if isinstance(p, str):
+                        parts.append(p)
+                    elif isinstance(p, dict):
+                        parts.append(str(p.get("name") or ""))
+                        parts.append(str(p.get("description") or ""))
+                projects_blob = " ".join([x for x in parts if x])
+            index_blob = " ".join([
+                str(resume_data.get("predicted_role") or ""),
+                str(resume_data.get("name") or ""),
+                str(resume_data.get("location") or ""),
+                " ".join([s for s in (resume_data.get("skills") or []) if isinstance(s, str)]),
+                projects_blob,
+                str(resume_data.get("experience") or ""),
+                raw_text,
+            ]).strip()
+            add_to_index(
+                owner_user_id=str(current_user.id),
+                resume_id=resume_data["_id"],
+                text_blob=index_blob,
+            )
+        except Exception:
+            # Index update is best-effort; ignore failures
+            pass
 
         # Safe preview for UI
         parsed_resumes.append({

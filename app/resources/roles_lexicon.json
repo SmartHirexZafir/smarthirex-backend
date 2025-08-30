@@ -1,0 +1,76 @@
+{
+  "variants_to_canonical": {
+    "frontend developer": "frontend developer",
+    "front end developer": "frontend developer",
+    "frontend engineer": "frontend developer",
+    "fe developer": "frontend developer",
+    "react developer": "frontend developer",
+
+    "backend developer": "backend developer",
+    "back end developer": "backend developer",
+    "backend engineer": "backend developer",
+    "node developer": "backend developer",
+    "python developer": "backend developer",
+    "java developer": "backend developer",
+
+    "full stack developer": "full stack developer",
+    "fullstack developer": "full stack developer",
+    "full-stack developer": "full stack developer",
+    "mern developer": "full stack developer",
+    "mevn developer": "full stack developer",
+    "lamp developer": "full stack developer",
+
+    "mobile developer": "mobile developer",
+    "android developer": "mobile developer",
+    "ios developer": "mobile developer",
+    "flutter developer": "mobile developer",
+    "react native developer": "mobile developer",
+
+    "ui/ux designer": "ui/ux designer",
+    "ux/ui designer": "ui/ux designer",
+    "product designer": "product designer",
+    "web designer": "web designer",
+    "graphic designer": "web designer",
+    "visual designer": "web designer",
+
+    "data scientist": "data scientist",
+    "ml scientist": "data scientist",
+    "machine learning scientist": "data scientist",
+
+    "data engineer": "data engineer",
+    "etl engineer": "data engineer",
+    "data platform engineer": "data engineer",
+
+    "ml engineer": "ml engineer",
+    "machine learning engineer": "ml engineer",
+    "ai engineer": "ml engineer",
+    "ai/ml engineer": "ml engineer",
+
+    "devops": "devops/sre",
+    "devops engineer": "devops/sre",
+    "site reliability engineer": "devops/sre",
+    "sre": "devops/sre",
+    "platform engineer": "devops/sre",
+
+    "qa engineer": "qa engineer",
+    "quality assurance engineer": "qa engineer",
+    "test engineer": "qa engineer",
+    "qa analyst": "qa engineer",
+    "software tester": "qa engineer",
+
+    "data analyst": "data analyst",
+    "business analyst": "analyst",
+
+    "software engineer": "software developer",
+    "software developer": "software developer",
+
+    "product manager": "product manager",
+    "pm": "product manager",
+    "product owner": "product manager",
+
+    "advocate": "advocate",
+    "lawyer": "advocate",
+    "attorney": "advocate",
+    "barrister": "advocate"
+  }
+}
