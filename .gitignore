@@ -8,3 +8,4 @@ venv/
 *.db
 .DS_Store
 *.log
+/app/ml_models/
