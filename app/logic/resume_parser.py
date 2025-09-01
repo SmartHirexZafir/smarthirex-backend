@@ -50,9 +50,30 @@ except Exception:
 # ----------------------------
 SKILL_FILE = Path(__file__).parent.parent / "resources" / "skills.txt"
 KNOWN_SKILLS: set = set()
-if SKILL_FILE.exists():
-    with open(SKILL_FILE, "r", encoding="utf-8") as f:
-        KNOWN_SKILLS = set(line.strip().lower() for line in f if line.strip())
+
+# ✅ NEW: Multi-path fallback loader to avoid silent empty vocab when the file
+#        lives outside app/resources (e.g., project root or /resources).
+def _load_skills_vocab() -> None:
+    global KNOWN_SKILLS
+    candidate_paths = [
+        SKILL_FILE,
+        Path("app/resources/skills.txt"),
+        Path("resources/skills.txt"),
+        Path("skills.txt"),
+    ]
+    for p in candidate_paths:
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    KNOWN_SKILLS = set(line.strip().lower() for line in f if line.strip())
+                if KNOWN_SKILLS:
+                    return
+        except Exception:
+            # try next path silently (non-fatal)
+            continue
+    # if all fail, keep empty set (degrade gracefully)
+
+_load_skills_vocab()
 
 # ----------------------------
 # Helpers

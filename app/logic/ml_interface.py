@@ -20,6 +20,8 @@ except Exception:
 
 # NEW: for near-literal paragraph matching
 from difflib import SequenceMatcher
+# NEW: timestamps for embedding persistence
+from datetime import datetime, timezone
 
 
 # -----------------------------
@@ -387,7 +389,8 @@ def _build_search_blob(cv: Dict[str, Any]) -> str:
 async def _ensure_owner_index(owner_user_id: Optional[str]) -> None:
     """
     Build (or reuse) an owner-scoped vector index lazily.
-    No persistence; safe in-memory cache. If numpy is missing or ANN disabled, no-op.
+    Prefers precomputed `index_embedding` stored on each resume; if missing,
+    computes once and persists back for future fast boots. In-memory cache only.
     """
     if not USE_ANN_INDEX or np is None:
         return
@@ -396,32 +399,94 @@ async def _ensure_owner_index(owner_user_id: Optional[str]) -> None:
         return
 
     query = {"ownerUserId": owner_user_id} if owner_user_id else {}
-    # fetch minimal fields
+    # fetch minimal fields including stored embeddings
     projection = {
-        "_id": 1, "predicted_role": 1, "category": 1, "name": 1, "location": 1,
-        "skills": 1, "projects": 1, "total_experience_years": 1, "years_of_experience": 1,
-        "experience_years": 1, "yoe": 1, "experience": 1, "raw_text": 1
+        "_id": 1,
+        "index_embedding": 1,
+        "index_embedding_dim": 1,
+        "index_embedding_model": 1,
+        "index_blob": 1,
+        "raw_text": 1,
+        "predicted_role": 1,
+        "category": 1,
+        "name": 1,
+        "location": 1,
+        "skills": 1,
+        "projects": 1,
+        "total_experience_years": 1,
+        "years_of_experience": 1,
+        "experience_years": 1,
+        "yoe": 1,
+        "experience": 1
     }
-    # Motor requires a concrete length (None is invalid)
+
     docs: List[Dict[str, Any]] = await db.parsed_resumes.find(query, projection).to_list(length=100_000)
     if not docs:
         _owner_index_cache[key] = {"ids": [], "vecs": None}
         return
 
-    blobs = [_build_search_blob(cv) for cv in docs]
-    try:
-        # batch-encode to numpy
-        vecs = embedding_model.encode(blobs, convert_to_tensor=False, batch_size=EMB_BATCH_SIZE, show_progress_bar=False)
-        if isinstance(vecs, list):
-            vecs = np.array(vecs, dtype=np.float32)
-        vecs = _l2_normalize(vecs.astype(np.float32))
-    except Exception:
-        # if encoding fails, skip building index
+    ids: List[str] = []
+    vecs: List["np.ndarray"] = []
+
+    for cv in docs:
+        rid = str(cv.get("_id"))
+        stored = cv.get("index_embedding")
+        if stored is not None:
+            try:
+                vec_np = np.asarray(stored, dtype=np.float32)
+                n = np.linalg.norm(vec_np) + 1e-12
+                vec_np = vec_np / n
+            except Exception:
+                vec_np = None
+        else:
+            vec_np = None
+
+        if vec_np is None:
+            # compute from a compact blob
+            blob = cv.get("index_blob") or _build_search_blob(cv)
+            try:
+                emb = embedding_model.encode(clean_text(blob)[:INDEX_TRUNCATE_CHARS], convert_to_tensor=False)
+                if isinstance(emb, list):
+                    emb = np.array(emb, dtype=np.float32)
+                emb = emb.astype(np.float32)
+                emb /= (np.linalg.norm(emb) + 1e-12)
+                vec_np = emb
+
+                # persist for future fast warm
+                try:
+                    await db.parsed_resumes.update_one(
+                        {"_id": cv["_id"]},
+                        {"$set": {
+                            "index_blob": blob,
+                            "index_embedding": emb.tolist(),
+                            "index_embedding_dim": int(emb.shape[0]),
+                            "index_embedding_model": str(MODEL_ID),
+                            "ann_ready": True,
+                            "index_embedding_updated_at": datetime.now(timezone.utc)
+                        }}
+                    )
+                except Exception:
+                    # best-effort; ignore persistence failures
+                    pass
+            except Exception:
+                # could not compute, skip this doc for ANN
+                vec_np = None
+
+        if vec_np is not None:
+            ids.append(rid)
+            vecs.append(vec_np)
+
+    if not vecs:
         _owner_index_cache[key] = {"ids": [], "vecs": None}
         return
 
-    ids = [str(cv.get("_id")) for cv in docs]
-    _owner_index_cache[key] = {"ids": ids, "vecs": vecs}
+    try:
+        mat = np.vstack(vecs).astype(np.float32)
+    except Exception:
+        _owner_index_cache[key] = {"ids": [], "vecs": None}
+        return
+
+    _owner_index_cache[key] = {"ids": ids, "vecs": mat}
 
 def _index_search_ids(owner_user_id: Optional[str], q_vec_np: "np.ndarray", topk: int) -> List[str]:
     """
@@ -616,7 +681,37 @@ async def get_semantic_matches(
         obj_ids = [oid for oid in ([_to_object_id(i) for i in ids_restrict]) if oid is not None]
         query["_id"] = {"$in": obj_ids or ids_restrict}
 
-    cursor = db.parsed_resumes.find(query)
+    # NEW: prefilter by min_years if present (cheap DB-side pruning)
+    if min_years is not None:
+        query["$or"] = [
+            {"total_experience_years": {"$gte": min_years}},
+            {"years_of_experience": {"$gte": min_years}},
+            {"experience_years": {"$gte": min_years}},
+            {"yoe": {"$gte": min_years}},
+            {"experience": {"$gte": min_years}},
+        ]
+
+    # Minimal projection to reduce network/load
+    projection = {
+        "_id": 1,
+        "raw_text": 1,
+        "predicted_role": 1,
+        "category": 1,
+        "name": 1,
+        "location": 1,
+        "email": 1,
+        "skills": 1,
+        "projects": 1,
+        "resume_url": 1,
+        "confidence": 1,
+        "total_experience_years": 1,
+        "years_of_experience": 1,
+        "experience_years": 1,
+        "yoe": 1,
+        "experience": 1,
+    }
+
+    cursor = db.parsed_resumes.find(query, projection=projection)
 
     strict_matches: List[Dict[str, Any]] = []
     close_matches: List[Dict[str, Any]] = []   # relaxed filters if strict empty AND no strict filters set
@@ -665,6 +760,17 @@ async def get_semantic_matches(
             experience = _to_float_years(exp_val)  # '5+ years' -> 5.0, '0.2 yrs' -> 0.2
         except Exception:
             experience = 0.0
+
+        # ---- Add: user-friendly experience fields for UI ----
+        experience_rounded = round(experience, 2)
+        if experience > 0 and experience < 1:
+            experience_display = "< 1 year"
+        elif experience >= 1:
+            yrs_i = int(round(experience))
+            experience_display = f"{yrs_i} year" + ("" if yrs_i == 1 else "s")
+        else:
+            experience_display = "Not specified"
+        # -----------------------------------------------------
 
         location_text = clean_text(cv.get("location") or "")
 
@@ -833,6 +939,8 @@ async def get_semantic_matches(
             "predicted_role": original_predicted_role,
             "category": cv.get("category", original_predicted_role),
             "experience": experience,
+            "experience_display": experience_display,      # added
+            "experience_rounded": experience_rounded,      # added
             "location": location_text or "N/A",
             "email": cv.get("email", "N/A"),
             "skills": skills,

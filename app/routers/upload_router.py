@@ -12,6 +12,15 @@ from app.logic.ml_interface import (
 from app.routers.auth_router import get_current_user  # ✅ auth required
 import uuid
 import os
+import re  # ✅ needed for experience normalization
+
+# ✅ NEW imports for embedding persistence & timestamps
+from app.logic.ml_interface import embedding_model, INDEX_TRUNCATE_CHARS, MODEL_ID
+from datetime import datetime, timezone
+try:
+    import numpy as np
+except Exception:
+    np = None  # degrade gracefully if numpy unavailable
 
 router = APIRouter()
 
@@ -116,6 +125,37 @@ async def upload_resumes(
         resume_data["filename"] = filename
         resume_data["experience"] = resume_data.get("experience", 0)
 
+        # 🔧 Canonical numeric experience fields for DB filtering & scoring
+        def _to_float_years_upload(v):
+            try:
+                if isinstance(v, (int, float)):
+                    return float(v)
+                s = str(v)
+                m = re.search(r"(\d+(?:\.\d+)?)", s)
+                return float(m.group(1)) if m else 0.0
+            except Exception:
+                return 0.0
+
+        exp_candidates = [
+            resume_data.get("total_experience_years"),
+            resume_data.get("years_of_experience"),
+            resume_data.get("experience_years"),
+            resume_data.get("yoe"),
+            resume_data.get("experience"),
+        ]
+
+        numeric_years = 0.0
+        for c in exp_candidates:
+            if c is not None and str(c).strip() != "":
+                numeric_years = _to_float_years_upload(c)
+                break
+
+        # Set all aliases so DB-side $gte works reliably
+        resume_data["total_experience_years"] = numeric_years
+        resume_data["years_of_experience"]    = numeric_years
+        resume_data["experience_years"]       = numeric_years
+        resume_data["yoe"]                    = numeric_years
+
         # Fallbacks & profile fields
         resume_data["name"] = (resume_data.get("name") or "").strip() or "No Name"
         resume_data["location"] = resume_data.get("location") or "N/A"
@@ -177,6 +217,44 @@ async def upload_resumes(
             )
         except Exception:
             # Index update is best-effort; ignore failures
+            pass
+
+        # ✅ NEW: Persist index embedding + index_blob for fast ANN (best-effort, non-fatal)
+        try:
+            # Clean + truncate for encoder, consistent with ANN builder
+            blob_for_emb = clean_text(index_blob)[:int(INDEX_TRUNCATE_CHARS)]
+            vec = embedding_model.encode(blob_for_emb, convert_to_tensor=False)
+
+            # Normalize & ensure float32 if numpy is available
+            if np is not None:
+                try:
+                    vec_np = np.asarray(vec, dtype=np.float32)
+                    nrm = np.linalg.norm(vec_np) + 1e-12
+                    vec_np = (vec_np / nrm).astype(np.float32)
+                    vec_to_store = vec_np.tolist()
+                    dim = int(vec_np.shape[0])
+                except Exception:
+                    # fallback: store raw list
+                    vec_to_store = [float(x) for x in (vec.tolist() if hasattr(vec, "tolist") else vec)]
+                    dim = len(vec_to_store)
+            else:
+                # numpy not available: store as-is
+                vec_to_store = [float(x) for x in (vec.tolist() if hasattr(vec, "tolist") else vec)]
+                dim = len(vec_to_store)
+
+            await db.parsed_resumes.update_one(
+                {"_id": resume_data["_id"]},
+                {"$set": {
+                    "index_blob": blob_for_emb,
+                    "index_embedding": vec_to_store,
+                    "index_embedding_dim": dim,
+                    "index_embedding_model": str(MODEL_ID),
+                    "ann_ready": True,
+                    "index_embedding_updated_at": datetime.now(timezone.utc),
+                }}
+            )
+        except Exception:
+            # Best-effort only; do not fail the upload on embedding issues
             pass
 
         # Safe preview for UI

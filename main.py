@@ -19,6 +19,9 @@ from app.routers.tests_router import router as tests_router
 # ✅ NEW: interviews router (schedule interview + listings)
 from app.routers.interviews_router import router as interviews_router
 
+# ✅ NEW: tests history (attempts list + PDF reports)
+from app.routers.tests_history_router import router as tests_history_router
+
 # Optional: proctoring endpoints (start/heartbeat/snapshot/end)
 try:
     from app.routers.proctor_router import router as proctor_router
@@ -84,6 +87,9 @@ app.include_router(tests_router, prefix="/tests")
 # ✅ Register NEW interviews router (has internal prefix '/interviews')
 app.include_router(interviews_router)
 
+# ✅ Register NEW tests history router (internal prefix '/tests/history')
+app.include_router(tests_history_router)
+
 # ✅ (Optional) Proctor router
 # NOTE: The router itself has NO internal prefix now; we add it here only once.
 if proctor_router:
@@ -126,10 +132,10 @@ _DEFAULT_AVATAR_B64 = (
 
 @app.get("/default-avatar.png")
 async def default_avatar() -> Response:
-    for p in _DEF_AVATAR_CANDIDATES:
-        if p.is_file():
-            return FileResponse(str(p), media_type="image/png")
-    return Response(content=base64.b64decode(_DEFAULT_AVATAR_B64), media_type="image/png")
+  for p in _DEF_AVATAR_CANDIDATES:
+      if p.is_file():
+          return FileResponse(str(p), media_type="image/png")
+  return Response(content=base64.b64decode(_DEFAULT_AVATAR_B64), media_type="image/png")
 
 
 # ---------------------------

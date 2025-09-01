@@ -36,14 +36,31 @@ try:
     get_db = _app_get_db
     _db_mode = "app"
 except Exception:
-    # Fallback to env-based connection later
-    _db_mode = "env"
+    # NEW: if get_db is not exported by app.utils.mongo, gracefully fall back to its `db` object
+    try:
+        from app.utils.mongo import db as _app_db  # type: ignore
+
+        def _fallback_get_db():
+            # return the already-initialized database instance from the app
+            return _app_db
+
+        get_db = _fallback_get_db  # type: ignore
+        _db_mode = "app"
+    except Exception:
+        # Fallback to env-based connection later
+        _db_mode = "env"
 
 # --- Utility: ObjectId optional import -----------------------------------------
 try:
     from bson import ObjectId  # type: ignore
 except Exception:
     ObjectId = None  # type: ignore
+
+# NEW: Optional Motor type import for robust runtime detection
+try:
+    from motor.motor_asyncio import AsyncIOMotorDatabase  # type: ignore
+except Exception:
+    AsyncIOMotorDatabase = None  # type: ignore
 
 
 def _is_awaitable(obj: Any) -> bool:
@@ -60,6 +77,13 @@ def _stringify(val: Any) -> Optional[str]:
             return str(val)
     except Exception:
         pass
+    # NEW: lists/tuples — pick the first non-empty element
+    if isinstance(val, (list, tuple)):
+        for v in val:
+            s = _stringify(v)
+            if s:
+                return s
+        return None
     # dict with id/_id
     if isinstance(val, dict):
         for k in ("id", "_id", "userId", "ownerUserId"):
@@ -140,8 +164,14 @@ async def _run_with_motor(
     dry_run: bool,
     limit: int,
 ) -> Tuple[int, int, int]:
+    """
+    Uses Motor's async API. Keeps original behavior but switches to collection.bulk_write
+    for reliability (instead of raw db.command('bulkWrite')).
+    """
     coll = db[collection_name]
-    query = {owner_field: {"$in": [None, ""]}}
+
+    # Include both "missing" and "null/empty" owner_field cases (additive)
+    query = {"$or": [{owner_field: {"$exists": False}}, {owner_field: {"$in": [None, ""]}}]}
     if extra_filter:
         query.update(extra_filter)
 
@@ -149,6 +179,12 @@ async def _run_with_motor(
     cursor = coll.find(query, projection={owner_field: 1, **{f: 1 for f in infer_fields}})
     processed = updated = skipped = 0
     ops = []
+
+    # Import here to avoid mandatory dependency at import time
+    try:
+        from pymongo import UpdateOne  # type: ignore
+    except Exception:
+        UpdateOne = None  # type: ignore
 
     async for doc in cursor:
         if limit and processed >= limit:
@@ -163,30 +199,20 @@ async def _run_with_motor(
             skipped += 1
             continue
 
-        if dry_run:
+        if dry_run or UpdateOne is None:
             print(f"[DRY] would set {owner_field}={inferred} for _id={doc.get('_id')}")
         else:
             ops.append(
-                {
-                    "filter": {"_id": doc["_id"]},
-                    "update": {"$set": {owner_field: inferred}},
-                }
+                UpdateOne({"_id": doc["_id"]}, {"$set": {owner_field: inferred}})
             )
             if len(ops) >= batch_size:
-                # Perform bulk write
-                requests = [
-                    # Use raw command to keep compat without importing UpdateOne
-                    {"updateOne": {"filter": op["filter"], "update": op["update"]}}
-                    for op in ops
-                ]
-                await db.command("bulkWrite", collection_name, requests=requests)
-                updated += len(ops)
+                res = await coll.bulk_write(ops, ordered=False)
+                updated += res.modified_count
                 ops = []
 
-    if ops and not dry_run:
-        requests = [{"updateOne": {"filter": op["filter"], "update": op["update"]}} for op in ops]
-        await db.command("bulkWrite", collection_name, requests=requests)
-        updated += len(ops)
+    if ops and not dry_run and UpdateOne is not None:
+        res = await coll.bulk_write(ops, ordered=False)
+        updated += res.modified_count
 
     return processed, updated, skipped
 
@@ -206,7 +232,9 @@ def _run_with_pymongo(
     from pymongo import UpdateOne  # type: ignore
 
     coll = db[collection_name]
-    query = {owner_field: {"$in": [None, ""]}}
+
+    # Include both "missing" and "null/empty" owner_field cases (additive)
+    query = {"$or": [{owner_field: {"$exists": False}}, {owner_field: {"$in": [None, ""]}}]}
     if extra_filter:
         query.update(extra_filter)
 
@@ -282,22 +310,38 @@ def main():
                     dry_run=args.dry_run,
                     limit=args.limit,
                 )
-                print(f"\nDone (MOTOR). Processed: {processed}, Updated: {updated}, Skipped: {skipped}")
+                print(f"\nDone (MOTOR/awaitable). Processed: {processed}, Updated: {updated}, Skipped: {skipped}")
             asyncio.run(_run_async())
         else:
-            # Assume PyMongo db
+            # Detect Motor vs PyMongo instance at runtime
             db = db_candidate
-            processed, updated, skipped = _run_with_pymongo(
-                db=db,
-                collection_name=args.collection,
-                owner_field=args.owner_field,
-                infer_fields=infer_fields,
-                extra_filter=extra_filter,
-                batch_size=args.batch_size,
-                dry_run=args.dry_run,
-                limit=args.limit,
-            )
-            print(f"\nDone (PYMONGO via app). Processed: {processed}, Updated: {updated}, Skipped: {skipped}")
+            if AsyncIOMotorDatabase is not None and isinstance(db, AsyncIOMotorDatabase):
+                async def _run_async_motor():
+                    processed, updated, skipped = await _run_with_motor(
+                        db=db,
+                        collection_name=args.collection,
+                        owner_field=args.owner_field,
+                        infer_fields=infer_fields,
+                        extra_filter=extra_filter,
+                        batch_size=args.batch_size,
+                        dry_run=args.dry_run,
+                        limit=args.limit,
+                    )
+                    print(f"\nDone (MOTOR). Processed: {processed}, Updated: {updated}, Skipped: {skipped}")
+                asyncio.run(_run_async_motor())
+            else:
+                # Assume PyMongo db
+                processed, updated, skipped = _run_with_pymongo(
+                    db=db,
+                    collection_name=args.collection,
+                    owner_field=args.owner_field,
+                    infer_fields=infer_fields,
+                    extra_filter=extra_filter,
+                    batch_size=args.batch_size,
+                    dry_run=args.dry_run,
+                    limit=args.limit,
+                )
+                print(f"\nDone (PYMONGO via app). Processed: {processed}, Updated: {updated}, Skipped: {skipped}")
     else:
         # Env fallback
         db = _env_connect()

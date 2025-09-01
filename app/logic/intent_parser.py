@@ -40,7 +40,14 @@ def detect_show_all(prompt: str) -> bool:
         "display all",
         "get all",
         "sab dikhao",
-        "saare candidate"
+        "saare candidate",
+        # ✅ a few extra phrasings
+        "show all cvs",
+        "list all cvs",
+        "all cvs",
+        "all resumes",
+        "saare cvs",
+        "saari cvs",
     ]
 
 # ---------------------------
@@ -390,76 +397,90 @@ def _extract_experience(prompt: str) -> Dict[str, float]:
       - "= 4 years", "exactly 4 years" -> eq
       - "min 3", "max 7"
       - Symbols: <=, >=, <, >
+      - ✅ Also accepts "yrs", "yr", and "yoe" as year indicators; and handles "atleast"
     Returns:
       Either {"op":"<|>|=","years":X} or {"gte":A,"lte":B} or {"gte":X} / {"lte":Y}
     """
     p = prompt.lower()
     exp: Dict[str, float] = {}
 
+    YR = r"(?:years?|yrs?|yr|yoe)"
+    NUM = r"(\d+(?:\.\d+)?)"
+
     # Symbols: <=, >=, <, >
-    m = re.search(r"\b>=\s*(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b>=\s*{NUM}\s*{YR}?\b", p)
     if m:
         return {"gte": float(m.group(1))}
-    m = re.search(r"\b<=\s*(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b<=\s*{NUM}\s*{YR}?\b", p)
     if m:
         return {"lte": float(m.group(1))}
-    m = re.search(r"\b>\s*(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b>\s*{NUM}\s*{YR}?\b", p)
     if m:
         return {"op": ">", "years": float(m.group(1))}
-    m = re.search(r"\b<\s*(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b<\s*{NUM}\s*{YR}?\b", p)
     if m:
         return {"op": "<", "years": float(m.group(1))}
 
     # between X and Y / between X to Y
-    m = re.search(r"\bbetween\s+(\d+(?:\.\d+)?)\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\bbetween\s+{NUM}\s+(?:and|to)\s+{NUM}\s*{YR}?\b", p)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
         if lo > hi:
             lo, hi = hi, lo
         return {"gte": lo, "lte": hi}
 
-    # range like "3-5 years" / "3–5 years" / "3 — 5 years"
-    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*years?\b", p)
+    # range like "3-5 years" / "3–5 years" / "3 — 5 years" / "3 to 5 yrs"
+    m = re.search(rf"\b{NUM}\s*(?:-|–|—|to)\s*{NUM}\s*{YR}?\b", p)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
         if lo > hi:
             lo, hi = hi, lo
         return {"gte": lo, "lte": hi}
 
-    # >= / at least / minimum / 3+ years
-    if re.search(r"\b(at least|min(?:imum)?)\b", p) or re.search(r"\b\d+\s*\+\s*years?\b", p):
-        m = re.search(r"\b(\d+(?:\.\d+)?)\s*\+?\s*years?\b", p)
+    # >= / at least / atleast / minimum / 3+ years
+    if re.search(r"\b(at least|atleast|min(?:imum)?)\b", p) or re.search(rf"\b{NUM}\s*\+\s*{YR}\b", p):
+        m = re.search(rf"\b{NUM}\s*\+?\s*{YR}\b", p)
         if m:
             exp["gte"] = float(m.group(1))
             # keep parsing in case an upper bound is present
 
     # > / greater than / more than / over
-    m = re.search(r"\b(greater than|more than|over)\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b(greater than|more than|over)\s+{NUM}\s*{YR}\b", p)
     if m:
         return {"op": ">", "years": float(m.group(2))}
 
     # <= / at most / maximum / up to
-    m = re.search(r"\b(at most|max(?:imum)?|up to)\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b(at most|max(?:imum)?|up to)\s+{NUM}\s*{YR}?\b", p)
     if m:
-        exp["lte"] = float(m.group(2))
+        exp["lte"] = float(m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1))
 
     # < / less than / under / below
-    m = re.search(r"\b(less than|under|below)\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b(less than|under|below)\s+{NUM}\s*{YR}\b", p)
     if m:
         return {"op": "<", "years": float(m.group(2))}
 
     # exact = / equals / exactly
-    m = re.search(r"\b(exactly|equal(?:s)? to|=)\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\b(exactly|equal(?:s)? to|=)\s+{NUM}\s*{YR}?\b", p)
     if m:
         return {"op": "=", "years": float(m.group(2))}
 
-    # explicit min/max X years
-    m = re.search(r"\bmin\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    # explicit min/max X years (allow missing year token)
+    m = re.search(rf"\bmin\s+{NUM}(?:\s*{YR})?\b", p)
     if m:
         exp["gte"] = float(m.group(1))
-    m = re.search(r"\bmax\s+(\d+(?:\.\d+)?)\s*years?\b", p)
+    m = re.search(rf"\bmax\s+{NUM}(?:\s*{YR})?\b", p)
     if m:
         exp["lte"] = float(m.group(1))
+
+    # simple "X yrs"/"X yoe"
+    m = re.search(rf"\b{NUM}\s*{YR}\b", p)
+    if m and "gte" not in exp and "lte" not in exp and "op" not in exp:
+        exp["gte"] = float(m.group(1))
+
+    # "X+" (no unit) → treat as >= X
+    m = re.search(rf"\b{NUM}\+\b", p)
+    if m and "gte" not in exp:
+        exp["gte"] = float(m.group(1))
 
     return exp
 
@@ -592,6 +613,10 @@ def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
         out["job_title"] = parsed["job_title"]
         # helpful aliases for strict gating downstream
         out["job_title_normalized"] = parsed["job_title"]
+        # ✅ aliases used by response builder's _collect_filter_intent
+        out["title"] = parsed["job_title"]
+        out["role"] = parsed["job_title"]
+        out["position"] = parsed["job_title"]
     if parsed.get("role_family"):
         out["role_family"] = parsed["role_family"]
     if parsed.get("locations"):
@@ -606,17 +631,30 @@ def _normalize_query_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
         out["skills_exclude"] = parsed["skills_exclude"]
     if parsed.get("projects_keywords"):
         out["projects_keywords"] = parsed["projects_keywords"]
+        # ✅ provide alternative keys some code paths may check
+        out["projects"] = parsed["projects_keywords"]
+        out["project_terms"] = parsed["projects_keywords"]
     if "projects_required" in parsed:
         out["projects_required"] = bool(parsed["projects_required"])
     if parsed.get("experience"):
         out["experience"] = parsed["experience"]
+        # ✅ expose single-sided convenience aliases for downstream flexibility
+        if isinstance(parsed["experience"], dict):
+            op = parsed["experience"].get("op")
+            yrs = parsed["experience"].get("years")
+            if op == ">" and yrs is not None:
+                out["experience_more_than"] = yrs
+            if op == "<" and yrs is not None:
+                out["experience_less_than"] = yrs
     if "skills_all_strict" in parsed:
         out["skills_all_strict"] = bool(parsed["skills_all_strict"])
     # convenience numeric bounds (additive; safely ignored if unused)
     if "min_years" in parsed and parsed["min_years"] is not None:
         out["min_years"] = parsed["min_years"]
+        out["min_experience"] = parsed["min_years"]  # ✅ alias for response_builder
     if "max_years" in parsed and parsed["max_years"] is not None:
         out["max_years"] = parsed["max_years"]
+        out["max_experience"] = parsed["max_years"]  # ✅ alias for response_builder
 
     # ✅ NEW additive normalizations for strong filtering
     if parsed.get("must_have_phrases"):

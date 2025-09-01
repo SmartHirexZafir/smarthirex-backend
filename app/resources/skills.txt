@@ -1,4 +1,5 @@
 # Programming Languages
+
 python
 java
 javascript
@@ -22,6 +23,7 @@ haskell
 lua
 
 # Web Frontend
+
 html
 css
 scss
@@ -42,8 +44,12 @@ bootstrap
 tailwind
 material-ui
 chakra-ui
+material ui
+mui
+chakra ui
 
 # Backend & Frameworks
+
 node
 nodejs
 express
@@ -58,8 +64,10 @@ laravel
 symfony
 gin
 fiber
+spring boot
 
 # Databases
+
 mysql
 postgresql
 sqlite
@@ -75,8 +83,10 @@ elasticsearch
 neo4j
 firestore
 bigquery
+postgres
 
 # Cloud & DevOps
+
 aws
 azure
 gcp
@@ -97,8 +107,16 @@ puppet
 chef
 helm
 openshift
+cicd
+github actions
+gitlab ci
+circle ci
+travis ci
+nginx
+apache
 
 # Version Control / Collaboration
+
 git
 svn
 mercurial
@@ -107,8 +125,12 @@ confluence
 slack
 trello
 asana
+github
+gitlab
+bitbucket
 
 # Machine Learning / AI / Data
+
 pytorch
 tensorflow
 keras
@@ -129,8 +151,14 @@ llms
 mlflow
 dataiku
 rapidminer
+scikit
+torch
+powerbi
+tableau
+jupyter
 
 # Big Data / Streaming
+
 spark
 hadoop
 kafka
@@ -143,6 +171,7 @@ databricks
 redshift
 
 # Testing / QA
+
 jest
 mocha
 chai
@@ -156,8 +185,10 @@ postman
 karma
 enzyme
 puppeteer
+rspec
 
 # Mobile
+
 android
 ios
 flutter
@@ -166,8 +197,10 @@ swiftui
 xamarin
 cordova
 ionic
+react native
 
 # APIs / Communication
+
 graphql
 rest
 soap
@@ -180,6 +213,7 @@ swagger
 openapi
 
 # Security
+
 oauth
 jwt
 saml
@@ -188,8 +222,14 @@ penetration-testing
 owasp
 ssl
 tls
+oauth2
+oidc
+openid connect
+penetration testing
+owasp top 10
 
 # Other Tools / Tech
+
 webpack
 babel
 eslint
@@ -212,3 +252,7 @@ photoshop
 illustrator
 after-effects
 premiere
+adobe-xd
+adobe xd
+excel
+word

@@ -9,7 +9,7 @@ from app.utils.emailer import send_verification_email
 from dotenv import load_dotenv
 from types import SimpleNamespace
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  # ✅ include timezone for aware datetimes
 import jwt, uuid, os
 
 load_dotenv()
@@ -22,6 +22,7 @@ SECRET_KEY = os.getenv("JWT_SECRET", "smarthirex-secret")
 ALGORITHM = "HS256"
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
 VERIFICATION_TTL_HOURS = 24
+JWT_EXPIRES_HOURS = int(os.getenv("JWT_EXPIRES_HOURS", "168"))  # ✅ default 7 days
 
 # ----------- Models -----------
 
@@ -39,6 +40,10 @@ class LoginRequest(BaseModel):
 
 # ----------- Helpers -----------
 
+def _now_utc() -> datetime:
+    """Timezone-aware UTC now for consistent storage and comparisons."""
+    return datetime.now(timezone.utc)
+
 def _verify_link(token: str) -> str:
     """
     Link sent to the user's email. It points to the Next.js page:
@@ -51,9 +56,9 @@ async def _create_verify_token(user_id: str) -> str:
     await db.email_verification_tokens.insert_one({
         "user_id": user_id,
         "token": token,
-        "expires_at": datetime.utcnow() + timedelta(hours=VERIFICATION_TTL_HOURS),
+        "expires_at": _now_utc() + timedelta(hours=VERIFICATION_TTL_HOURS),  # ✅ aware
         "used": False,
-        "created_at": datetime.utcnow(),
+        "created_at": _now_utc(),  # ✅ aware
     })
     return token
 
@@ -61,7 +66,7 @@ async def _verify_token_and_mark_used(token: str):
     tok = await db.email_verification_tokens.find_one({"token": token})
     if (not tok) or tok.get("used"):
         raise HTTPException(status_code=400, detail="Invalid or used token")
-    if tok["expires_at"] < datetime.utcnow():
+    if tok["expires_at"] < _now_utc():  # ✅ aware comparison
         raise HTTPException(status_code=400, detail="Token expired")
 
     # mark user as verified + token as used
@@ -82,16 +87,20 @@ def _wants_json(request: Request, redirect_param: Optional[str] = None) -> bool:
 
 @router.post("/signup")
 async def signup(data: SignupRequest):
-    existing = await db.users.find_one({"email": data.email})
+    # ✅ normalize email to lowercase to avoid case-variant duplicates
+    email_lc = str(data.email).strip().lower()
+
+    existing = await db.users.find_one({"email": email_lc})
     if existing:
         raise HTTPException(status_code=400, detail="User already exists")
 
     hashed = pwd_context.hash(data.password)
     user = data.dict()
     user["_id"] = str(uuid.uuid4())
+    user["email"] = email_lc  # ✅ store lowercased
     user["password"] = hashed
     user["is_verified"] = False
-    user["created_at"] = datetime.utcnow()
+    user["created_at"] = _now_utc()  # ✅ aware timestamp
 
     await db.users.insert_one(user)
 
@@ -99,7 +108,7 @@ async def signup(data: SignupRequest):
     token = await _create_verify_token(user["_id"])
     verify_url = _verify_link(token)
     try:
-        send_verification_email(data.email, verify_url)
+        send_verification_email(email_lc, verify_url)
     except Exception:
         # if email sending fails, you may want to delete user or allow resend
         # here we keep user and allow "resend" from UI
@@ -141,7 +150,9 @@ async def resend_verification(payload: dict = Body(...)):
     if not email:
         raise HTTPException(status_code=400, detail="email required")
 
-    user = await db.users.find_one({"email": email})
+    email_lc = str(email).strip().lower()  # ✅ normalize
+
+    user = await db.users.find_one({"email": email_lc})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user.get("is_verified"):
@@ -150,7 +161,7 @@ async def resend_verification(payload: dict = Body(...)):
     token = await _create_verify_token(user["_id"])
     verify_url = _verify_link(token)
     try:
-        send_verification_email(email, verify_url)
+        send_verification_email(email_lc, verify_url)
     except Exception:
         pass
     return {"ok": True, "message": "Verification email sent"}
@@ -159,7 +170,8 @@ async def resend_verification(payload: dict = Body(...)):
 
 @router.post("/login")
 async def login(data: LoginRequest):
-    user = await db.users.find_one({"email": data.email})
+    email_lc = str(data.email).strip().lower()  # ✅ normalize
+    user = await db.users.find_one({"email": email_lc})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -170,8 +182,15 @@ async def login(data: LoginRequest):
     if not user.get("is_verified"):
         raise HTTPException(status_code=403, detail="Email not verified")
 
+    # ✅ add exp/iat claims so tokens expire (caught by get_current_user handler)
+    now = _now_utc()
     token = jwt.encode(
-        {"email": user["email"], "id": str(user["_id"])},
+        {
+            "email": user["email"],
+            "id": str(user["_id"]),
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(hours=JWT_EXPIRES_HOURS)).timestamp()),
+        },
         SECRET_KEY,
         algorithm=ALGORITHM
     )

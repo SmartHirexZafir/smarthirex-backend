@@ -83,31 +83,45 @@ SYNONYMS: Dict[str, str] = {
 # ---- NEW: Optional custom synonyms merge (non-breaking) ---------------------
 _CUSTOM_SYNONYMS_PATH = os.path.join("app", "resources", "synonyms_custom.json")
 
+# ✅ ADDITIVE: search multiple common paths so custom synonyms are picked up
+# even if the file lives outside app/resources during development/deployment.
+_CUSTOM_SYNONYMS_PATHS: List[str] = [
+    _CUSTOM_SYNONYMS_PATH,
+    os.path.join("resources", "synonyms_custom.json"),
+    "synonyms_custom.json",
+]
+
+
 def _merge_custom_synonyms() -> None:
     """
-    Load app/resources/synonyms_custom.json and merge into SYNONYMS.
+    Load custom synonyms and merge into SYNONYMS.
     - Keys/values are lowercased and stripped.
     - Invalid entries are ignored.
     - Custom entries override defaults.
-    Silently no-ops if file is missing or invalid.
+    Silently no-ops if file(s) are missing or invalid.
     """
-    try:
-        with open(_CUSTOM_SYNONYMS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return
-        cleaned: Dict[str, str] = {}
-        for k, v in data.items():
-            if isinstance(k, str) and isinstance(v, str):
-                kk = k.strip().lower()
-                vv = v.strip().lower()
-                if kk and vv:
-                    cleaned[kk] = vv
-        if cleaned:
-            SYNONYMS.update(cleaned)
-    except Exception:
-        # Optional file — ignore any errors to preserve old behavior
-        pass
+    for path in _CUSTOM_SYNONYMS_PATHS:
+        try:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            cleaned: Dict[str, str] = {}
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    kk = k.strip().lower()
+                    vv = v.strip().lower()
+                    if kk and vv:
+                        cleaned[kk] = vv
+            if cleaned:
+                SYNONYMS.update(cleaned)
+                # If we successfully loaded from one path, we still continue to allow
+                # cumulative merges from multiple files if present.
+        except Exception:
+            # Optional file — ignore any errors to preserve old behavior
+            continue
 
 # Attempt merge at import time (safe if file is absent)
 _merge_custom_synonyms()

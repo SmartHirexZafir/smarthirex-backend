@@ -8,15 +8,23 @@ from app.utils.redirect_helper import build_redirect_url
 
 
 # ---------------------------
-# Usage guide helpers (as-is)
+# Usage guide helpers (as-is) + safe fallbacks
 # ---------------------------
 async def load_usage_guide():
     path = os.path.join("app", "static", "usage_guide.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # ensure dict shape for fuzzy_match
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        # File optional; return empty to avoid crashes/hangs
+        return {}
 
 
 async def fuzzy_match(prompt, guide):
+    if not isinstance(guide, dict) or not guide:
+        return None
     closest = difflib.get_close_matches(prompt.lower(), guide.keys(), n=1, cutoff=0.3)
     return guide[closest[0]] if closest else None
 
@@ -443,7 +451,11 @@ async def build_response(parsed_data: dict) -> dict:
             keywords=parsed_data.get("keywords"),
         ) or []
 
-        redirect_url = build_redirect_url(parsed_data)
+        # Safe redirect build (non-fatal)
+        try:
+            redirect_url = build_redirect_url(parsed_data)
+        except Exception:
+            redirect_url = None
 
         # SHOW ALL → no structured filters (but keep original match flags)
         if intent == "show_all":
@@ -531,14 +543,23 @@ async def build_response(parsed_data: dict) -> dict:
     if intent == "usage_help":
         guide = await load_usage_guide()
         reply = await fuzzy_match(parsed_data.get("query", ""), guide)
+        reply_text = reply if reply else "Sorry, is feature ke bare me mujhe info nahi mili."
         return {
-            "reply": reply if reply else "Sorry, is feature ke bare me mujhe info nahi mili.",
+            "reply": reply_text,
             "redirect": None,
+            "resumes_preview": [],
+            "matchMeta": _summarize_matches([]),
+            "ui": {"primaryMessage": reply_text, "query": (parsed_data.get("query") or "").strip()},
             "no_results": False,
         }
 
+    # Unknown intent → respond with consistent, UI-safe shape
+    reply_text = "Sorry, I couldn't understand your query."
     return {
-        "reply": "Sorry, I couldn't understand your query.",
+        "reply": reply_text,
         "redirect": None,
+        "resumes_preview": [],
+        "matchMeta": _summarize_matches([]),
+        "ui": {"primaryMessage": reply_text, "query": (parsed_data.get("query") or "").strip()},
         "no_results": True,
     }

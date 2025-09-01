@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Request, Depends
 from datetime import datetime, timezone
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Tuple
 
 from bson import ObjectId
 from app.logic.intent_parser import parse_prompt
@@ -149,32 +149,44 @@ async def _owner_preview_filter(items: List[Dict[str, Any]], owner_id: str) -> L
     """
     Keep only previews that belong to the current owner.
     Support both string UUID _id and ObjectId _id stored in DB.
+
+    🔧 Performance fix: resolve ownership in BULK (avoids N+1 DB lookups).
     """
-    filtered: List[Dict[str, Any]] = []
-    for item in items or []:
+    if not items:
+        return []
+
+    str_ids: List[str] = []
+    obj_ids: List[ObjectId] = []
+
+    for item in items:
         cid_any = item.get("_id") or item.get("id") or item.get("resume_id")
-
-        # Prepare a query that tries multiple possible id shapes
-        or_conditions = []
-        # string ID path
         if isinstance(cid_any, str):
-            or_conditions.append({"_id": cid_any, "ownerUserId": owner_id})
-
-        # objectId path (from raw or {$oid})
+            str_ids.append(cid_any)
         oid = _to_object_id(cid_any)
         if oid:
-            or_conditions.append({"_id": oid, "ownerUserId": owner_id})
+            obj_ids.append(oid)
 
-        if not or_conditions:
-            # if we can't form any id condition, skip quietly
-            continue
+    # Build $or with type-separated _id lists (Mongo can't mix types in one $in reliably)
+    or_conditions: List[Dict[str, Any]] = []
+    if str_ids:
+        or_conditions.append({"_id": {"$in": str_ids}, "ownerUserId": owner_id})
+    if obj_ids:
+        or_conditions.append({"_id": {"$in": obj_ids}, "ownerUserId": owner_id})
 
-        doc = await db.parsed_resumes.find_one(
-            {"$or": or_conditions},
-            {"_id": 1},
-        )
-        if doc:
-            # ensure safe fallbacks for frontend card
+    if not or_conditions:
+        return []
+
+    cursor = db.parsed_resumes.find({"$or": or_conditions}, {"_id": 1})
+    owned = await cursor.to_list(length=10_000)
+    owned_ids: set = set()
+    for d in owned:
+        _id = d.get("_id")
+        owned_ids.add(str(_id))
+
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        cid_any = item.get("_id") or item.get("id") or item.get("resume_id")
+        if str(cid_any) in owned_ids:
             if not (item.get("name") and str(item.get("name")).strip()):
                 item["name"] = "No Name"
             if not isinstance(item.get("skills"), list):
@@ -315,7 +327,18 @@ async def handle_chatbot_query(
     Receives a natural language prompt from user,
     identifies intent, processes it, and responds accordingly.
     """
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return {
+            "reply": "Invalid request payload.",
+            "resumes_preview": [],
+            "matchMeta": {"strictCount": 0, "closeCount": 0, "total": 0, "hasExact": False, "hasClose": False},
+            "no_results": True,
+            "no_cvs_uploaded": False,
+            "ui": {"primaryMessage": "Invalid request payload.", "query": ""},
+        }
+
     prompt = (data.get("prompt") or "").strip()
 
     if not prompt:
@@ -348,8 +371,21 @@ async def handle_chatbot_query(
     parsed.setdefault("keywords", keywords)
     parsed.setdefault("ownerUserId", owner_id)  # 👈 pass owner for downstream filtering
 
-    # Step 2: Build response (existing pipeline)
-    response = await build_response(parsed)  # keep as-is
+    # Step 2: Build response (existing pipeline) with defensive try/except
+    try:
+        response = await build_response(parsed)  # keep as-is
+    except Exception:
+        # Fail-safe: return an empty, UI-safe response so loader stops
+        return {
+            "reply": "Sorry, something went wrong while processing your query.",
+            "resumes_preview": [],
+            "normalized_prompt": normalized_prompt,
+            "keywords": keywords,
+            "matchMeta": {"strictCount": 0, "closeCount": 0, "total": 0, "hasExact": False, "hasClose": False},
+            "no_results": True,
+            "no_cvs_uploaded": False,
+            "ui": {"primaryMessage": "Sorry, something went wrong while processing your query.", "query": prompt},
+        }
 
     # ✅ Safety post-filter: keep only resumes owned by current user
     raw_preview = response.get("resumes_preview", []) or []
@@ -410,6 +446,8 @@ async def handle_chatbot_query(
         "matchMeta": match_meta,                 # counts for banners
         "no_results": no_results,                # 👈 NEW flag for UI (hide analyzing + 3s toast)
         "no_cvs_uploaded": False,
+        # forward redirect hint from response_builder if present
+        "redirect": response.get("redirect"),
         # convenience for candidate filter header
         "ui": {
             "primaryMessage": reply_text,        # "Showing N results for your query."

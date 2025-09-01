@@ -38,11 +38,15 @@ db = client[MONGO_DB_NAME]
 # ✅ Optional: Called at app startup to confirm DB
 async def verify_mongo_connection():
     try:
+        # Lightweight ping first (fast fail if network/creds are wrong)
+        await db.command("ping")
         collections = await db.list_collection_names()
         print(f"✅ MongoDB connected to '{MONGO_DB_NAME}'. Collections: {collections}")
         # ✅ NEW (non-breaking): ensure useful indexes
         await ensure_meetings_indexes()
         await ensure_parsed_resumes_indexes()
+        await ensure_chat_queries_indexes()
+        await ensure_search_history_indexes()
     except Exception as e:
         print("❌ MongoDB connection failed:", str(e))
         raise
@@ -118,8 +122,42 @@ async def ensure_parsed_resumes_indexes() -> None:
         await db.parsed_resumes.create_index("content_hash")
         # Composite index to speed up per-user duplicate checks:
         await db.parsed_resumes.create_index([("ownerUserId", 1), ("content_hash", 1)])
+        # Light, generic sort helpers (optional; non-unique)
+        await db.parsed_resumes.create_index([("predicted_role", 1)])
+        await db.parsed_resumes.create_index([("category", 1)])
+        # ✅ NEW: Experience-field indexes to speed up min-years prefilter ($or) queries
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("total_experience_years", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("years_of_experience", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("experience_years", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("yoe", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("experience", 1)])
     except Exception as e:
         print("⚠️ Failed to create parsed_resumes indexes:", e)
+
+
+# ✅ NEW: Indexes for chatbot logs (used by chatbot_router)
+async def ensure_chat_queries_indexes() -> None:
+    """
+    Indexes for chat_queries, which stores per-owner query logs.
+    Speeds up analytics and owner's history lookups.
+    """
+    try:
+        await db.chat_queries.create_index([("ownerUserId", 1), ("timestamp", -1)])
+        await db.chat_queries.create_index([("timestamp", -1)])
+    except Exception as e:
+        print("⚠️ Failed to create chat_queries indexes:", e)
+
+
+# ✅ NEW: Indexes for search_history (used to render prior filtered results fast)
+async def ensure_search_history_indexes() -> None:
+    """
+    Indexes for search_history collection.
+    """
+    try:
+        await db.search_history.create_index([("ownerUserId", 1), ("timestamp_raw", -1)])
+        await db.search_history.create_index([("timestamp_raw", -1)])
+    except Exception as e:
+        print("⚠️ Failed to create search_history indexes:", e)
 
 
 # -----------------------------------------------------------------------------
