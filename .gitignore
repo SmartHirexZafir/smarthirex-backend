@@ -8,4 +8,18 @@ venv/
 *.db
 .DS_Store
 *.log
-/app/ml_models/
+
+
+# ML models & artifacts
+**/ml_models/
+*.pkl
+*.pt
+*.bin
+*.h5
+*.onnx
+*.ckpt
+*.model
+
+# (optional) IDE
+.vscode/
+.idea/
