@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Request, Depends
 from datetime import datetime, timezone
-from typing import Any, Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Iterable
 
 from bson import ObjectId
 from app.logic.intent_parser import parse_prompt
@@ -13,6 +13,47 @@ from app.logic.normalize import normalize_prompt, extract_min_years  # ✅ corre
 import re
 
 router = APIRouter()
+
+# --- Allowed filters (canonical keys) ---------------------------------------
+_ALLOWED_FILTERS = {
+    "role": "role",                # Job Role
+    "job_role": "role",
+    "jobrole": "role",
+    "skills": "skills",            # Skills
+    "location": "location",        # Location
+    "projects": "projects",        # Projects
+    "experience": "experience",    # Experience
+    "cv": "cv",                    # CV Content Matching
+    "cv_content": "cv",
+    "cv_content_matching": "cv",
+}
+
+# Minimal baseline skills for routing-level filtering (aligned with backend list)
+_BASELINE_SKILLS = set([
+    "react", "aws", "node", "excel", "django", "figma",
+    "pandas", "tensorflow", "keras", "java", "python",
+    "pytorch", "spark", "sql", "scikit", "mlflow", "docker",
+    "kubernetes", "typescript", "next", "nextjs", "next.js",
+    "powerpoint", "flora", "html", "css"
+])
+
+def _canon_filters(raw_filters: Any) -> List[str]:
+    """
+    Canonicalize selected filter keys and preserve the original order.
+    """
+    if not isinstance(raw_filters, (list, tuple)):
+        return []
+    out: List[str] = []
+    seen = set()
+    for f in raw_filters:
+        k = str(f or "").strip().lower()
+        k = _ALLOWED_FILTERS.get(k, "")
+        if not k:
+            continue
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
 
 
 def _to_object_id(val: Any) -> Optional[ObjectId]:
@@ -66,11 +107,16 @@ def _candidate_text_blob(c: Dict[str, Any]) -> str:
     push(c.get("currentRole"))
     push(c.get("skills"))
     push(c.get("summary"))
-    # nested resume fields
+
+    # nested resume fields (if present in preview)
     r = c.get("resume") or {}
     push(r.get("summary"))
     push(r.get("projects"))
     push(r.get("workHistory"))
+
+    # raw_text (from ml layer) if passed through
+    push(c.get("raw_text"))
+
     return " • ".join(parts).lower()
 
 
@@ -105,7 +151,6 @@ def _role_matches(wanted_role: Optional[str], c: Dict[str, Any]) -> bool:
         return True
 
     # suffix-based (designer|developer|engineer|scientist|analyst|manager|architect)
-    # and presence of a leading keyword (e.g., "web", "data", "ui/ux")
     m = re.search(
         r"\b([a-z][a-z ]*?)\s+(designer|developer|engineer|scientist|analyst|manager|architect)\b",
         want,
@@ -126,18 +171,19 @@ def _role_matches(wanted_role: Optional[str], c: Dict[str, Any]) -> bool:
 
 def _candidate_years(c: Dict[str, Any]) -> float:
     """
-    Try to convert experience into a number of years.
+    Try to convert experience into a number of years (handles multiple aliases).
     """
-    exp = c.get("experience")
-    if isinstance(exp, (int, float)):
-        return float(exp)
-    if isinstance(exp, str):
-        m = re.search(r"(\d+(?:\.\d+)?)", exp)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                return 0.0
+    for k in ("experience", "total_experience_years", "years_of_experience", "experience_years", "yoe"):
+        exp = c.get(k)
+        if isinstance(exp, (int, float)):
+            return float(exp)
+        if isinstance(exp, str):
+            m = re.search(r"(\d+(?:\.\d+)?)", exp)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    pass
     return 0.0
 
 
@@ -195,102 +241,148 @@ async def _owner_preview_filter(items: List[Dict[str, Any]], owner_id: str) -> L
     return filtered
 
 
-async def _fallback_filter_for_owner(
-    owner_id: str,
+# ------------------------ server-side SEQUENTIAL FILTERS ---------------------
+
+def _extract_location_from_prompt(prompt_like: str) -> Optional[str]:
+    """
+    Very lightweight location extractor: looks for 'in <place>'.
+    """
+    p = " " + (prompt_like or "").lower() + " "
+    m = re.search(r"\bin\s+([a-z][a-z .,'-]{1,60})", p)
+    if not m:
+        return None
+    loc = m.group(1).strip()
+    # trim trailing punctuation
+    loc = re.sub(r"[.,;:!?]+$", "", loc)
+    return loc if loc else None
+
+
+def _filter_by_role(cands: Iterable[Dict[str, Any]], prompt: str) -> List[Dict[str, Any]]:
+    wanted_role = (parse_prompt(prompt) or {}).get("job_title")
+    return [c for c in cands if _role_matches(wanted_role, c)]
+
+
+def _filter_by_experience(cands: Iterable[Dict[str, Any]], prompt: str) -> List[Dict[str, Any]]:
+    # treat prompt as ">= N years" when a single value is found
+    min_years = extract_min_years(prompt)  # None if not present
+    if min_years is None:
+        return list(cands)
+    out = []
+    for c in cands:
+        yrs = _candidate_years(c)
+        if yrs >= float(min_years):
+            out.append(c)
+    return out
+
+
+def _filter_by_skills(cands: Iterable[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
+    # only use plausible skill tokens from prompt
+    focus = [k for k in (keywords or []) if k in _BASELINE_SKILLS]
+    if not focus:
+        return list(cands)
+    focus_set = set(focus)
+    out: List[Dict[str, Any]] = []
+    for c in cands:
+        skills = c.get("skills") or []
+        skills_lc = set(str(s).strip().lower() for s in skills if s)
+        if skills_lc & focus_set:
+            out.append(c)
+    return out
+
+
+def _filter_by_location(cands: Iterable[Dict[str, Any]], prompt: str) -> List[Dict[str, Any]]:
+    loc = _extract_location_from_prompt(prompt)
+    if not loc:
+        return list(cands)
+    out: List[Dict[str, Any]] = []
+    for c in cands:
+        c_loc = str(c.get("location") or "").lower()
+        if c_loc and loc in c_loc:
+            out.append(c)
+    return out
+
+
+def _filter_by_projects(cands: Iterable[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
+    """
+    Project-category-only filter.
+    Looks ONLY at 'projects' field (strings or dicts with name/description).
+    """
+    if not keywords:
+        return list(cands)
+    keys = [k.strip().lower() for k in keywords if k and isinstance(k, str)]
+    out: List[Dict[str, Any]] = []
+    for c in cands:
+        txt = ""
+        projs = c.get("projects", [])
+        if isinstance(projs, list):
+            for p in projs:
+                if isinstance(p, str):
+                    txt += " " + p
+                elif isinstance(p, dict):
+                    txt += " " + str(p.get("name", "")) + " " + str(p.get("description", ""))
+        txt = txt.lower()
+        if txt and any(k in txt for k in keys):
+            out.append(c)
+    return out
+
+
+def _filter_by_cv_content(cands: Iterable[Dict[str, Any]], prompt: str, keywords: List[str]) -> List[Dict[str, Any]]:
+    """
+    When CV content is selected, only match prompt keywords / substring against raw_text-like content.
+    We keep this conservative (must match at least one keyword or prompt substring).
+    """
+    p = (prompt or "").lower().strip()
+    keys = [k for k in (keywords or []) if k and len(k) > 1]
+    out: List[Dict[str, Any]] = []
+    for c in cands:
+        blob = (
+            str(c.get("raw_text") or "")
+            + " "
+            + str((c.get("resume") or {}).get("summary") or "")
+            + " "
+            + str((c.get("resume") or {}).get("workHistory") or "")
+        ).lower()
+        if not blob:
+            continue
+        if p and p in blob:
+            out.append(c)
+            continue
+        if keys and any(k in blob for k in keys):
+            out.append(c)
+    return out
+
+
+def _apply_selected_filters_in_order(
+    items: List[Dict[str, Any]],
+    selected: List[str],
     prompt_like: str,
-    provided_keywords: Optional[List[str]] = None
+    keywords: List[str],
 ) -> List[Dict[str, Any]]:
     """
-    If primary pipeline returns no results, try a lightweight fuzzy filter
-    over the owner's resumes to avoid false 'no results'.
-    - Adds a strict *role/title* check so irrelevant roles are not returned.
+    Sequentially apply the selected filters in the given order.
+    Each step reduces the working set → faster & stricter.
     """
-    # 🔧 use imported normalize helpers (fixed names)
-    norm = normalize_prompt(prompt_like)
-    keywords = provided_keywords or norm["keywords"]
-    min_years = extract_min_years(norm["normalized_prompt"])
+    working = list(items)
+    if not working or not selected:
+        return working
 
-    # parse a concrete job title (e.g. 'web designer', 'data scientist')
-    parsed = parse_prompt(prompt_like) or {}
-    wanted_role = parsed.get("job_title")
-
-    # fetch a reasonable slice (you can index later for scale)
-    cursor = db.parsed_resumes.find(
-        {"ownerUserId": owner_id},
-        {
-            "_id": 1,
-            "name": 1,
-            "predicted_role": 1,
-            "category": 1,
-            "experience": 1,
-            "location": 1,
-            "confidence": 1,
-            "email": 1,
-            "phone": 1,
-            "skills": 1,
-            "resume_url": 1,
-            "filename": 1,
-            "currentRole": 1,
-            "resume": 1,
-            "semantic_score": 1,
-            "final_score": 1,
-        },
-    )
-
-    docs = await cursor.to_list(length=1000)
-
-    scored: List[Dict[str, Any]] = []
-    for c in docs:
-        # 🚫 discard if role/title clearly doesn't match
-        if not _role_matches(wanted_role, c):
-            continue
-
-        hay = _candidate_text_blob(c)
-        score = 0.0
-
-        for k in keywords:
-            if k in hay:
-                score += 10
-            # tiny preference for role-ish tokens
-            if re.search(r"(developer|engineer|scientist|designer|manager|architect|analyst)", k):
-                score += 5
-
-        yrs = _candidate_years(c)
-        if min_years is not None and yrs >= min_years:
-            score += 15
-
-        # leverage existing scores if present
-        if isinstance(c.get("semantic_score"), (int, float)):
-            score += float(c["semantic_score"])
-        if isinstance(c.get("final_score"), (int, float)):
-            score += float(c["final_score"])
-
-        if score > 0:
-            # map to preview shape
-            preview = {
-                "_id": c.get("_id"),
-                "name": (str(c.get("name") or "").strip() or "No Name"),
-                "predicted_role": c.get("predicted_role"),
-                "category": c.get("category"),
-                "experience": c.get("experience"),
-                "location": c.get("location"),
-                "confidence": c.get("confidence"),
-                "email": c.get("email"),
-                "phone": c.get("phone"),
-                "skills": c.get("skills") or [],
-                "resume_url": c.get("resume_url"),
-                "filename": c.get("filename"),
-                "score_type": "Fallback Match",
-                "semantic_score": c.get("semantic_score"),
-                "final_score": c.get("final_score"),
-                # Mark as close so UI can show the right banner
-                "is_strict_match": False,
-                "match_type": "close",
-            }
-            scored.append({"preview": preview, "score": score})
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return [x["preview"] for x in scored[:100]]  # return top-N
+    for f in selected:
+        if f == "role":
+            working = _filter_by_role(working, prompt_like)
+        elif f == "experience":
+            working = _filter_by_experience(working, prompt_like)
+        elif f == "skills":
+            working = _filter_by_skills(working, keywords)
+        elif f == "location":
+            working = _filter_by_location(working, prompt_like)
+        elif f == "projects":
+            working = _filter_by_projects(working, keywords)
+        elif f == "cv":
+            working = _filter_by_cv_content(working, prompt_like, keywords)
+        # if list becomes empty early, break
+        if not working:
+            break
+    return working
 
 
 def _summarize_matches(preview: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -340,6 +432,8 @@ async def handle_chatbot_query(
         }
 
     prompt = (data.get("prompt") or "").strip()
+    selected_filters_raw = data.get("selected_filters") or data.get("filters") or data.get("selectedFilters") or []
+    selected_filters = _canon_filters(selected_filters_raw)
 
     if not prompt:
         return {"reply": "Prompt is empty.", "resumes_preview": []}
@@ -370,8 +464,10 @@ async def handle_chatbot_query(
     parsed.setdefault("normalized_prompt", normalized_prompt)
     parsed.setdefault("keywords", keywords)
     parsed.setdefault("ownerUserId", owner_id)  # 👈 pass owner for downstream filtering
+    # 👇 NEW: include selected filters (order preserved)
+    parsed["selectedFilters"] = selected_filters
 
-    # Step 2: Build response (existing pipeline) with defensive try/except
+    # Step 2: Build response (existing pipeline)
     try:
         response = await build_response(parsed)  # keep as-is
     except Exception:
@@ -391,23 +487,67 @@ async def handle_chatbot_query(
     raw_preview = response.get("resumes_preview", []) or []
     filtered_preview = await _owner_preview_filter(raw_preview, owner_id)
 
-    # ✅ Server-side fallback fuzzy filter if nothing left (now role-aware)
+    # ✅ NEW: Semantic fallback (owner-scoped) so cards get semantic_score, related_roles, role etc.
+    # If still empty after the first pass, use get_semantic_matches instead of the old fuzzy DB scan.
     if not filtered_preview:
-        filtered_preview = await _fallback_filter_for_owner(
-            owner_id=owner_id,
-            prompt_like=normalized_prompt or prompt,
-            provided_keywords=keywords,
+        try:
+            from app.logic.ml_interface import get_semantic_matches  # lazy import to avoid cycles
+            sem_candidates = await get_semantic_matches(
+                normalized_prompt or prompt,
+                owner_user_id=owner_id,
+                normalized_prompt=normalized_prompt,
+                keywords=keywords,
+            )
+        except Exception:
+            sem_candidates = []
+        # keep ownership safety
+        filtered_preview = await _owner_preview_filter(sem_candidates, owner_id)
+
+    # ✅ If STILL empty → fall back to legacy fuzzy scan (previous behavior, kept intact)
+    if not filtered_preview:
+        from app.logic.normalize import normalize_prompt as _np  # lazy import safe
+        norm2 = _np(normalized_prompt or prompt)
+        fallback_keywords = norm2["keywords"]
+        fallback = []
+        cursor = db.parsed_resumes.find(
+            {"ownerUserId": owner_id},
+            {
+                "_id": 1, "name": 1, "predicted_role": 1, "category": 1, "experience": 1,
+                "location": 1, "confidence": 1, "ml_confidence": 1,  # ⬅ added
+                "email": 1, "phone": 1, "skills": 1,
+                "resume_url": 1, "filename": 1, "currentRole": 1, "resume": 1,
+                "semantic_score": 1, "final_score": 1, "raw_text": 1, "projects": 1,
+            },
+        )
+        docs = await cursor.to_list(length=1000)
+        for c in docs:
+            hay = _candidate_text_blob(c)
+            score = 0.0
+            for k in (fallback_keywords or []):
+                if k in hay: score += 10
+            if "developer" in hay or "engineer" in hay: score += 5
+            if c.get("semantic_score"): score += float(c["semantic_score"])
+            if c.get("final_score"): score += float(c["final_score"])
+            if score > 0:
+                fallback.append(c)
+        filtered_preview = fallback
+
+    # 👇 If user selected filters → strictly apply them (in order)
+    if selected_filters:
+        filtered_preview = _apply_selected_filters_in_order(
+            filtered_preview, selected_filters, normalized_prompt or prompt, keywords or []
         )
 
     # Summarize matches for UI messaging
     match_meta = _summarize_matches(filtered_preview)
-    no_results = match_meta["total"] == 0  # 👈 add this flag
+    no_results = match_meta["total"] == 0
 
     # Step 3: Log analytics (scoped)
     await db.chat_queries.insert_one(
         {
             "prompt": prompt,
             "parsed": parsed,
+            "selectedFilters": selected_filters,
             "response_preview_count": len(filtered_preview),
             "timestamp": datetime.now(timezone.utc),
             "ownerUserId": owner_id,
@@ -423,6 +563,7 @@ async def handle_chatbot_query(
             {
                 "prompt": prompt,
                 "parsed": parsed,
+                "selectedFilters": selected_filters,
                 "timestamp_raw": timestamp_raw,
                 "timestamp_display": timestamp_display,
                 "totalMatches": len(filtered_preview),
@@ -444,13 +585,11 @@ async def handle_chatbot_query(
         "normalized_prompt": normalized_prompt,  # extra context for UI
         "keywords": keywords,                    # extra context for UI
         "matchMeta": match_meta,                 # counts for banners
-        "no_results": no_results,                # 👈 NEW flag for UI (hide analyzing + 3s toast)
+        "no_results": no_results,
         "no_cvs_uploaded": False,
-        # forward redirect hint from response_builder if present
         "redirect": response.get("redirect"),
-        # convenience for candidate filter header
         "ui": {
-            "primaryMessage": reply_text,        # "Showing N results for your query."
-            "query": prompt,                     # original query text (to print under header)
+            "primaryMessage": reply_text,
+            "query": prompt,
         },
     }

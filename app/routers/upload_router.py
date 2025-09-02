@@ -1,26 +1,43 @@
+# app/routers/upload_router.py
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+import uuid
+import os
+import re
+
+from app.routers.auth_router import get_current_user  # ✅ auth required
 from app.logic.resume_parser import parse_resume_file
 from app.utils.mongo import db, compute_cv_hash, check_duplicate_cv_hash
+
+# Classic ML classifier assets (best-effort, fully optional)
 from app.logic.ml_interface import (
     clean_text,
     model,
     vectorizer,
     label_encoder,
-    add_to_index,  # ✅ ANN: add newly inserted resume to owner-scoped in-memory index
+    add_to_index,  # ✅ ANN: owner-scoped in-memory index (best-effort)
 )
-from app.routers.auth_router import get_current_user  # ✅ auth required
-import uuid
-import os
-import re  # ✅ needed for experience normalization
 
-# ✅ NEW imports for embedding persistence & timestamps
-from app.logic.ml_interface import embedding_model, INDEX_TRUNCATE_CHARS, MODEL_ID
-from datetime import datetime, timezone
+# Embeddings / ANN config (best-effort)
+from app.logic.ml_interface import (
+    embedding_model,      # should provide .encode(text) -> vector
+    INDEX_TRUNCATE_CHARS, # int, for index text truncation
+    MODEL_ID,             # embedding model/version identifier
+)
+
+# Normalizers for exact-match fields
+from app.logic.normalize import (
+    normalize_role,
+    normalize_tokens,
+    to_years_of_experience,
+)
+
+# numpy is optional; guard usage
 try:
     import numpy as np
-except Exception:
-    np = None  # degrade gracefully if numpy unavailable
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
 
 router = APIRouter()
 
@@ -35,8 +52,13 @@ PROGRESS_HOLD_MS = 2000       # progress bar stays ~2s after 100%
 @router.post("/upload-resumes")
 async def upload_resumes(
     files: List[UploadFile] = File(...),
-    current_user = Depends(get_current_user),  # ✅ enforce login/ownership
+    current_user=Depends(get_current_user),
 ):
+    """
+    Upload, parse, de-duplicate, normalize, persist (with embeddings when available),
+    and warm the owner-scoped ANN index. Operates best-effort for embeddings—never fails
+    the upload because of the ANN/embedding step.
+    """
     parsed_resumes: List[Dict[str, Any]] = []
 
     received_count = len(files)
@@ -84,8 +106,8 @@ async def upload_resumes(
             skipped_files["parse_error"].append(filename)
             continue
 
-        raw_text = resume_data.get("raw_text", "") or ""
-        if not raw_text.strip():
+        raw_text = (resume_data.get("raw_text") or "").strip()
+        if not raw_text:
             skipped_empty += 1
             skipped_files["empty"].append(filename)
             continue
@@ -96,7 +118,7 @@ async def upload_resumes(
             skipped_files["duplicates"].append(filename)
             continue
 
-        # --- ML prediction (kept backward-compatible; guard if assets missing) ---
+        # --- Classic ML prediction (kept backward-compatible; guard if assets missing) ---
         cleaned = clean_text(raw_text)
         predicted_label: str = "Unknown"
         confidence_pct: float = 0.0
@@ -104,29 +126,25 @@ async def upload_resumes(
             if vectorizer is not None and model is not None and label_encoder is not None:
                 features = vectorizer.transform([cleaned])
                 prediction = model.predict(features)
-                confidence = getattr(model, "predict_proba", lambda x: [[0.0]])(features)[0]
-                if isinstance(confidence, (list, tuple)) and len(confidence) > 0:
-                    confidence = float(max(confidence))
-                else:
-                    confidence = 0.0
+                # predict_proba may not exist; fallback safe
+                _proba = getattr(model, "predict_proba", lambda x: [[0.0]])(features)[0]
+                conf_val: float = float(max(_proba)) if isinstance(_proba, (list, tuple)) and _proba else 0.0
                 predicted_label = label_encoder.inverse_transform(prediction)[0]
-                confidence_pct = round(float(confidence) * 100.0, 2)
+                confidence_pct = round(conf_val * 100.0, 2)
         except Exception:
-            # If classic ML assets fail, fallback to Unknown gracefully
             predicted_label = "Unknown"
             confidence_pct = 0.0
 
-        # ✅ Required metadata
-        resume_data["_id"] = str(uuid.uuid4())
-        resume_data["content_hash"] = compute_cv_hash(raw_text)
-        resume_data["predicted_role"] = predicted_label
-        resume_data["category"] = predicted_label
-        resume_data["confidence"] = confidence_pct
-        resume_data["filename"] = filename
-        resume_data["experience"] = resume_data.get("experience", 0)
+        # ---------- Construct the doc to insert ----------
+        # Stable ID (avoids an extra DB roundtrip)
+        _id = str(uuid.uuid4())
 
-        # 🔧 Canonical numeric experience fields for DB filtering & scoring
-        def _to_float_years_upload(v):
+        # Ownership & de-dup hash
+        content_hash = compute_cv_hash(raw_text)
+        owner_id_str = str(current_user.id)
+
+        # Experience canon (float years)
+        def _to_float_years_upload(v: Any) -> float:
             try:
                 if isinstance(v, (int, float)):
                     return float(v)
@@ -143,20 +161,75 @@ async def upload_resumes(
             resume_data.get("yoe"),
             resume_data.get("experience"),
         ]
-
         numeric_years = 0.0
         for c in exp_candidates:
             if c is not None and str(c).strip() != "":
                 numeric_years = _to_float_years_upload(c)
                 break
 
-        # Set all aliases so DB-side $gte works reliably
+        # Normalized exact-match fields (idempotent; resume_parser already sets these—use setdefault)
+        role_source = resume_data.get("currentRole") or resume_data.get("title") or resume_data.get("job_title")
+        resume_data.setdefault("role_norm", normalize_role(role_source))
+        resume_data.setdefault("skills_norm", normalize_tokens(resume_data.get("skills")))
+        # projects_norm: from project names + tech tags if present
+        if "projects_norm" not in resume_data:
+            proj_items: List[str] = []
+            _projects = (resume_data.get("resume") or {}).get("projects") or resume_data.get("projects") or []
+            if isinstance(_projects, list):
+                for p in _projects:
+                    if isinstance(p, dict):
+                        if p.get("name"):
+                            proj_items.append(str(p["name"]))
+                        if isinstance(p.get("tech"), list):
+                            proj_items.extend([str(t) for t in p["tech"] if isinstance(t, str)])
+                    elif isinstance(p, str):
+                        proj_items.append(p)
+            resume_data["projects_norm"] = normalize_tokens(proj_items)
+        resume_data.setdefault("yoe_num", to_years_of_experience(numeric_years))
+
+        # Canonical numeric aliases (kept for backward-compat; UI/pages may read any of these)
         resume_data["total_experience_years"] = numeric_years
         resume_data["years_of_experience"]    = numeric_years
         resume_data["experience_years"]       = numeric_years
         resume_data["yoe"]                    = numeric_years
 
-        # Fallbacks & profile fields
+        # Required metadata / fallbacks
+        resume_data["_id"] = _id
+        resume_data["content_hash"] = content_hash
+        resume_data["ownerUserId"] = owner_id_str
+
+        # ---------- Canonicalize & map role across synonyms ----------
+        # Prefer parsed role; if missing/placeholder, fallback to ML-predicted label.
+        def _bad_role(s: Any) -> bool:
+            t = (str(s or "").strip().lower())
+            return (not t) or t in {"n/a", "na", "none", "-", "unknown", "not specified"}
+
+        parser_role = (resume_data.get("currentRole") or resume_data.get("title") or resume_data.get("job_title") or "").strip()
+        ml_role = (predicted_label or "").strip()
+
+        canonical_role = parser_role if not _bad_role(parser_role) else (ml_role if not _bad_role(ml_role) else "")
+
+        if canonical_role:
+            resume_data["predicted_role"] = canonical_role
+            resume_data["category"] = canonical_role
+            resume_data["currentRole"] = canonical_role
+            # refresh normalized role to align with canonical
+            try:
+                resume_data["role_norm"] = normalize_role(canonical_role)
+            except Exception:
+                pass
+        else:
+            # keep fields searchable/non-null
+            resume_data["predicted_role"] = "N/A"
+            resume_data["category"] = "N/A"
+            resume_data["currentRole"] = resume_data.get("currentRole") or "N/A"
+
+        # Still keep ML outputs (read-only, for analytics/debug/UI)
+        resume_data["ml_predicted_role"] = ml_role or "Unknown"
+        resume_data["ml_confidence"] = confidence_pct
+
+        resume_data["filename"] = filename
+        resume_data["experience"] = resume_data.get("experience", numeric_years)
         resume_data["name"] = (resume_data.get("name") or "").strip() or "No Name"
         resume_data["location"] = resume_data.get("location") or "N/A"
         resume_data["raw_text"] = raw_text
@@ -164,100 +237,137 @@ async def upload_resumes(
         resume_data["phone"] = resume_data.get("phone") or None
         resume_data["skills"] = resume_data.get("skills") or []
         resume_data["resume_url"] = resume_data.get("resume_url", "")
-        resume_data["currentRole"] = resume_data.get("currentRole") or "N/A"
         resume_data["company"] = resume_data.get("company") or "N/A"
 
-        # Nested resume section
-        resume_data["resume"] = resume_data.get("resume", {})
-        resume = resume_data["resume"]
-        resume["summary"] = resume.get("summary", "")
-        resume["education"] = resume.get("education", [])
-        resume["workHistory"] = resume.get("workHistory", [])
-        resume["projects"] = resume.get("projects", [])
-        resume["filename"] = filename
-        resume["url"] = resume_data.get("resume_url", "")
+        # Nested resume section (ensure presence)
+        resume = resume_data.get("resume") or {}
+        resume_data["resume"] = {
+            "summary": resume.get("summary", ""),
+            "education": resume.get("education", []),
+            "workHistory": resume.get("workHistory", []),
+            "projects": resume.get("projects", []),
+            "filename": filename,
+            "url": resume_data.get("resume_url", ""),
+        }
 
         # Clean old transient fields if present
         for key in ["matchedSkills", "missingSkills", "score", "testScore", "rank", "filter_skills"]:
             resume_data.pop(key, None)
 
-        # ✅ Ownership
-        resume_data["ownerUserId"] = str(current_user.id)
+        # ---------- Build/use index blob (used for embedding + ANN warm) ----------
+        try:
+            # Prefer parser-provided index_blob if present
+            index_blob = (resume_data.get("index_blob") or "").strip()
+            if not index_blob:
+                projects_blob = ""
+                _p = resume_data["resume"]["projects"]
+                if isinstance(_p, list):
+                    parts: List[str] = []
+                    for p in _p[:6]:
+                        if isinstance(p, str):
+                            parts.append(p)
+                        elif isinstance(p, dict):
+                            parts.append(str(p.get("name") or ""))
+                            parts.append(str(p.get("description") or ""))
+                    projects_blob = " ".join([x for x in parts if x])
+                index_blob_raw = " ".join([
+                    str(resume_data.get("predicted_role") or ""),
+                    str(resume_data.get("name") or ""),
+                    str(resume_data.get("location") or ""),
+                    " ".join([s for s in (resume_data.get("skills") or []) if isinstance(s, str)]),
+                    projects_blob,
+                    str(resume_data.get("experience") or ""),
+                    raw_text,
+                ]).strip()
+                index_blob = clean_text(index_blob_raw)[:int(INDEX_TRUNCATE_CHARS)]
+        except Exception:
+            index_blob = ""
+        resume_data["index_blob"] = index_blob or None
 
-        # ✅ Insert into DB
+        # ---------- Embedding lifecycle fields (observable) ----------
+        # If parser already provided an embedding, respect it and mark ready.
+        existing_vec = resume_data.get("index_embedding")
+        vec_to_store: Optional[List[float]] = None
+        dim: Optional[int] = None
+
+        if isinstance(existing_vec, list) and existing_vec:
+            try:
+                dim = len(existing_vec)
+                resume_data["embedding_status"] = "ready"
+                resume_data["embedding_model_version"] = str(MODEL_ID)
+                resume_data["embedding_dim"] = dim
+                resume_data["index_embedding"] = existing_vec
+                resume_data["index_embedding_updated_at"] = datetime.now(timezone.utc)
+                resume_data["ann_ready"] = True
+                vec_to_store = existing_vec  # for ANN warm
+            except Exception:
+                existing_vec = None  # fall through to compute anew
+
+        if vec_to_store is None:
+            resume_data["embedding_status"] = "pending"
+            resume_data["embedding_model_version"] = str(MODEL_ID)
+            resume_data["embedding_dim"] = None
+            resume_data["ann_ready"] = False
+
+            # ---------- Compute embedding (best-effort, synchronous) ----------
+            try:
+                if embedding_model and index_blob:
+                    vec = embedding_model.encode(index_blob, convert_to_tensor=False)
+                    if np is not None:
+                        vec_np = np.asarray(vec, dtype=np.float32)
+                        nrm = float(np.linalg.norm(vec_np) + 1e-12)
+                        if nrm > 0.0:
+                            vec_np = (vec_np / nrm).astype(np.float32)
+                        vec_to_store = vec_np.tolist()
+                        dim = int(vec_np.shape[0])
+                    else:
+                        # numpy unavailable: store raw list, attempt simple L2 norm
+                        lst = vec.tolist() if hasattr(vec, "tolist") else list(vec)  # type: ignore
+                        try:
+                            denom = (sum(x * x for x in lst) ** 0.5) or 1.0
+                            lst = [float(x) / float(denom) for x in lst]
+                        except Exception:
+                            lst = [float(x) for x in lst]
+                        vec_to_store = lst
+                        dim = len(lst)
+                    # Mark ready
+                    resume_data["embedding_status"] = "ready"
+                    resume_data["embedding_dim"] = dim
+                    resume_data["index_embedding"] = vec_to_store
+                    resume_data["index_embedding_updated_at"] = datetime.now(timezone.utc)
+                    resume_data["ann_ready"] = True
+            except Exception:
+                # Embedding failed; keep pending/failed state
+                resume_data["embedding_status"] = "failed"
+                resume_data["ann_ready"] = False
+
+        # ---------- Persist once (single insert) ----------
         await db.parsed_resumes.insert_one(resume_data)
         inserted_count += 1
 
-        # ✅ ANN: Update in-memory owner-scoped vector index immediately (best-effort, non-fatal)
+        # ---------- Warm in-memory ANN index (best-effort)
+        # Prefer passing the precomputed embedding if the function supports it;
+        # otherwise fall back to text_blob path.
         try:
-            # Compact blob similar to backend indexer (clean/trim happens inside add_to_index)
-            projects_blob = ""
-            if isinstance(resume.get("projects"), list):
-                parts = []
-                for p in resume["projects"][:6]:
-                    if isinstance(p, str):
-                        parts.append(p)
-                    elif isinstance(p, dict):
-                        parts.append(str(p.get("name") or ""))
-                        parts.append(str(p.get("description") or ""))
-                projects_blob = " ".join([x for x in parts if x])
-            index_blob = " ".join([
-                str(resume_data.get("predicted_role") or ""),
-                str(resume_data.get("name") or ""),
-                str(resume_data.get("location") or ""),
-                " ".join([s for s in (resume_data.get("skills") or []) if isinstance(s, str)]),
-                projects_blob,
-                str(resume_data.get("experience") or ""),
-                raw_text,
-            ]).strip()
-            add_to_index(
-                owner_user_id=str(current_user.id),
-                resume_id=resume_data["_id"],
-                text_blob=index_blob,
-            )
+            try:
+                add_to_index(
+                    owner_user_id=owner_id_str,
+                    resume_id=_id,
+                    text_blob=index_blob or "",
+                    embedding=vec_to_store,   # type: ignore[arg-type]
+                )
+            except TypeError:
+                # older signature without 'embedding'
+                add_to_index(
+                    owner_user_id=owner_id_str,
+                    resume_id=_id,
+                    text_blob=index_blob or "",
+                )
         except Exception:
-            # Index update is best-effort; ignore failures
+            # Never fail the request due to ANN warm-up
             pass
 
-        # ✅ NEW: Persist index embedding + index_blob for fast ANN (best-effort, non-fatal)
-        try:
-            # Clean + truncate for encoder, consistent with ANN builder
-            blob_for_emb = clean_text(index_blob)[:int(INDEX_TRUNCATE_CHARS)]
-            vec = embedding_model.encode(blob_for_emb, convert_to_tensor=False)
-
-            # Normalize & ensure float32 if numpy is available
-            if np is not None:
-                try:
-                    vec_np = np.asarray(vec, dtype=np.float32)
-                    nrm = np.linalg.norm(vec_np) + 1e-12
-                    vec_np = (vec_np / nrm).astype(np.float32)
-                    vec_to_store = vec_np.tolist()
-                    dim = int(vec_np.shape[0])
-                except Exception:
-                    # fallback: store raw list
-                    vec_to_store = [float(x) for x in (vec.tolist() if hasattr(vec, "tolist") else vec)]
-                    dim = len(vec_to_store)
-            else:
-                # numpy not available: store as-is
-                vec_to_store = [float(x) for x in (vec.tolist() if hasattr(vec, "tolist") else vec)]
-                dim = len(vec_to_store)
-
-            await db.parsed_resumes.update_one(
-                {"_id": resume_data["_id"]},
-                {"$set": {
-                    "index_blob": blob_for_emb,
-                    "index_embedding": vec_to_store,
-                    "index_embedding_dim": dim,
-                    "index_embedding_model": str(MODEL_ID),
-                    "ann_ready": True,
-                    "index_embedding_updated_at": datetime.now(timezone.utc),
-                }}
-            )
-        except Exception:
-            # Best-effort only; do not fail the upload on embedding issues
-            pass
-
-        # Safe preview for UI
+        # ---------- Safe preview for UI ----------
         parsed_resumes.append({
             "_id": resume_data["_id"],
             "name": resume_data["name"],
@@ -265,7 +375,7 @@ async def upload_resumes(
             "category": resume_data["category"],
             "experience": resume_data["experience"],
             "location": resume_data["location"],
-            "confidence": resume_data["confidence"],
+            "confidence": resume_data.get("ml_confidence", 0.0),
             "email": resume_data["email"],
             "phone": resume_data["phone"],
             "skills": resume_data["skills"],

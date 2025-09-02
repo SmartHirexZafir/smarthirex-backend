@@ -1,4 +1,5 @@
-import joblib
+# app/logic/ml_interface.py
+
 import os
 import re
 import json
@@ -10,19 +11,14 @@ from app.utils.mongo import db
 from sentence_transformers import SentenceTransformer, util
 from app.logic.normalize import normalize_prompt
 
-# NEW: small extras for ANN
-import math
 from bson import ObjectId
 try:
     import numpy as np
 except Exception:
     np = None  # degrade gracefully if numpy unavailable
 
-# NEW: for near-literal paragraph matching
 from difflib import SequenceMatcher
-# NEW: timestamps for embedding persistence
 from datetime import datetime, timezone
-
 
 # -----------------------------
 # Load classic ML assets (LAZY)
@@ -91,13 +87,13 @@ extended_roles = [
     # Frontend / Web / Design
     "Front-End Developer", "Frontend Developer", "Web Developer", "Web Designer",
     "UI Designer", "UX Designer", "UI/UX Designer", "Product Designer",
-    "Graphic Designer", "Visual Designer","Python Developer"
+    "Graphic Designer", "Visual Designer", "Python Developer",
 ]
 
 # 🔹 ADDITIVE: Extend with legal roles (won't break existing behavior)
 extended_roles += [
     "Advocate", "Lawyer", "Attorney", "Legal Counsel", "Corporate Counsel",
-    "Associate Lawyer", "Litigation Lawyer"
+    "Associate Lawyer", "Litigation Lawyer",
 ]
 
 
@@ -153,24 +149,6 @@ def clean_text(text: str) -> str:
 # Prompt parsing utilities (strict filters & requirements)
 # -------------------------------------------------------
 _EXP_NUM = r"(\d+(?:\.\d+)?)"
-_EXPERIENCE_PATTERNS = [
-    # between / range
-    rf"(?:between|from)\s+{_EXP_NUM}\s*(?:to|and|-|–|—)\s*{_EXP_NUM}\s*(?:years|yrs)\b",
-    rf"(?:range|between)\s+{_EXP_NUM}\s*[-–—]\s*{_EXP_NUM}\s*(?:years|yrs)\b",
-    rf"(?:min(?:imum)?)[^\d]*{_EXP_NUM}.*?(?:max(?:imum)?)[^\d]*{_EXP_NUM}\s*(?:years|yrs)?\b",
-    # comparative
-    rf"(?:less than|under|below)\s+{_EXP_NUM}\s*(?:years|yrs)\b",
-    rf"(?:greater than|more than|over)\s+{_EXP_NUM}\s*(?:years|yrs)\b",
-    rf"(?:at least|min(?:imum)?)\s+{_EXP_NUM}\s*(?:years|yrs)\b",
-    # symbols
-    rf">=\s*{_EXP_NUM}\s*(?:years|yrs)?\b",
-    rf"<=\s*{_EXP_NUM}\s*(?:years|yrs)?\b",
-    rf">\s*{_EXP_NUM}\s*(?:years|yrs)?\b",
-    rf"<\s*{_EXP_NUM}\s*(?:years|yrs)?\b",
-    # simple "3+ years", "7 years"
-    rf"{_EXP_NUM}\s*\+\s*(?:years|yrs)\b",
-    rf"{_EXP_NUM}\s*(?:years|yrs)\b",
-]
 
 _SKILL_SECTION_CLAUSES = [
     r"(?:must include|must have|required(?: skills)?|should include|need to include|need to have)"
@@ -180,7 +158,7 @@ _LOCATION_PATTERN = r"(?:\bin|from|based in)\s+([a-zA-Z][a-zA-Z\s]{1,50})\b"
 
 
 # =================================================================
-# NEW: Config loader for weights/thresholds (search_weights.json)
+# Config loader for weights/thresholds (search_weights.json)
 # =================================================================
 SEARCH_WEIGHTS_PATH = os.path.join("app", "resources", "search_weights.json")
 
@@ -319,7 +297,7 @@ ROLE_SIM_RELATED = float(_SEARCH_CFG["boosts"]["role_similarity_related"])
 BASELINE_SKILL_KEYWORDS = list(_SEARCH_CFG.get("baseline_skill_keywords", []))
 
 # ============================================================
-# NEW: Simple owner-scoped ANN/Vector index (lazy, in-memory)
+# Simple owner-scoped ANN/Vector index (lazy, in-memory)
 # ============================================================
 
 # Config via config/env (safe)
@@ -333,12 +311,6 @@ _owner_index_cache: Dict[str, Dict[str, Any]] = {}  # key "__all__" used when ow
 
 def _owner_key(owner_user_id: Optional[str]) -> str:
     return owner_user_id or "__all__"
-
-def _l2_normalize(mat: "np.ndarray") -> "np.ndarray":
-    if np is None:
-        return mat
-    norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12
-    return mat / norms
 
 def _to_object_id(maybe_id: Any) -> Optional[ObjectId]:
     try:
@@ -409,6 +381,8 @@ async def _ensure_owner_index(owner_user_id: Optional[str]) -> None:
         "raw_text": 1,
         "predicted_role": 1,
         "category": 1,
+        "ml_predicted_role": 1,   # ✅ include for potential role fallbacks
+        "currentRole": 1,         # ✅ alias for role
         "name": 1,
         "location": 1,
         "skills": 1,
@@ -515,10 +489,11 @@ def _index_search_ids(owner_user_id: Optional[str], q_vec_np: "np.ndarray", topk
     except Exception:
         return []
 
-def add_to_index(owner_user_id: Optional[str], resume_id: Any, text_blob: str) -> None:
+def add_to_index(owner_user_id: Optional[str], resume_id: Any, text_blob: str, embedding: Optional[List[float]] = None) -> None:
     """
     Optional helper for ingestion path: add/update one resume into the in-memory index.
     Safe no-op if ANN disabled or numpy missing.
+    - If `embedding` is provided (pre-normalized list), we use it directly.
     """
     if not USE_ANN_INDEX or np is None:
         return
@@ -528,14 +503,18 @@ def add_to_index(owner_user_id: Optional[str], resume_id: Any, text_blob: str) -
         # index not built yet; ignore (it will be built lazily on first query)
         return
     try:
-        vec = embedding_model.encode(clean_text(text_blob)[:INDEX_TRUNCATE_CHARS],
-                                     convert_to_tensor=False)
-        if isinstance(vec, list):
-            vec = np.array(vec, dtype=np.float32)
-        vec = vec.astype(np.float32)
-        # normalize
-        n = np.linalg.norm(vec) + 1e-12
-        vec = vec / n
+        if embedding is not None:
+            vec = np.asarray(embedding, dtype=np.float32)
+            n = np.linalg.norm(vec) + 1e-12
+            vec = vec / n
+        else:
+            vec = embedding_model.encode(clean_text(text_blob)[:INDEX_TRUNCATE_CHARS],
+                                         convert_to_tensor=False)
+            if isinstance(vec, list):
+                vec = np.array(vec, dtype=np.float32)
+            vec = vec.astype(np.float32)
+            n = np.linalg.norm(vec) + 1e-12
+            vec = vec / n
         # update/append
         rid = str(resume_id)
         if rid in state["ids"]:
@@ -548,13 +527,8 @@ def add_to_index(owner_user_id: Optional[str], resume_id: Any, text_blob: str) -
         # silent no-op on failure
         pass
 
-# ============================================================
-# END: ANN / Vector index helpers
-# ============================================================
-
-
 # ---------------------------------------------------------
-# Helpers for strong paragraph matching (additive, non-breaking)
+# Helpers for strong paragraph / literal matching
 # ---------------------------------------------------------
 def _normalize_blob_for_literal(s: str) -> str:
     s = (s or "").lower()
@@ -563,8 +537,49 @@ def _normalize_blob_for_literal(s: str) -> str:
 
 def _looks_like_paragraph(q: str) -> bool:
     q = (q or "").strip()
-    # Long text OR many tokens OR contains quotes → treat as paragraph
     return (len(q) >= 60) or ('"' in q) or ("'" in q) or (len(q.split()) >= 12)
+
+def _any_phrase_in_blob(blob: str, phrases: List[str]) -> bool:
+    if not phrases:
+        return False
+    if not blob:
+        return False
+    b = _normalize_blob_for_literal(blob)
+    for p in phrases:
+        pp = _normalize_blob_for_literal(p)
+        if pp and pp in b:
+            return True
+    return False
+
+
+# ---------------------------------------------------------
+# Role inference helper (no hardcoded fallbacks)
+# ---------------------------------------------------------
+def best_role_by_similarity(text: str, roles: Optional[List[str]] = None, threshold: float = 0.45) -> Tuple[str, float]:
+    """
+    Infer the closest role from a list using sentence embeddings.
+    - Returns ("", 0.0) if best similarity < threshold (no forced fallback).
+    - `roles` defaults to get_full_roles_for_suggestions().
+    """
+    query = clean_text(text or "")
+    if not query:
+        return "", 0.0
+    roles = roles or get_full_roles_for_suggestions()
+    try:
+        q_vec = embedding_model.encode(query, convert_to_tensor=True)
+        best_role: str = ""
+        best_sim: float = -1.0
+        for r in roles:
+            r_vec = embedding_model.encode(r, convert_to_tensor=True)
+            sim = util.cos_sim(q_vec, r_vec)[0][0].item()
+            if sim > best_sim:
+                best_sim = sim
+                best_role = r
+        if best_sim < threshold:
+            return "", 0.0
+        return best_role, float(best_sim)
+    except Exception:
+        return "", 0.0
 
 
 # ---------------------------------------------------------
@@ -577,21 +592,39 @@ async def get_semantic_matches(
     owner_user_id: Optional[str] = None,
     normalized_prompt: Optional[str] = None,
     keywords: Optional[List[str]] = None,
+    options: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Returns a ranked list of candidate previews with semantic and shaped scores.
-    Now includes strict multi-criteria filtering (experience, skills-must-include,
-    projects, location, role) with graceful fallback to close matches if none
-    satisfy all constraints. Each item includes flags: is_strict_match, match_type,
-    failed_filters (for UI messaging).
+    Returns ranked candidates with semantic + rule scores.
 
-    NEW: Uses a lazy owner-scoped ANN/Vector index to pull a small candidate pool
-    (top-K) before running the existing filtering pipeline. If ANN is not
-    available, behavior gracefully falls back to the previous full-scan approach.
+    NEW (dropdown-ready):
+      - Pass `options` to force structured filters instead of parsing from text.
+        Supported keys (all optional):
+          {
+            "selected": ["role","experience","skills","projects","location","education","phrases"],  # which filters to apply
+            "role": "python developer",
+            "min_years": 3,
+            "max_years": 8,
+            "skills": ["python","django"],
+            "projects_required": true,
+            "location": "bangalore",
+            "schools": ["iisc", "iit"],
+            "degrees": ["btech","mtech","ms"],
+            "must_phrases": ["microservices", "rest api"],
+            "exclude_phrases": ["internship only"],
+            "exact_match_only": false,        # if true -> return only resumes containing exact phrase(s)
+            "exact_terms": ["python developer", "3 years"],  # optional list; if missing uses the prompt
+            "prefilter_role_regex": true      # optional: db-side prefilter on predicted_role/category with case-insensitive regex
+          }
 
-    NEW (strong filter): For paragraph-like queries, perform literal or near-literal
-    matching against resume raw_text and boost those hits so exact passages are surfaced.
+    - Backward compatible if `options` is omitted.
     """
+    options = options or {}
+    selected_fields: Optional[List[str]] = options.get("selected")
+    def _selected(field: str) -> bool:
+        # If frontend specified the subset, only apply those; else apply all.
+        return (not selected_fields) or (field in selected_fields)
+
     # normalization inputs
     if not normalized_prompt or not isinstance(keywords, list):
         norm = normalize_prompt(prompt)
@@ -601,9 +634,10 @@ async def get_semantic_matches(
     else:
         is_prompt_role_like = len((normalized_prompt or prompt).split()) <= 4
 
-    # ❗ Use RAW prompt for parsing filters (digits/symbols preserved)
+    # RAW prompt for parsing filters
     raw_prompt = (normalized_prompt or prompt)
     parsed_text = str(raw_prompt).lower()
+
     # Clean only for embeddings
     cleaned_for_sem = clean_text(raw_prompt)
     prompt_embedding_tensor = embedding_model.encode(cleaned_for_sem, convert_to_tensor=True)
@@ -613,39 +647,72 @@ async def get_semantic_matches(
     query_lit = _normalize_blob_for_literal(query_raw_for_literal)
     is_paragraph_query = _looks_like_paragraph(query_raw_for_literal)
 
-    # Also keep a numpy vector for ANN (if possible)
+    # ANN query vector for owner-scoped recall
     if np is not None:
         try:
             q_vec_np = embedding_model.encode(cleaned_for_sem, convert_to_tensor=False)
             if isinstance(q_vec_np, list):
                 q_vec_np = np.array(q_vec_np, dtype=np.float32)
-            # normalize for cosine via dot
-            nrm = np.linalg.norm(q_vec_np) + 1e-12
-            q_vec_np = (q_vec_np / nrm).astype(np.float32)
+            q_vec_np = (q_vec_np / (np.linalg.norm(q_vec_np) + 1e-12)).astype(np.float32)
         except Exception:
             q_vec_np = None
     else:
         q_vec_np = None
 
     # -----------------------------
-    # Parse strict filter directives (on RAW)
+    # Parse filters from prompt
     # -----------------------------
-    min_years, max_years, strict_ge, strict_le = _parse_experience_filters(parsed_text)
-    must_include_skills = _parse_must_include_skills(parsed_text)
-    projects_required = _parse_projects_required(parsed_text)
-    location_filter = _parse_location(parsed_text)
-    requested_role = _parse_role(parsed_text)
+    min_years, max_years, strict_ge, strict_le = (None, None, None, None)
+    must_include_skills: List[str] = []
+    projects_required: bool = False
+    location_filter: Optional[str] = None
+    requested_role: Optional[str] = None
+    schools_required: List[str] = []
+    degrees_required: List[str] = []
+    must_have_phrases: List[str] = []
+    exclude_phrases: List[str] = []
 
-    # NEW: education & phrases
-    schools_required, degrees_required = _parse_education_requirements(raw_prompt)
-    must_have_phrases, exclude_phrases = _parse_phrase_requirements(raw_prompt)
+    # Parse everything, then override from options if provided
+    # (parsing is cheap and keeps backward compatibility)
+    _p_min, _p_max, _p_ge, _p_le = _parse_experience_filters(parsed_text)
+    _p_skills = _parse_must_include_skills(parsed_text)
+    _p_proj = _parse_projects_required(parsed_text)
+    _p_loc = _parse_location(parsed_text)
+    _p_role = _parse_role(parsed_text)
+    _p_schools, _p_degrees = _parse_education_requirements(raw_prompt)
+    _p_must_phr, _p_excl_phr = _parse_phrase_requirements(raw_prompt)
 
-    # helpful: do we have any strict filters?
-    has_strict_filters = bool(
-        requested_role or must_include_skills or projects_required or location_filter or
-        schools_required or degrees_required or must_have_phrases or exclude_phrases or
-        (min_years is not None or max_years is not None)
-    )
+    # Override with options when provided
+    min_years = options.get("min_years", _p_min)
+    max_years = options.get("max_years", _p_max)
+    strict_ge = True if "min_years" in options else _p_ge
+    strict_le = True if "max_years" in options else _p_le
+
+    must_include_skills = [clean_text(s) for s in (options.get("skills", _p_skills) or [])]
+    projects_required = bool(options.get("projects_required", _p_proj))
+    location_filter = clean_text(options.get("location", _p_loc) or "") or None
+    requested_role = clean_text(options.get("role", _p_role) or "") or None
+    schools_required = [s.lower() for s in (options.get("schools", _p_schools) or [])]
+    degrees_required = [s.lower() for s in (options.get("degrees", _p_degrees) or [])]
+    must_have_phrases = options.get("must_phrases", _p_must_phr) or []
+    exclude_phrases = options.get("exclude_phrases", _p_excl_phr) or []
+
+    exact_match_only: bool = bool(options.get("exact_match_only", False))
+    exact_terms: List[str] = options.get("exact_terms") or []
+    if exact_match_only and not exact_terms:
+        # Use the prompt as the exact phrase when not provided
+        exact_terms = [prompt]
+
+    # helpful: do we have any strict filters (respecting dropdown selection)
+    has_strict_filters = any([
+        _selected("role") and bool(requested_role),
+        _selected("skills") and bool(must_include_skills),
+        _selected("projects") and bool(projects_required),
+        _selected("location") and bool(location_filter),
+        _selected("education") and (bool(schools_required) or bool(degrees_required)),
+        _selected("phrases") and (bool(must_have_phrases) or bool(exclude_phrases)),
+        _selected("experience") and (min_years is not None or max_years is not None),
+    ])
 
     # quick baseline skills keywords (still used for scoring bonuses)
     baseline_skill_keywords = BASELINE_SKILL_KEYWORDS or [
@@ -660,36 +727,73 @@ async def get_semantic_matches(
     ))
 
     # =====================================================
-    # NEW: ANN candidate recall (owner-scoped, lazy index)
+    # ANN candidate recall (owner-scoped, lazy index)
     # =====================================================
     ids_restrict: Optional[List[str]] = None
-    if USE_ANN_INDEX and q_vec_np is not None and np is not None:
-        # build index first time for this owner (no-op if exists)
+    if USE_ANN_INDEX and q_vec_np is not None and np is not None and not exact_match_only:
         await _ensure_owner_index(owner_user_id)
         try:
             ids_restrict = _index_search_ids(owner_user_id, q_vec_np, ANN_TOPK)
-            # if empty list, we simply don't restrict later (full fallback)
             if ids_restrict is not None and len(ids_restrict) == 0:
                 ids_restrict = None
         except Exception:
             ids_restrict = None
 
-    # scope query to owner if provided; restrict to ANN candidate IDs when available
-    query: Dict[str, Any] = {"ownerUserId": owner_user_id} if owner_user_id else {}
-    if ids_restrict:
-        # Convert to ObjectIds where possible; also keep string IDs for robustness
-        obj_ids = [oid for oid in ([_to_object_id(i) for i in ids_restrict]) if oid is not None]
-        query["_id"] = {"$in": obj_ids or ids_restrict}
+    # -----------------------------
+    # Build Mongo query (prefilters)
+    # -----------------------------
+    query: Dict[str, Any] = {}
+    conditions: List[Dict[str, Any]] = []
 
-    # NEW: prefilter by min_years if present (cheap DB-side pruning)
-    if min_years is not None:
-        query["$or"] = [
-            {"total_experience_years": {"$gte": min_years}},
-            {"years_of_experience": {"$gte": min_years}},
-            {"experience_years": {"$gte": min_years}},
-            {"yoe": {"$gte": min_years}},
-            {"experience": {"$gte": min_years}},
-        ]
+    if owner_user_id:
+        query["ownerUserId"] = owner_user_id
+
+    if ids_restrict:
+        obj_ids = [oid for oid in ([_to_object_id(i) for i in ids_restrict]) if oid is not None]
+        conditions.append({"_id": {"$in": obj_ids or ids_restrict}})
+
+    # DB prefilter by experience if selected
+    if _selected("experience") and (min_years is not None):
+        conditions.append({
+            "$or": [
+                {"total_experience_years": {"$gte": min_years}},
+                {"years_of_experience": {"$gte": min_years}},
+                {"experience_years": {"$gte": min_years}},
+                {"yoe": {"$gte": min_years}},
+                {"experience": {"$gte": min_years}},
+            ]
+        })
+
+    # Optional DB prefilter by role/category when dropdown includes "role"
+    if _selected("role") and requested_role and options.get("prefilter_role_regex", True):
+        try:
+            role_regex = re.escape(requested_role)
+            conditions.append({
+                "$or": [
+                    {"predicted_role": {"$regex": role_regex, "$options": "i"}},
+                    {"category": {"$regex": role_regex, "$options": "i"}},
+                ]
+            })
+        except Exception:
+            pass
+
+    # Optional DB prefilter by location when selected
+    if _selected("location") and location_filter:
+        try:
+            conditions.append({"location": {"$regex": re.escape(location_filter), "$options": "i"}})
+        except Exception:
+            pass
+
+    # Optional DB prefilter by must include skills (exact containment) when selected
+    if _selected("skills") and must_include_skills:
+        # skills are stored as lower-cased strings in most pipelines; normalize requirements
+        conditions.append({"skills": {"$all": [clean_text(s) for s in must_include_skills]}})
+
+    if conditions:
+        if "$and" in query:
+            query["$and"].extend(conditions)
+        else:
+            query["$and"] = conditions
 
     # Minimal projection to reduce network/load
     projection = {
@@ -697,6 +801,8 @@ async def get_semantic_matches(
         "raw_text": 1,
         "predicted_role": 1,
         "category": 1,
+        "ml_predicted_role": 1,   # ✅ include ML role for fallback
+        "currentRole": 1,         # ✅ include alias
         "name": 1,
         "location": 1,
         "email": 1,
@@ -704,6 +810,7 @@ async def get_semantic_matches(
         "projects": 1,
         "resume_url": 1,
         "confidence": 1,
+        "ml_confidence": 1,
         "total_experience_years": 1,
         "years_of_experience": 1,
         "experience_years": 1,
@@ -714,8 +821,11 @@ async def get_semantic_matches(
     cursor = db.parsed_resumes.find(query, projection=projection)
 
     strict_matches: List[Dict[str, Any]] = []
-    close_matches: List[Dict[str, Any]] = []   # relaxed filters if strict empty AND no strict filters set
-    soft_pool: List[Dict[str, Any]] = []       # deep fallback only when no strict filters
+    close_matches: List[Dict[str, Any]] = []
+    soft_pool: List[Dict[str, Any]] = []
+
+    # helper for bad placeholders
+    _BAD = {"n/a", "na", "none", "-", "unknown", "not specified"}
 
     async for cv in cursor:
         cv_id = cv.get("_id")
@@ -723,16 +833,26 @@ async def get_semantic_matches(
         if not raw_text.strip():
             continue
 
-        # Predicted role from prior pipeline (if any)
-        original_predicted_role = (cv.get("predicted_role") or cv.get("category") or "").strip()
-        predicted_role_lc = original_predicted_role.lower().strip()
-        confidence = round(cv.get("confidence", 0), 2)
+        # ✅ robust role selection across mapped fields, ignoring placeholders
+        original_predicted_role = next(
+            (v for v in [cv.get("predicted_role"), cv.get("category"), cv.get("ml_predicted_role"), cv.get("currentRole")]
+             if isinstance(v, str) and v.strip() and v.strip().lower() not in _BAD),
+            ""
+        ).strip()
+        predicted_role_lc = (original_predicted_role or "").lower().strip()
+
+        # Prefer ml_confidence if present; fall back to legacy 'confidence'
+        conf_val = cv.get("ml_confidence", cv.get("confidence", 0))
+        try:
+            confidence = round(float(conf_val or 0), 2)
+        except Exception:
+            confidence = 0.0
 
         cleaned_resume_text = clean_text(raw_text)
         skills = cv.get("skills", []) or []
         skills_text = " ".join(skills).lower()
 
-        # Projects might be list of dicts; make a cheap blob
+        # Projects -> cheap blob
         projects_field = cv.get("projects", [])
         if isinstance(projects_field, list):
             projects_text = " ".join(
@@ -757,25 +877,88 @@ async def get_semantic_matches(
             m = re.search(r"(\d+(?:\.\d+)?)", s)
             return float(m.group(1)) if m else 0.0
         try:
-            experience = _to_float_years(exp_val)  # '5+ years' -> 5.0, '0.2 yrs' -> 0.2
+            experience = _to_float_years(exp_val)
         except Exception:
             experience = 0.0
 
-        # ---- Add: user-friendly experience fields for UI ----
+        # user-friendly experience fields for UI
         experience_rounded = round(experience, 2)
-        if experience > 0 and experience < 1:
+        if 0 < experience < 1:
             experience_display = "< 1 year"
         elif experience >= 1:
             yrs_i = int(round(experience))
             experience_display = f"{yrs_i} year" + ("" if yrs_i == 1 else "s")
         else:
             experience_display = "Not specified"
-        # -----------------------------------------------------
 
         location_text = clean_text(cv.get("location") or "")
 
-        # Compose comparison text for general semantic sim
-        # (Cosmetic: format experience cleanly to avoid "0." artifacts)
+        # ===== EXACT MODE SHORT-CIRCUIT =====
+        if exact_match_only:
+            phrases = exact_terms or [prompt]
+            literal_hit = _any_phrase_in_blob(raw_text, phrases)
+            if not literal_hit:
+                continue  # exact mode: only keep literal hits
+
+            # derive a role score like the existing score_components ("role_match")
+            role_score_exact = 1.0 if (requested_role and clean_text(original_predicted_role) == requested_role) else 0.7
+            role_pred_score_pct = round(max(0.0, min(1.0, role_score_exact)) * 100.0, 2)
+
+            # Build simple item, score 100 for exact
+            item = {
+                "_id": cv_id,
+                "name": (cv.get("name") or "").strip() or "No Name",
+                "predicted_role": original_predicted_role,
+                "category": cv.get("category", original_predicted_role),
+                "ml_predicted_role": cv.get("ml_predicted_role"),  # ✅ surface ML role too
+                "experience": experience,
+                "experience_display": experience_display,
+                "experience_rounded": experience_rounded,
+                "location": location_text or "N/A",
+                "email": cv.get("email", "N/A"),
+                "skills": skills,
+                "skillsTruncated": [s for s in skills[:6] if isinstance(s, str)],
+                "skillsOverflowCount": max(0, len(skills) - min(6, len(skills))),
+                "resume_url": cv.get("resume_url", ""),
+                "semantic_score": 100.0,
+                "confidence": confidence,
+                "ml_confidence": confidence,              # alias for UI
+                "role_prediction_score": role_pred_score_pct,  # ✅ Role Prediction Confidence
+                "score_type": "Exact phrase match",
+                "final_score": 100.0,
+                "score_components": {
+                    "role_match": 1.0 if (requested_role and clean_text(original_predicted_role) == requested_role) else 0.7,
+                    "skills_match": 1.0 if all(clean_text(s) in [clean_text(x) for x in skills] for s in must_include_skills) else 0.6,
+                    "experience_match": 1.0,
+                    "projects_match": 1.0,
+                    "semantic_score": 100.0
+                },
+                "rank": 0,
+                "related_roles": [],
+                "relatedRoles": [],
+                "raw_text": raw_text,
+                "strengths": ["Exact phrase found"],
+                "redFlags": [],
+                "is_strict_match": True,
+                "match_type": "exact",
+                "failed_filters": [],
+                "mustIncludeSkills": must_include_skills,
+                "missingMustSkills": [],
+                "matchedSkills": [s for s in skills if isinstance(s, str) and any(clean_text(s) in clean_text(p) for p in phrases)],
+                "missingSkills": [],
+                "schoolsRequired": schools_required,
+                "degreesRequired": degrees_required,
+                "mustHavePhrases": must_have_phrases,
+                "excludePhrases": exclude_phrases,
+                "literalHit": True,
+                "nearLiteralHit": False,
+            }
+            strict_matches.append(item)
+            # continue to next CV (we don't need full scoring in exact mode)
+            continue
+
+        # ===== NORMAL / SEMANTIC MODE =====
+        # comparison text for semantic similarity
         exp_str = f"{experience:.1f}".rstrip('0').rstrip('.')
         if exp_str == "":
             exp_str = "0"
@@ -787,31 +970,23 @@ async def get_semantic_matches(
             f"{exp_str} years experience",
             location_text,
         ])
-        # (Keep original behavior: per-item encode for semantic_score; safe if ANN already shrank pool)
         compare_embedding = embedding_model.encode(compare_text, convert_to_tensor=True)
         similarity = util.cos_sim(prompt_embedding_tensor, compare_embedding)[0][0].item()
         semantic_score = round(similarity * 100, 2)
 
-        # -----------------------
-        # Strong paragraph matching (additive)
-        # -----------------------
+        # Paragraph literal / near-literal boosts
         literal_hit = False
         near_literal_hit = False
-
-        # We keep your original paragraph gate intact,
-        # but ALSO allow smaller snippets (>=20 chars) to attempt literal checks.
         allow_literal_attempt = is_paragraph_query or (len(query_lit) >= 20)
 
         if allow_literal_attempt and raw_text:
             cv_blob = _normalize_blob_for_literal(raw_text)
-            # 1) exact/substring literal check
             if query_lit and query_lit in cv_blob:
                 literal_hit = True
             else:
-                # 2) near-literal (cheap sliding window) for longer snippets
                 q_snip = query_lit[:240]
                 if len(q_snip) >= 60:
-                    step = 800  # coarse step to keep it light
+                    step = 800
                     for start in range(0, max(1, len(cv_blob) - len(q_snip) + 1), step):
                         window = cv_blob[start:start + len(q_snip) + 200]
                         if not window:
@@ -821,74 +996,69 @@ async def get_semantic_matches(
                             near_literal_hit = True
                             break
 
-        # -----------------------
-        # Compute weighted scoring components
-        # -----------------------
-        role_score = _role_relatedness_score(predicted_role_lc, requested_role)    # 0..1
-        skills_score = _skills_score(skills, must_include_skills, baseline_required_skills)  # 0..1
-        exp_score = _experience_score(experience, min_years, max_years)           # 0..1
-        proj_score = _projects_score(projects_field, projects_text, projects_required)       # 0..1
+        # component scores
+        role_score = _role_relatedness_score(predicted_role_lc, requested_role) if _selected("role") else 0.7
+        skills_score = _skills_score(skills, must_include_skills if _selected("skills") else [], baseline_required_skills)
+        exp_score = _experience_score(experience, min_years if _selected("experience") else None, max_years if _selected("experience") else None)
+        proj_score = _projects_score(projects_field, projects_text, projects_required if _selected("projects") else False)
 
-        # Boosts on literal/near-literal (without breaking existing weights)
         if literal_hit:
             semantic_score = max(semantic_score, LITERAL_SEMANTIC_BOOST)
-            # If role was neutral and user asked a role, gently lift
-            if requested_role:
+            if requested_role and _selected("role"):
                 role_score = max(role_score, 0.90)
         elif near_literal_hit:
             semantic_score = max(semantic_score, NEAR_LITERAL_SEMANTIC_BOOST)
 
         weighted_final = (W_ROLE * role_score) + (W_SKILLS * skills_score) + (W_EXP * exp_score) + (W_PROJ * proj_score)
-        final_score = round(weighted_final * 100.0, 2)  # keep 0..100 like before
+        final_score = round(weighted_final * 100.0, 2)
 
-        # -------------------------------
-        # STRICT FILTER EVALUATION (AND)
-        # -------------------------------
+        # STRICT FILTERS (respect selected fields)
         failed_filters: List[str] = []
 
-        # 1) Hard role gate (exact or closely related)
+        # 1) Role
         role_ok = True
-        if requested_role:
-            role_ok = (role_score >= ROLE_SIM_STRICT)  # exact/related
+        if _selected("role") and requested_role:
+            role_ok = (role_score >= ROLE_SIM_STRICT)
             if not role_ok:
                 failed_filters.append("role")
 
-        # 2) Experience gate
-        exp_ok = _experience_satisfies(experience, min_years, max_years, strict_ge, strict_le)
-        if (min_years is not None or max_years is not None) and not exp_ok:
-            failed_filters.append("experience")
+        # 2) Experience
+        exp_ok = True
+        if _selected("experience") and (min_years is not None or max_years is not None):
+            exp_ok = _experience_satisfies(experience, min_years, max_years, strict_ge, strict_le)
+            if not exp_ok:
+                failed_filters.append("experience")
 
         # 3) Skills must-include (ALL)
         skills_ok = True
         missing_must_skills: List[str] = []
-        if must_include_skills:
+        if _selected("skills") and must_include_skills:
             skills_ok, missing_must_skills = _skills_contain_all(skills, must_include_skills)
             if not skills_ok:
                 failed_filters.append("skills")
 
         # 4) Projects
         proj_ok = True
-        if projects_required:
+        if _selected("projects") and projects_required:
             proj_ok = _has_projects(projects_field, projects_text)
             if not proj_ok:
                 failed_filters.append("projects")
 
         # 5) Location
         loc_ok = True
-        if location_filter:
+        if _selected("location") and location_filter:
             loc_ok = location_filter in location_text
             if not loc_ok:
                 failed_filters.append("location")
 
-        # 6) Education (schools & degrees) — strict contains in raw_text
+        # 6) Education (schools & degrees)
         edu_ok = True
         rt_lc = (raw_text or "").lower()
-        if schools_required:
+        if _selected("education") and schools_required:
             edu_ok = all(s in rt_lc for s in schools_required)
             if not edu_ok:
                 failed_filters.append("education_schools")
-        if edu_ok and degrees_required:
-            # accept common degree variants like dots/hyphens removed
+        if _selected("education") and edu_ok and degrees_required:
             norm_rt = re.sub(r"[.\- ]", "", rt_lc)
             def _deg_match(d: str) -> bool:
                 d1 = d.lower()
@@ -899,37 +1069,32 @@ async def get_semantic_matches(
                 failed_filters.append("education_degrees")
                 edu_ok = False
 
-        # 7) Phrases include/exclude — strict substring on raw_text
+        # 7) Phrases include/exclude
         phr_ok = True
-        if must_have_phrases:
+        if _selected("phrases") and must_have_phrases:
             if not all(p.lower() in rt_lc for p in must_have_phrases):
                 failed_filters.append("phrases_required")
                 phr_ok = False
-        if exclude_phrases and phr_ok:
+        if _selected("phrases") and exclude_phrases and phr_ok:
             if any(p.lower() in rt_lc for p in exclude_phrases):
                 failed_filters.append("phrases_excluded")
                 phr_ok = False
 
         is_strict_match = (len(failed_filters) == 0)
 
-        # -------------------------------
-        # Primary semantic gate (floor)
-        # -------------------------------
+        # Primary semantic floor (skip when exact literal already proved)
         primary_gate_pass = True
-        if is_paragraph_query:
-            # Paragraph queries often score lower semantically; only reject
-            # very weak ones if we didn't find literal/near-literal evidence.
-            if semantic_score < PARAGRAPH_FLOOR and not (literal_hit or near_literal_hit):
-                primary_gate_pass = False
-        else:
-            if is_prompt_role_like and semantic_score < SEMANTIC_FLOOR_ROLE_LIKE:
-                primary_gate_pass = False
-            if (not is_prompt_role_like) and semantic_score < SEMANTIC_FLOOR_GENERAL:
-                primary_gate_pass = False
+        if not (literal_hit or near_literal_hit):
+            if _looks_like_paragraph(query_raw_for_literal):
+                if semantic_score < PARAGRAPH_FLOOR:
+                    primary_gate_pass = False
+            else:
+                if is_prompt_role_like and semantic_score < SEMANTIC_FLOOR_ROLE_LIKE:
+                    primary_gate_pass = False
+                if (not is_prompt_role_like) and semantic_score < SEMANTIC_FLOOR_GENERAL:
+                    primary_gate_pass = False
 
-        # -------------------------------
-        # Build preview item
-        # -------------------------------
+        # Build item
         skills_truncated = [s for s in skills[:6] if isinstance(s, str)]
         overflow = max(0, len(skills) - len(skills_truncated))
 
@@ -938,9 +1103,10 @@ async def get_semantic_matches(
             "name": (cv.get("name") or "").strip() or "No Name",
             "predicted_role": original_predicted_role,
             "category": cv.get("category", original_predicted_role),
+            "ml_predicted_role": cv.get("ml_predicted_role"),  # ✅ surface ML role too
             "experience": experience,
-            "experience_display": experience_display,      # added
-            "experience_rounded": experience_rounded,      # added
+            "experience_display": experience_display,
+            "experience_rounded": experience_rounded,
             "location": location_text or "N/A",
             "email": cv.get("email", "N/A"),
             "skills": skills,
@@ -949,6 +1115,8 @@ async def get_semantic_matches(
             "resume_url": cv.get("resume_url", ""),
             "semantic_score": semantic_score,
             "confidence": confidence,
+            "ml_confidence": confidence,                         # alias for UI
+            "role_prediction_score": round(max(0.0, min(1.0, role_score)) * 100.0, 2),  # ✅ Role Prediction Confidence
             "score_type": "Weighted Role/Skills/Exp/Projects",
             "final_score": final_score,
             "score_components": {
@@ -971,7 +1139,6 @@ async def get_semantic_matches(
             "missingMustSkills": missing_must_skills,
             "matchedSkills": [s for s in skills if isinstance(s, str) and s.lower() in parsed_text],
             "missingSkills": [s for s in (keywords or []) if s not in [x.lower() for x in skills if isinstance(x, str)]],
-            # NEW: surface back what we parsed so UI can reflect if needed
             "schoolsRequired": schools_required,
             "degreesRequired": degrees_required,
             "mustHavePhrases": must_have_phrases,
@@ -985,22 +1152,22 @@ async def get_semantic_matches(
             item["strengths"].append("Strong overall match")
         elif final_score >= 70:
             item["strengths"].append("Relevant to query")
-        if requested_role and role_ok:
+        if _selected("role") and requested_role and role_ok:
             item["strengths"].append("Role aligns with requested/related role")
         if not skills:
             item["redFlags"].append("No skills extracted from resume")
-        if (min_years is not None or max_years is not None) and not exp_ok:
+        if _selected("experience") and (min_years is not None or max_years is not None) and not exp_ok:
             item["redFlags"].append("Experience outside requested range")
-        if schools_required and "education_schools" not in failed_filters:
+        if _selected("education") and schools_required and "education_schools" not in failed_filters:
             item["strengths"].append("Matches required school(s)")
-        if degrees_required and "education_degrees" not in failed_filters:
+        if _selected("education") and degrees_required and "education_degrees" not in failed_filters:
             item["strengths"].append("Matches required degree(s)")
-        if must_have_phrases and "phrases_required" not in failed_filters:
+        if _selected("phrases") and must_have_phrases and "phrases_required" not in failed_filters:
             item["strengths"].append("Contains required phrase(s)")
 
-        # Related roles (best effort)
+        # Related roles (best effort, non-fatal)
         try:
-            if original_predicted_role:
+            if original_predicted_role and original_predicted_role.strip().lower() not in _BAD:
                 pred_embed = embedding_model.encode(original_predicted_role)
                 scores = []
                 full_roles = get_full_roles_for_suggestions()
@@ -1016,31 +1183,23 @@ async def get_semantic_matches(
                 item["related_roles"] = top
                 item["relatedRoles"] = [{"role": x["role"], "score": round(x["match"]/100.0, 4)} for x in top]
         except Exception:
-            pass  # non-fatal
+            pass
 
-        # ----------------------------------------
-        # Decide which bucket this item belongs to
-        # ----------------------------------------
-        # Primary semantic floor
+        # Decide which bucket
         if not primary_gate_pass:
-            # If any strict filter present, ignore weak items entirely
             if has_strict_filters:
                 continue
             soft_pool.append(item)
             continue
 
-        # ROLE gate: if role specified and unrelated, drop
-        if requested_role and not role_ok:
+        if _selected("role") and requested_role and not role_ok:
             continue
 
-        # If strict filters exist, only accept items that pass ALL strict checks
         if has_strict_filters:
             if is_strict_match:
                 strict_matches.append(item)
-            # else: fail some strict filter -> drop silently
             continue
 
-        # No strict filters -> allow close bucket
         if is_strict_match:
             strict_matches.append(item)
         else:
@@ -1065,11 +1224,9 @@ async def get_semantic_matches(
             cv["match_type"] = "close"
         return close_matches
 
-    # If strict filters were requested but nothing matched -> return empty
     if has_strict_filters:
         return []
 
-    # Otherwise (no strict filters): allow deep fallback
     soft_pool.sort(key=lambda x: x["final_score"], reverse=True)
     for i, cv in enumerate(soft_pool):
         cv["rank"] = i + 1
@@ -1081,8 +1238,6 @@ async def get_semantic_matches(
 # -----------------------------
 # Backwards-compat exports ✅
 # -----------------------------
-# Some modules (e.g., upload_router) import: model, vectorizer, label_encoder.
-# Expose them via lazy loader so those imports keep working without boot failures.
 model, vectorizer, label_encoder = get_classic_assets()
 
 
@@ -1149,7 +1304,7 @@ def _parse_experience_filters(prompt: str) -> Tuple[Optional[float], Optional[fl
     if m:
         return float(m.group(1)), None, True, None
 
-    # Simple "7 years" (treat as >= 7 by default)
+    # Simple "7 years"
     m = re.search(rf"{_EXP_NUM}\s*(?:years|yrs)\b", p)
     if m:
         return float(m.group(1)), None, True, None
@@ -1187,30 +1342,26 @@ def _parse_location(prompt: str) -> Optional[str]:
 def _parse_role(prompt: str) -> Optional[str]:
     """
     Try to map prompt to a role token present in ROLE_VOCAB.
-    If not found but prompt is short (<=5 tokens), fall back to the prompt itself
-    so embedding-based role match can still work (e.g., 'advocate').
+    If not found but prompt is short (<=5 tokens), fall back to the prompt itself.
     """
     tokens = clean_text(prompt).split()
     joined = " ".join(tokens)
-    role_vocab = get_role_vocab()  # dynamic, encoder-aware
-    # Check multi-word vocab first by length
+    role_vocab = get_role_vocab()
     for role in sorted(role_vocab, key=lambda x: -len(x)):
         if role in joined:
             return role
-    # fallback: early tokens heuristic if prompt looks like a short role-like query
     if len(tokens) <= 5:
         for n in (3, 2, 1):
             cand = " ".join(tokens[:n]).strip()
             if cand in role_vocab:
                 return cand
-        # NEW: if still not found, allow the short prompt itself (alphabetic only)
         if any(t.isalpha() for t in tokens):
             return joined
     return None
 
 
 # -----------------------------
-# NEW: Education & phrase parsers
+# Education & phrase parsers
 # -----------------------------
 _DEGREE_TOKENS = [
     "llb", "jd", "llm",
@@ -1233,13 +1384,10 @@ def _parse_education_requirements(prompt: str) -> Tuple[List[str], List[str]]:
     schools: List[str] = []
     degrees: List[str] = []
 
-    # Degrees: any listed degree token mentioned explicitly
     for deg in _DEGREE_TOKENS:
         if re.search(rf"\b{re.escape(deg)}\b", p):
             degrees.append(deg)
 
-    # Schools: simple patterns like "from XYZ", "graduate(d) from XYZ", "alumni of XYZ"
-    # Capture up to 6 words after the verb; stop at punctuation.
     school_patterns = [
         r"(?:from|graduate(?:d)?\s+from|alumni\s+of|passed\s+from)\s+([a-zA-Z][a-zA-Z&.\-'\s]{2,80})",
         r"(?:at)\s+([a-zA-Z][a-zA-Z&.\-'\s]{2,80})\s+(?:university|college|institute)"
@@ -1248,17 +1396,14 @@ def _parse_education_requirements(prompt: str) -> Tuple[List[str], List[str]]:
         for m in re.finditer(pat, p):
             cand = m.group(1).strip()
             cand = re.sub(r"[,.;].*$", "", cand).strip()
-            # keep if it looks like a school name or contains a hint
             if any(h in cand for h in _SCHOOL_HINTS) or len(cand.split()) >= 2:
                 schools.append(cand)
 
-    # Also hoover quoted school names like "RMIT", "LUMS"
     for m in re.finditer(r"['\"]([^'\"]{2,80})['\"]", p):
         q = m.group(1).strip()
         if len(q) >= 2 and (any(h in q for h in _SCHOOL_HINTS) or len(q) >= 3):
             schools.append(q)
 
-    # dedupe & lower
     schools = list(dict.fromkeys([s.lower() for s in schools if s]))
     degrees = list(dict.fromkeys([d.lower() for d in degrees if d]))
     return schools, degrees
@@ -1274,11 +1419,9 @@ def _parse_phrase_requirements(prompt: str) -> Tuple[List[str], List[str]]:
     must: List[str] = []
     excl: List[str] = []
 
-    # 1) Quoted phrases → must
     for m in re.finditer(r"['\"]([^'\"]{2,200})['\"]", p):
         must.append(m.group(1).strip())
 
-    # 2) "must include ...", "should include ...", "include phrase ..."
     inc_patterns = [
         r"(?:must|should|need to|needs to|required to)\s+(?:include|contain)\s+([^.;\n]+)",
         r"(?:include|contains?)\s+phrase\s+([^.;\n]+)",
@@ -1293,7 +1436,6 @@ def _parse_phrase_requirements(prompt: str) -> Tuple[List[str], List[str]]:
                 if len(t) >= 2:
                     must.append(t)
 
-    # 3) "exclude ..." / "must not include ..."
     exc_patterns = [
         r"(?:exclude|without)\s+([^.;\n]+)",
         r"(?:must|should)\s+not\s+(?:include|contain)\s+([^.;\n]+)"
@@ -1308,7 +1450,6 @@ def _parse_phrase_requirements(prompt: str) -> Tuple[List[str], List[str]]:
                 if len(t) >= 2:
                     excl.append(t)
 
-    # dedupe & clean
     def _norm_list(xs: List[str]) -> List[str]:
         seen = {}
         out = []
@@ -1335,7 +1476,7 @@ def _role_is_related(predicted_role: str, requested_role: str) -> bool:
         emb_a = embedding_model.encode(pr, convert_to_tensor=True)
         emb_b = embedding_model.encode(rr, convert_to_tensor=True)
         sim = util.cos_sim(emb_a, emb_b)[0][0].item()
-        return sim >= ROLE_SIM_RELATED  # related roles
+        return sim >= ROLE_SIM_RELATED
     except Exception:
         return False
 
@@ -1343,11 +1484,6 @@ def _role_is_related(predicted_role: str, requested_role: str) -> bool:
 def _role_relatedness_score(predicted_role: str, requested_role: Optional[str]) -> float:
     """
     Return a role match score in [0,1].
-    - 1.0 exact/same family
-    - ~0.95 related (embedding similarity >= ROLE_SIM_HIGH)
-    - ~0.8 related (embedding similarity >= ROLE_SIM_RELATED)
-    - 0.0 if unrelated when requested_role present
-    - 0.7 neutral default if no requested_role provided
     """
     if not predicted_role:
         return 0.0
@@ -1411,14 +1547,9 @@ def _experience_score(exp_years: float,
                       max_years: Optional[float]) -> float:
     """
     Map experience vs requested bounds to [0,1].
-    - 1.0 inside the target range
-    - If only min: decays as you fall below
-    - If only max: decays as you exceed
-    - If no bounds: neutral 0.6
     """
     if min_years is None and max_years is None:
         return 0.6
-    # both bounds
     if min_years is not None and max_years is not None:
         if min_years > max_years:
             min_years, max_years = max_years, min_years
@@ -1431,14 +1562,12 @@ def _experience_score(exp_years: float,
         else:
             gap = (exp_years - max_years)
             return max(0.0, 1.0 - gap / (width + 2.0))
-    # only min
     if min_years is not None:
         if exp_years >= min_years:
             return 1.0
         gap = (min_years - exp_years)
         base = max(1.0, min_years + 2.0)
         return max(0.0, 1.0 - gap / base)
-    # only max
     if exp_years <= max_years:
         return 1.0
     gap = (exp_years - max_years)
@@ -1451,7 +1580,6 @@ def _skills_score(candidate_skills: List[str],
                   baseline_required: List[str]) -> float:
     """
     Score skills coverage in [0,1].
-    Priority to must_include; if empty, use baseline_required derived from prompt/keywords.
     """
     cand = set([clean_text(s) for s in candidate_skills if isinstance(s, str)])
     focus = [clean_text(s) for s in (must_include if must_include else baseline_required) if s]
@@ -1466,8 +1594,6 @@ def _projects_score(projects_field: Any,
                     projects_required: bool) -> float:
     """
     Score projects presence [0,1].
-    - If projects are strictly required by the prompt: 1.0 if present else 0.0
-    - Otherwise: mild preference for having projects (0.6 vs 0.4)
     """
     has_proj = _has_projects(projects_field, projects_text)
     if projects_required:

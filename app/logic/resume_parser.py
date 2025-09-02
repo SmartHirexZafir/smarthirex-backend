@@ -1,4 +1,4 @@
-# ✅ File: app/logic/resume_parser.py
+# app/logic/resume_parser.py
 
 import fitz  # PyMuPDF
 import docx2txt
@@ -6,11 +6,21 @@ import io
 import re
 import tempfile
 import os
+import zipfile
+from xml.etree import ElementTree as ET
 from datetime import datetime
 from dateutil import parser as dateparser
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from PIL import Image  # <-- added: needed for robust OCR with pytesseract
+from PIL import Image  # needed for robust OCR with pytesseract
+
+# ========= Normalization helpers (shared across ingest/search) =========
+from app.logic.normalize import (
+    normalize_role,
+    normalize_tokens,
+    to_years_of_experience,
+    norm_text,
+)
 
 # ----------------------------
 # SpaCy: load safely with fallback
@@ -51,8 +61,8 @@ except Exception:
 SKILL_FILE = Path(__file__).parent.parent / "resources" / "skills.txt"
 KNOWN_SKILLS: set = set()
 
-# ✅ NEW: Multi-path fallback loader to avoid silent empty vocab when the file
-#        lives outside app/resources (e.g., project root or /resources).
+# ✅ Multi-path fallback loader to avoid silent empty vocab when the file
+#   lives outside app/resources (e.g., project root or /resources).
 def _load_skills_vocab() -> None:
     global KNOWN_SKILLS
     candidate_paths = [
@@ -184,6 +194,31 @@ def _pdf_text_pymupdf(content: bytes) -> str:
         except Exception:
             pass
 
+def _pdf_text_pypdf(content: bytes) -> str:
+    """
+    Optional PDF extractor using pypdf / PyPDF2. Never raises outwards.
+    """
+    try:
+        try:
+            from pypdf import PdfReader  # type: ignore
+        except Exception:
+            from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(content))
+        texts: List[str] = []
+        for page in getattr(reader, "pages", []):
+            try:
+                t = page.extract_text() or ""
+                if t:
+                    texts.append(t)
+            except Exception:
+                continue
+        return _safe_join(texts)
+    except Exception:
+        return ""
+
 def _pdf_text_ocr_with_fitz(content: bytes) -> str:
     """
     OCR fallback using PyMuPDF rasterization + pytesseract.
@@ -204,7 +239,7 @@ def _pdf_text_ocr_with_fitz(content: bytes) -> str:
             try:
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img_bytes = pix.tobytes("png")
-                # ✅ ensure pytesseract receives a Pillow Image (not a BytesIO)
+                # ensure pytesseract receives a Pillow Image (not a BytesIO)
                 img = Image.open(io.BytesIO(img_bytes)).convert("L")
                 txt = pytesseract.image_to_string(img)
                 if txt:
@@ -222,32 +257,72 @@ def _pdf_text_ocr_with_fitz(content: bytes) -> str:
 
 def extract_text_from_pdf(content: bytes) -> str:
     """
-    Try text extraction; if blank and OCR enabled, OCR fallback.
+    Try pypdf extraction first; if blank, fall back to PyMuPDF; if still blank
+    and OCR is enabled, OCR fallback.
     """
+    # 1) pypdf / PyPDF2
+    text = _pdf_text_pypdf(content)
+    if _strip_text(text):
+        return text
+    # 2) PyMuPDF
     text = _pdf_text_pymupdf(content)
     if _strip_text(text):
         return text
-    # OCR fallback
+    # 3) OCR fallback
     ocr_text = _pdf_text_ocr_with_fitz(content)
     return ocr_text
+
+def _docx_text_via_zip(content: bytes) -> str:
+    """
+    Robust DOCX extractor: read word/document.xml from the DOCX (zip) and
+    collect all <w:t> text nodes. Never raises outwards.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            with zf.open("word/document.xml") as f:
+                xml_bytes = f.read()
+        try:
+            root = ET.fromstring(xml_bytes)
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            texts = [t.text for t in root.findall(".//w:t", ns) if t is not None and t.text]
+            return _strip_text("\n".join(texts))
+        except Exception:
+            # Regex strip as last resort if XML parser chokes
+            raw = re.sub(rb"<[^>]+>", b" ", xml_bytes)
+            try:
+                return _strip_text(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                return _strip_text(raw.decode("latin-1", errors="ignore"))
+    except Exception:
+        return ""
 
 def extract_text_from_docx(content: bytes) -> str:
     """
     Use a temp file path for docx2txt to avoid file-like compatibility issues.
+    If the result is blank or junky, fall back to zip-based XML text extraction.
     Never raises outwards.
     """
+    # 1) Try docx2txt
     try:
         with tempfile.NamedTemporaryFile(suffix=".docx") as tmp:
             tmp.write(content)
             tmp.flush()
             t = docx2txt.process(tmp.name) or ""
-            return t
+            if _strip_text(t):
+                return t
     except Exception:
-        # minimal salvage: try naive decode
-        try:
-            return content.decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
+        pass
+
+    # 2) Fallback: read word/document.xml from the docx zip
+    xml_text = _docx_text_via_zip(content)
+    if _strip_text(xml_text):
+        return xml_text
+
+    # 3) Minimal salvage: try naive decode
+    try:
+        return content.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 def extract_text_from_doc_legacy(content: bytes) -> str:
     """
@@ -381,7 +456,7 @@ def extract_experience(text: str) -> float:
             re.IGNORECASE
         )
         explicit_years = 0.0
-        for m in year_match or []:
+        for m in (year_match or []):
             try:
                 # '0.' -> float('0.') works; but guard just in case
                 val = float(m if m[-1].isdigit() else m.rstrip(".") or "0")
@@ -487,7 +562,8 @@ def extract_summary(text: str) -> str:
 
 def extract_education(text: str) -> list:
     try:
-        sections = re.findall(r"(Bachelor|Master|B\.Tech|M\.Tech|BSc|MSc|Ph\.D)[\s\S]{0,200}", text, re.IGNORECASE)
+        # Use a non-capturing group so we get the full matched span (not only the degree token)
+        sections = re.findall(r"(?:Bachelor|Master|B\.Tech|M\.Tech|BSc|MSc|Ph\.D)[\s\S]{0,200}", text, re.IGNORECASE)
     except Exception:
         sections = []
     results = []
@@ -516,8 +592,8 @@ def extract_work_history(text: str) -> list:
             duration = lines[i + 2]
             if len(title) > 2 and len(company) > 2 and len(duration) > 2:
                 results.append({
-                    "title": title,
-                    "company": company,
+                    "title": norm_text(title) or title,
+                    "company": norm_text(company) or company,
                     "duration": duration,
                     "description": "Worked on various tasks and contributed to team goals."
                 })
@@ -561,15 +637,15 @@ def extract_info(text: str) -> dict:
     ).strip()
 
     experience_float = float(experience)
-    experience_display = _format_experience_display(experience_float)  # ✅ clean display
-    experience_rounded = _round_experience_value(experience_float)     # ✅ numeric rounded
+    experience_display = _format_experience_display(experience_float)  # clean display
+    experience_rounded = _round_experience_value(experience_float)     # numeric rounded
 
     # Additive detections (for strong filtering convenience)
     degrees_detected = _detect_degrees(text or "")
     schools_detected = _detect_schools(text or "")
 
     info = {
-        "name": name or "No Name",                 # ✅ fallback
+        "name": name or "No Name",                 # fallback
         "email": email or None,
         "phone": phone or None,
 
@@ -621,11 +697,28 @@ def extract_info(text: str) -> dict:
         "schools_detected": schools_detected,
     }
 
-    # ----------------------------
-    # NEW: Precompute search_blob for fast ANN/text recall
-    # ----------------------------
-    # Compose a compact, normalized blob using salient fields.
-    # This is non-breaking (just an extra field).
+    # ---------- NEW: Precompute normalized fields for fast exact filters ----------
+    # role_norm: from best available role field
+    role_source = info.get("currentRole") or info.get("title") or info.get("job_title")
+    info["role_norm"] = normalize_role(role_source)
+
+    # skills_norm: canonicalized skill tokens
+    info["skills_norm"] = normalize_tokens(info.get("skills"))
+
+    # projects_norm: combine project names + tech tags (keep concise)
+    proj_items: List[str] = []
+    for p in projects:
+        if isinstance(p, dict):
+            if p.get("name"):
+                proj_items.append(str(p["name"]))
+            if isinstance(p.get("tech"), list):
+                proj_items.extend([str(t) for t in p["tech"] if isinstance(t, (str,))])
+    info["projects_norm"] = normalize_tokens(proj_items)
+
+    # yoe_num: integer-ish years for indexed range queries
+    info["yoe_num"] = to_years_of_experience(info.get("experience"))
+
+    # ---------- Precompute search_blob for fast ANN/text recall ----------
     try:
         parts: List[str] = []
         parts.append(info.get("name") or "")
@@ -663,6 +756,12 @@ def extract_info(text: str) -> dict:
             info["search_blob"] = _clean_text_for_blob((text or "")[:4000])
         except Exception:
             info["search_blob"] = ""
+
+    # ---------- Additive fields for ANN indexing (non-disruptive) ----------
+    info["index_blob"] = info.get("search_blob", "")
+    # Embeddings, if any, should be filled by the upstream pipeline;
+    # keep placeholder None to avoid breaking consumers.
+    info["index_embedding"] = None
 
     return info
 

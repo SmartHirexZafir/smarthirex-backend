@@ -9,10 +9,18 @@ from typing import Dict, Any, List, Optional, Set
 # Public API (import these)
 # ------------------------------
 __all__ = [
+    # prompt + keyword utilities
     "normalize_prompt",
     "extract_min_years",
     "tokenize_keywords",
+    # role token helper kept for backward compatibility
     "normalize_role_word",
+    # new normalized-field helpers for ingest/search
+    "norm_text",
+    "normalize_role",
+    "normalize_tokens",
+    "to_years_of_experience",
+    # constants
     "SYNONYMS",
     "STOPWORDS",
 ]
@@ -80,13 +88,9 @@ SYNONYMS: Dict[str, str] = {
     "tailwindcss": "tailwind",
 }
 
-# ---- NEW: Optional custom synonyms merge (non-breaking) ---------------------
-_CUSTOM_SYNONYMS_PATH = os.path.join("app", "resources", "synonyms_custom.json")
-
-# ✅ ADDITIVE: search multiple common paths so custom synonyms are picked up
-# even if the file lives outside app/resources during development/deployment.
+# ---- Optional custom synonyms merge (non-breaking) --------------------------
 _CUSTOM_SYNONYMS_PATHS: List[str] = [
-    _CUSTOM_SYNONYMS_PATH,
+    os.path.join("app", "resources", "synonyms_custom.json"),
     os.path.join("resources", "synonyms_custom.json"),
     "synonyms_custom.json",
 ]
@@ -117,15 +121,16 @@ def _merge_custom_synonyms() -> None:
                         cleaned[kk] = vv
             if cleaned:
                 SYNONYMS.update(cleaned)
-                # If we successfully loaded from one path, we still continue to allow
-                # cumulative merges from multiple files if present.
         except Exception:
             # Optional file — ignore any errors to preserve old behavior
             continue
 
+
 # Attempt merge at import time (safe if file is absent)
 _merge_custom_synonyms()
+
 # -----------------------------------------------------------------------------
+
 
 # Words we ignore while generating keywords
 STOPWORDS: Set[str] = {
@@ -165,10 +170,91 @@ PLURAL_SINGULAR: Dict[str, str] = {
     "candidates": "candidate",
 }
 
+# -----------------------------------------------------------------------------
+# Core normalizers used by ingest + search (added per our plan)
+# -----------------------------------------------------------------------------
+
 
 def _basic_clean(s: str) -> str:
     """Lowercase + trim spaces."""
     return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+
+def norm_text(s: Optional[str]) -> Optional[str]:
+    """Minimal, safe normalizer for free text fields (keeps None)."""
+    if s is None:
+        return None
+    out = _basic_clean(s)
+    return out if out else None
+
+
+def normalize_role(s: Optional[str]) -> Optional[str]:
+    """
+    Normalize a role/title into a canonical, search-friendly form.
+    Examples:
+      " Full Stack Developer " -> "full-stack developer" (via phrase + synonyms)
+      "BE Engineer"            -> "backend engineer"
+    """
+    s = norm_text(s)
+    if not s:
+        return None
+    # stabilize common phrases first
+    s = _apply_phrase_normalizers(s)
+    # unify "full stack" → "full-stack", etc. (already covered but reinforced)
+    s = re.sub(r"\bfull\s*stack\b", "full-stack", s)
+    # token-level cleanup (plurals + synonyms)
+    s = _apply_plural_and_synonyms(s)
+    return s
+
+
+def normalize_tokens(items: Optional[List[str]]) -> List[str]:
+    """
+    Normalize a list of tokens (skills/projects/etc.) into a de-duplicated,
+    lowercased list with synonyms applied.
+    """
+    if not items:
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for x in items:
+        if not isinstance(x, str):
+            continue
+        t = norm_text(x)
+        if not t:
+            continue
+        # phrase fixes then token-level maps
+        t = _apply_phrase_normalizers(t)
+        t = _apply_plural_and_synonyms(t)
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+_YOE_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def to_years_of_experience(v: Optional[str | int | float]) -> Optional[int]:
+    """
+    Parse a years-of-experience value into an int (floor).
+    Accepts numeric values or strings like "3", "3.5", "3 years", "5+ yrs".
+    Returns None if no numeric content found.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            return int(float(v))
+        except Exception:
+            return None
+    s = _basic_clean(str(v))
+    m = _YOE_NUM_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(float(m.group(1)))
+    except Exception:
+        return None
 
 
 def normalize_role_word(w: str) -> str:
