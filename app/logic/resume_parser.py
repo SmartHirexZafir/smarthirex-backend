@@ -6,12 +6,13 @@ import io
 import re
 import tempfile
 import os
+import json
 import zipfile
 from xml.etree import ElementTree as ET
 from datetime import datetime
 from dateutil import parser as dateparser
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from PIL import Image  # needed for robust OCR with pytesseract
 
 # ========= Normalization helpers (shared across ingest/search) =========
@@ -20,6 +21,10 @@ from app.logic.normalize import (
     normalize_tokens,
     to_years_of_experience,
     norm_text,
+    normalize_degree,
+    make_search_blob,
+    normalize_location,
+    STOPWORDS,
 )
 
 # ----------------------------
@@ -84,6 +89,115 @@ def _load_skills_vocab() -> None:
     # if all fail, keep empty set (degrade gracefully)
 
 _load_skills_vocab()
+
+# ----------------------------
+# Role/Category keyword lexicon (for stable role prediction)
+# ----------------------------
+# We try to load from JSON so it's data-driven (no hardcoding requirement).
+# If absent, we fall back to a safe built-in map (minimal, non-exhaustive).
+_ROLE_CAT_JSON_CANDIDATES = [
+    Path("app/resources/role_category_keywords.json"),
+    Path("resources/role_category_keywords.json"),
+    Path("role_category_keywords.json"),
+]
+
+ROLE_KEYWORDS: Dict[str, List[str]] = {}
+CATEGORY_KEYWORDS: Dict[str, List[str]] = {}
+
+# Built-in light fallback (covers your dataset’s categories & some roles)
+_FALLBACK_CATEGORY_KEYWORDS: Dict[str, List[str]] = {
+    "Accountant": ["accounting", "accounts payable", "accounts receivable", "ledger", "bookkeeping", "audit", "tax"],
+    "Advocate": ["advocate", "attorney", "lawyer", "litigation", "legal research", "barrister", "llb", "llm"],
+    "Agriculture": ["agriculture", "agribusiness", "crop", "irrigation", "soil"],
+    "Apparel": ["textile", "apparel", "garment", "fashion"],
+    "Architecture": ["architect", "architecture", "autocad", "revit"],
+    "Arts": ["artist", "illustration", "fine arts", "painting"],
+    "Automobile": ["automobile", "automotive", "vehicle", "oem", "autocad"],
+    "Aviation": ["aviation", "aircraft", "airline", "aerospace"],
+    "Banking": ["bank", "banking", "loan", "credit", "npa", "branch"],
+    "Blockchain": ["blockchain", "smart contract", "web3", "solidity", "ethereum"],
+    "BPO": ["bpo", "call center", "voice process", "back office", "csr"],
+    "Building and Construction": ["construction", "site engineer", "contractor", "civil work"],
+    "Business Analyst": ["business analyst", "requirements", "brd", "process modeling", "stakeholder"],
+    "Civil Engineer": ["civil engineer", "civil engineering", "autocad", "estimation", "structure"],
+    "Consultant": ["consultant", "consulting", "advisory", "strategy"],
+    "Data Science": ["data science", "machine learning", "deep learning", "modeling", "python", "pandas"],
+    "Database": ["database", "sql server", "postgres", "oracle dba", "mysql"],
+    "Designing": ["designer", "ui", "ux", "photoshop", "figma", "adobe"],
+    "DevOps": ["devops", "sre", "ci/cd", "kubernetes", "docker", "terraform"],
+    "Digital Media": ["digital marketing", "seo", "sem", "social media", "google ads"],
+    "DotNet Developer": [".net", "dotnet", "c#", "asp.net"],
+    "Education": ["teacher", "lecturer", "professor", "education"],
+    "Electrical Engineering": ["electrical", "electronics", "circuit", "power systems"],
+    "ETL Developer": ["etl", "data pipeline", "ingestion", "ssis", "informatica"],
+    "Finance": ["finance", "financial analysis", "fp&a", "valuation"],
+    "Food and Beverages": ["food", "beverage", "f&b", "chef", "kitchen"],
+    "Health and Fitness": ["fitness", "trainer", "nutrition", "health"],
+    "Human Resources": ["human resources", "hr", "recruitment", "talent acquisition", "payroll"],
+    "Information Technology": ["information technology", "it", "software", "infrastructure"],
+    "Java Developer": ["java", "spring", "j2ee", "hibernate"],
+    "Management": ["manager", "management", "leadership", "pmo"],
+    "Mechanical Engineer": ["mechanical", "cad", "manufacturing", "solidworks"],
+    "Network Security Engineer": ["network security", "firewall", "siem", "ids", "ips"],
+    "Operations Manager": ["operations manager", "operations management", "sop"],
+    "PMO": ["pmo", "project management office", "governance"],
+    "Public Relations": ["public relations", "pr", "media relations"],
+    "Python Developer": ["python", "django", "flask", "fastapi"],
+    "React Developer": ["react", "next", "javascript", "redux", "frontend"],
+    "Sales": ["sales", "business development", "lead generation", "crm"],
+    "SAP Developer": ["sap", "abap", "sap hana", "sap fico", "sap mm"],
+    "SQL Developer": ["sql", "stored procedures", "pl/sql", "t-sql"],
+    "Testing": ["qa", "testing", "selenium", "automation", "jmeter"],
+    "Web Designing": ["web designer", "html", "css", "javascript", "ui/ux"],
+}
+_FALLBACK_ROLE_KEYWORDS: Dict[str, List[str]] = {
+    # More specific roles for better card labeling
+    "Data Scientist": ["data science", "machine learning", "modeling", "pytorch", "tensorflow"],
+    "ML Engineer": ["ml engineer", "mlops", "deployment", "tensorflow", "pytorch"],
+    "Frontend Developer": ["react", "next", "vue", "angular", "javascript", "typescript", "frontend"],
+    "Backend Developer": ["node", "django", "flask", "spring", "backend", "api development"],
+    "Full Stack Developer": ["full-stack", "mern", "mean", "django react", "node react"],
+    "React Developer": ["react", "redux", "next"],
+    "Python Developer": ["python", "django", "flask", "fastapi"],
+    "Java Developer": ["java", "spring", "hibernate"],
+    "DevOps Engineer": ["devops", "sre", "kubernetes", "docker", "terraform", "ci/cd"],
+    "ETL Developer": ["etl", "ssis", "informatica", "data pipeline"],
+    "QA Engineer": ["qa", "testing", "selenium", "automation"],
+    "Business Analyst": ["business analyst", "requirements", "brd", "stakeholder"],
+    "HR Manager": ["hr", "human resources", "recruitment", "payroll"],
+    "Operations Manager": ["operations manager", "operations"],
+    "Network Security Engineer": ["network security", "firewall", "siem"],
+    "SAP Developer": ["sap", "abap", "hana"],
+    "SQL Developer": ["sql", "t-sql", "pl/sql", "database"],
+    "Accountant": ["accounting", "ledger", "bookkeeping", "audit"],
+    "Advocate": ["advocate", "attorney", "lawyer", "litigation"],
+}
+
+def _load_role_category_keywords() -> None:
+    """Load ROLE_KEYWORDS and CATEGORY_KEYWORDS from JSON if present."""
+    global ROLE_KEYWORDS, CATEGORY_KEYWORDS
+    for p in _ROLE_CAT_JSON_CANDIDATES:
+        try:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                rk = data.get("role_keywords") or data.get("roles") or {}
+                ck = data.get("category_keywords") or data.get("categories") or {}
+                if isinstance(rk, dict) and rk:
+                    ROLE_KEYWORDS = {str(k): [str(x).lower() for x in (v or []) if isinstance(x, (str,))] for k, v in rk.items()}
+                if isinstance(ck, dict) and ck:
+                    CATEGORY_KEYWORDS = {str(k): [str(x).lower() for x in (v or []) if isinstance(x, (str,))] for k, v in ck.items()}
+                break
+        except Exception:
+            # ignore and try next
+            continue
+    # fallbacks if not loaded
+    if not CATEGORY_KEYWORDS:
+        CATEGORY_KEYWORDS = _FALLBACK_CATEGORY_KEYWORDS
+    if not ROLE_KEYWORDS:
+        ROLE_KEYWORDS = _FALLBACK_ROLE_KEYWORDS
+
+_load_role_category_keywords()
 
 # ----------------------------
 # Helpers
@@ -346,63 +460,160 @@ def extract_text_from_doc_legacy(content: bytes) -> str:
     return text.strip()
 
 # ----------------------------
-# Core field extractors
+# Core field extractors (enhanced for Req #8)
 # ----------------------------
+
+# Heuristic blocklists to avoid mistaking skills for names
+_NAME_BAD_TOKENS = {
+    "resume", "curriculum", "vitae", "cv",
+    "engineer", "developer", "designer", "scientist", "manager", "analyst",
+    "python", "java", "react", "node", "dotnet", ".net", "django", "spring",
+    "experience", "skills", "projects", "education",
+}
+
+def _title_case_name(s: str) -> str:
+    parts = [p for p in re.split(r"[\s\._\-]+", s) if p]
+    parts = [p for p in parts if not re.fullmatch(r"\d+", p)]
+    return " ".join(p.capitalize() for p in parts if p)
+
+
+def _is_probable_name(line: str) -> bool:
+    t = line.strip()
+    if not (2 <= len(t.split()) <= 4):
+        return False
+    if any(ch.isdigit() for ch in t):
+        return False
+    low = t.lower()
+    if any(tok in low for tok in _NAME_BAD_TOKENS):
+        return False
+    # Require each token to look like a name-ish token
+    for w in t.split():
+        if not re.match(r"^[A-Z][a-z'’\-]+$", w):
+            return False
+    return True
+
+
 def extract_name(text: str) -> Optional[str]:
     # 1) NER-based (PERSON)
     if _HAS_NER:
         try:
             doc = nlp(text)
-            names = [
-                ent.text.strip()
-                for ent in doc.ents
-                if getattr(ent, "label_", "") == "PERSON" and 2 <= len(ent.text.strip().split()) <= 4
-            ]
-            if names:
-                return names[0]
+            # Prefer the earliest PERSON near top
+            for ent in doc.ents:
+                if getattr(ent, "label_", "") == "PERSON":
+                    candidate = ent.text.strip()
+                    if _is_probable_name(candidate):
+                        return candidate
         except Exception:
             pass
 
-    # 2) Top lines regex
-    lines = text.strip().split("\n")
-    for line in lines[:10]:
-        line = line.strip()
-        if re.match(r"^[A-Z][a-z]+(?: [A-Z][a-z]+)+$", line):
+    # 2) Top lines heuristic
+    lines = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+    for line in lines[:12]:
+        # skip contact/links lines quickly
+        if any(x in line.lower() for x in ["linkedin", "github", "email", "phone", "contact"]):
+            continue
+        if _is_probable_name(line):
             return line
 
     # 3) “Name: …” pattern
-    match = re.search(r"(?i)^Name[:\s]+([A-Z][a-z]+(?: [A-Z][a-z]+)+)", text)
-    return match.group(1) if match else None
+    match = re.search(r"(?im)^\s*name[:\s]+([A-Z][a-z'’\-]+(?:\s+[A-Z][a-z'’\-]+){1,3})\s*$", text)
+    if match:
+        return match.group(1).strip()
+
+    # 4) Fallback via email username (e.g., john.doe -> John Doe)
+    email = extract_email(text)
+    if email:
+        username = email.split("@", 1)[0]
+        guess = _title_case_name(username)
+        if guess and 2 <= len(guess.split()) <= 4:
+            return guess
+
+    return None
+
 
 def extract_email(text: str) -> Optional[str]:
     match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
     return match.group() if match else None
 
+
 def extract_phone(text: str) -> Optional[str]:
     match = re.search(r"(\+?\d{1,3}[-.\s]?)?(\(?\d{2,4}\)?[-.\s]?)?\d{3,5}[-.\s]?\d{4,5}", text)
     return match.group() if match else None
 
+
+def _skills_from_explicit_section(text: str) -> List[str]:
+    """
+    Pull skills from an explicit "Skills" section, tolerant to variants.
+    """
+    try:
+        # Capture content after a skills-like heading up to next major heading or blank gap
+        sec = re.search(
+            r"(?is)\b(skills|technical skills|core skills|skills summary)\b[:\n\-–]*"
+            r"([\s\S]*?)(?=\n\s*[A-Z][A-Za-z ]{2,30}[:\n]|"
+            r"\n\s*[A-Z ]{3,}\n|"
+            r"\n\s*(?:education|experience|projects|certifications)\b|$)",
+            text,
+        )
+        if not sec:
+            return []
+        body = sec.group(2) or ""
+        # Split by common delimiters
+        parts = re.split(r"[,\|;/•·●\n\r]+", body)
+        skills: List[str] = []
+        for p in parts:
+            t = re.sub(r"[\(\)\[\]{}]", " ", p).strip()
+            t = re.sub(r"\s+", " ", t)
+            if not t:
+                continue
+            low = t.lower()
+            # drop obvious noise words
+            if low in STOPWORDS or len(low) < 2:
+                continue
+            # e.g., "Programming Languages: Python" -> keep after colon
+            if ":" in low:
+                low = low.split(":", 1)[-1].strip()
+            # filter very long phrases that are not real skills
+            if len(low) > 48:
+                continue
+            skills.append(low)
+        # de-dup while preserving order
+        out, seen = [], set()
+        for s in skills:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    except Exception:
+        return []
+
+
 def extract_skills(text: str) -> List[str]:
     """
-    Skills extraction:
-      1) Phrase-level contains check from skills.txt (multi-word first)
-      2) Token-level fallback when vocab present
+    Skills extraction (enhanced):
+      1) Use explicit Skills section if present (broad tokenization)
+      2) Phrase-level contains check from skills.txt (multi-word first)
+      3) Token-level fallback when vocab present
     """
-    low = text.lower()
-    matched = set()
+    low_all = text.lower()
+    matched: set = set()
 
-    # Phrase contains (longest first)
+    # 1) Section-based parse
+    section_skills = _skills_from_explicit_section(text)
+    matched |= set(section_skills)
+
+    # 2) Phrase contains (longest first) from vocab
     if KNOWN_SKILLS:
         for skill in sorted(KNOWN_SKILLS, key=len, reverse=True):
             try:
-                if skill and skill in low:
+                if skill and skill in low_all:
                     matched.add(skill)
             except Exception:
                 continue
 
-    # Token-level fallback
+    # 3) Token-level fallback via spaCy vocab overlap
     try:
-        doc = nlp(low)
+        doc = nlp(low_all)
         tokens = set(
             getattr(t, "text", "") for t in doc
             if getattr(t, "is_stop", False) is False and getattr(t, "is_punct", False) is False
@@ -411,7 +622,15 @@ def extract_skills(text: str) -> List[str]:
     except Exception:
         pass
 
-    return sorted({m.strip().lower() for m in matched if m and m.strip()})
+    # return normalized, de-duplicated list
+    out = []
+    seen = set()
+    for m in sorted({m.strip().lower() for m in matched if m and m.strip()}):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
 
 def _round_experience_value(years: float) -> float:
     """
@@ -427,6 +646,7 @@ def _round_experience_value(years: float) -> float:
     except Exception:
         return 0.0
 
+
 def _format_experience_display(years: float) -> str:
     """
     Pretty display string without '0.' or trailing '.0' issues.
@@ -436,6 +656,7 @@ def _format_experience_display(years: float) -> str:
         y_int = int(y)
         return f"{y_int} year" if y_int == 1 else f"{y_int} years"
     return f"{y} years"
+
 
 def extract_experience(text: str) -> float:
     """
@@ -469,7 +690,7 @@ def extract_experience(text: str) -> float:
     # B) Date ranges
     try:
         date_ranges = re.findall(
-            r'(\w+\s\d{4})\s*(?:-|–|—|to)\s*(\w+\s\d{4}|present)',
+            r'(\w+\s\d{4})\s*(?:-|–|—|to)\s*(\w+\s\d{4}|present|current)',
             text,
             re.IGNORECASE
         )
@@ -477,7 +698,7 @@ def extract_experience(text: str) -> float:
         for start, end in date_ranges:
             try:
                 start_date = dateparser.parse(start)
-                end_date = datetime.now() if re.search(r"present", end, re.IGNORECASE) else dateparser.parse(end)
+                end_date = datetime.now() if re.search(r"(present|current)", end, re.IGNORECASE) else dateparser.parse(end)
                 months = (end_date.year - start_date.year) * 12 + (end_date.month - start_date.month)
                 total_months += max(months, 0)
             except Exception:
@@ -489,6 +710,7 @@ def extract_experience(text: str) -> float:
     years = max(explicit_years, calculated_years)
     return _round_experience_value(years)
 
+
 def extract_projects(text: str) -> List[Dict[str, Any]]:
     """
     Extract up to 5 projects from recognizable sections, tagging technologies
@@ -496,9 +718,8 @@ def extract_projects(text: str) -> List[Dict[str, Any]]:
     """
     try:
         raw_sections = re.findall(
-            r'(?:Project[s]?:?|Responsibilities:|Description:)[\s\S]{0,800}',
+            r'(?is)\b(projects?|responsibilities|description)\b[:\n\-–]*([\s\S]{0,800})',
             text,
-            re.IGNORECASE
         )
     except Exception:
         raw_sections = []
@@ -506,16 +727,16 @@ def extract_projects(text: str) -> List[Dict[str, Any]]:
     projects: List[Dict[str, Any]] = []
     seen = set()
 
-    for section in raw_sections:
-        lines = [line.strip() for line in section.strip().split('\n') if len(line.strip()) > 20]
+    for _, section in raw_sections:
+        lines = [line.strip() for line in section.strip().split('\n') if len(line.strip()) > 10]
         if not lines:
             continue
 
+        # Heuristic: the first non-empty line is a project name (trim)
         name = lines[0][:80]
-        description = " ".join(lines[1:]).strip()
+        description = " ".join(lines[1:]).strip() or lines[0]
         if not name or name in seen:
             continue
-
         seen.add(name)
 
         tech: List[str] = []
@@ -536,12 +757,12 @@ def extract_projects(text: str) -> List[Dict[str, Any]]:
 
     return projects
 
+
 def extract_summary(text: str) -> str:
     try:
         match = re.search(
-            r"(Summary|Objective)[:\n\s]*(.*?)(?:\n\n|\n[A-Z][a-z]+:|\n[A-Z ]{3,}|Education|Experience|Projects|Skills|$)",
-            text,
-            re.IGNORECASE | re.DOTALL
+            r"(?is)\b(Summary|Objective|Profile|Professional Summary)\b[:\n\s]*(.*?)(?:\n\n|\n[A-Z][a-z]+:|\n[A-Z ]{3,}|Education|Experience|Projects|Skills|$)",
+            text
         )
         if match:
             return match.group(2).strip()[:600]
@@ -560,27 +781,151 @@ def extract_summary(text: str) -> str:
             break
     return ""
 
+
 def extract_education(text: str) -> list:
-    try:
-        # Use a non-capturing group so we get the full matched span (not only the degree token)
-        sections = re.findall(r"(?:Bachelor|Master|B\.Tech|M\.Tech|BSc|MSc|Ph\.D)[\s\S]{0,200}", text, re.IGNORECASE)
-    except Exception:
-        sections = []
+    """
+    Improved education parsing:
+      - Detect education section
+      - Extract degree (normalized), school, year, GPA if available
+    """
     results = []
-    for section in sections:
-        match = re.search(r"(?P<degree>[A-Za-z .]+)[,|\n\s]*(?P<school>[A-Za-z ]+)[,|\n\s]*(?P<year>\d{4})", section)
-        if match:
+
+    # Narrow to education section when possible
+    try:
+        sec = re.search(
+            r"(?is)\b(education|academic qualifications|academics|qualifications)\b[:\n\-–]*"
+            r"([\s\S]*?)(?=\n\s*[A-Z][A-Za-z ]{2,30}[:\n]|"
+            r"\n\s*[A-Z ]{3,}\n|"
+            r"\n\s*(?:experience|projects|skills|certifications)\b|$)",
+            text,
+        )
+        body = sec.group(2) if sec else text
+    except Exception:
+        body = text
+
+    # Split into moderate lines and attempt to parse degree/school/year/gpa in each
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or len(line) < 3:
+            continue
+
+        # Pull year (4 digits) if present
+        year_match = re.search(r"(19|20)\d{2}", line)
+        year = year_match.group(0) if year_match else None
+
+        # GPA / CGPA (e.g., 8.2/10 or 3.7 or 3.70)
+        gpa = None
+        gpa_m = re.search(r"(?i)(?:cgpa|gpa)\s*[:\-]?\s*([0-9]+(?:\.\d{1,2})?(?:\s*/\s*[0-9]+(?:\.\d{1,2})?)?)", line)
+        if gpa_m:
+            gpa = gpa_m.group(1).strip()
+
+        # Degree heuristic (normalize via normalize_degree)
+        deg_m = re.search(
+            r"(?i)(b\.?tech|m\.?tech|b\.?e\.?|m\.?e\.?|b\.?sc|m\.?sc|b\.?a|m\.?a|b\.?com|bcom|bca|mca|mba|pgdm|ph\.?d|ll\.?b|ll\.?m|bachelor of [a-z ]+|master of [a-z ]+)",
+            line
+        )
+        degree_raw = deg_m.group(0) if deg_m else None
+        degree = normalize_degree(degree_raw) if degree_raw else None
+
+        # School/University heuristic
+        school = None
+        sch_m = re.search(r"(?i)\b([A-Za-z][A-Za-z&\.\- ]{2,80})\b(?:,?\s*(?:university|college|institute|school))", line)
+        if sch_m:
+            school = sch_m.group(0).strip()
+        else:
+            # Sometimes school precedes degree
+            sch_m2 = re.search(r"(?i)\b([A-Za-z][A-Za-z&\.\- ]{4,80})(?:,|\s)-?\s*(?:\d{4}|\b)", line)
+            if sch_m2 and not degree:
+                school = sch_m2.group(1).strip()
+
+        if degree or school or year or gpa:
             results.append({
-                "degree": match.group("degree").strip(),
-                "school": match.group("school").strip(),
-                "year": match.group("year"),
-                "gpa": "N/A"
+                "degree": degree or (degree_raw.strip() if degree_raw else None) or "",
+                "school": (school or "").strip(),
+                "year": year or "",
+                "gpa": gpa or ""
             })
+
     return results
 
+
+def _extract_experience_blocks(text: str) -> list:
+    """
+    Heuristic extractor for work history entries using common patterns:
+      - Title @ Company (Dates)
+      - Company - Title  Dates
+      - Title, Company  (Month YYYY - Present)
+    Returns list of dicts with title, company, duration, description.
+    """
+    results = []
+    # Standard month patterns
+    MONTH = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?" \
+            r"|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    DATE = rf"(?:{MONTH}\s+\d{{4}})"
+    DUR = rf"(?:{DATE}|Present|Current)"
+    DURRANGE = rf"{DUR}\s*(?:-|–|—|to)\s*{DUR}"
+
+    # Pattern 1: Title @ Company (Duration)
+    pat1 = re.compile(
+        rf"(?im)^\s*(?P<title>[\w&/.,'’\-\s]{{3,80}}?)\s*(?:@|-|,)\s*"
+        rf"(?P<company>[\w&/.,'’\-\s]{{3,80}}?)\s*(?:\(|-|\s)\s*(?P<duration>{DURRANGE})?\)?\s*$"
+    )
+
+    # Pattern 2: Company - Title (Duration)
+    pat2 = re.compile(
+        rf"(?im)^\s*(?P<company>[\w&/.,'’\-\s]{{3,80}}?)\s*(?:-|,|@)\s*"
+        rf"(?P<title>[\w&/.,'’\-\s]{{3,80}}?)\s*(?:\(|-|\s)\s*(?P<duration>{DURRANGE})?\)?\s*$"
+    )
+
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    n = len(lines)
+    for i, ln in enumerate(lines):
+        m = pat1.match(ln) or pat2.match(ln)
+        if not m:
+            continue
+        title = m.group("title").strip()
+        company = m.group("company").strip()
+        duration = (m.group("duration") or "").strip()
+
+        # Attempt to capture a short description from following bullet lines
+        desc_lines = []
+        for j in range(i + 1, min(i + 6, n)):
+            t = lines[j].strip()
+            if re.match(r"^\s*(?:[-*•·●]|[0-9]+\.)\s+", lines[j]):
+                desc_lines.append(re.sub(r"^\s*(?:[-*•·●]|[0-9]+\.)\s+", "", t))
+            else:
+                # stop if next clear heading
+                if re.match(r"^[A-Z][A-Za-z ]{2,30}:?$", t) or len(t.split()) <= 2:
+                    break
+                # allow one plain line if reasonably long
+                if len(t) > 30:
+                    desc_lines.append(t)
+                else:
+                    break
+
+        results.append({
+            "title": norm_text(title) or title,
+            "company": norm_text(company) or company,
+            "duration": duration,
+            "description": " ".join(desc_lines)[:400] if desc_lines else "Worked on various tasks and contributed to team goals."
+        })
+
+    return results
+
+
 def extract_work_history(text: str) -> list:
+    """
+    Enhanced work history extraction that first attempts structured patterns,
+    then falls back to the original simple 3-line grouping.
+    """
+    # 1) Try structured patterns
+    items = _extract_experience_blocks(text)
+    if items:
+        return items
+
+    # 2) Fallback to the prior heuristic (kept for backward compatibility)
     try:
-        jobs = re.findall(r"(?:Experience|Work)[\s\S]{0,1000}", text, re.IGNORECASE)
+        jobs = re.findall(r"(?is)\b(Experience|Work Experience|Employment History|Work)\b[\s\S]{0,1000}", text, re.IGNORECASE)
     except Exception:
         jobs = []
     results = []
@@ -599,18 +944,122 @@ def extract_work_history(text: str) -> list:
                 })
     return results
 
+
+def _split_city_country(loc: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Basic split of "City, Country" → ("City", "Country").
+    """
+    try:
+        parts = [x.strip() for x in re.split(r"[,/|-]", loc) if x.strip()]
+        if len(parts) >= 2:
+            # heuristic: first looks like city if it's 1-3 words
+            city = parts[0]
+            country = parts[-1]
+            return city, country
+    except Exception:
+        pass
+    return None, None
+
+
 def extract_location(text: str) -> str:
+    # 1) spaCy NER (GPE)
     if _HAS_NER:
         try:
             doc = nlp(text)
             locations = [ent.text.strip() for ent in doc.ents if getattr(ent, "label_", "") == "GPE"]
             if locations:
-                return locations[0]
+                return normalize_location(locations[0]) or locations[0]
         except Exception:
             pass
 
-    match = re.search(r"\b(?:located in|from|based in)\s+([A-Z][a-z]+(?: [A-Z][a-z]+)?)", text)
-    return match.group(1) if match else "N/A"
+    # 2) common explicit patterns (Address/Location/Based in)
+    m = re.search(r"(?im)\b(?:location|address|based in|located in|from)\b[: ]+\s*([A-Z][a-zA-Z]+(?:[, ]+[A-Z][a-zA-Z]+)?)", text)
+    if m:
+        cand = m.group(1).strip()
+        return normalize_location(cand) or cand
+
+    # 3) email signature style "City, Country" near contact
+    m = re.search(r"\b([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?),\s*([A-Z][a-zA-Z]+)\b", text)
+    if m:
+        cand = f"{m.group(1)}, {m.group(2)}"
+        return normalize_location(cand) or cand
+
+    return "N/A"
+
+# ----------------------------
+# Role/category classification (deterministic, confidence-backed)
+# ----------------------------
+_WORD_RE = re.compile(r"\b[a-z0-9][a-z0-9 +./_-]*\b")
+
+def _count_occurrences(blob: str, term: str) -> int:
+    """
+    Count occurrences of term in blob with word-boundary-ish regex.
+    Spaces in term are honored. Case-insensitive, blob expected lowercased.
+    """
+    term = term.strip().lower()
+    if not term:
+        return 0
+    # escape + keep wildcards simple
+    pat = re.escape(term)
+    # allow separators between words (tolerant)
+    pat = pat.replace(r"\ ", r"\s+")
+    try:
+        return len(re.findall(rf"(?<![a-z0-9]){pat}(?![a-z0-9])", blob, flags=re.IGNORECASE))
+    except Exception:
+        return blob.count(term)
+
+def _score_by_keywords(blob: str, skills_norm: List[str], terms: List[str]) -> float:
+    """
+    Score a label by summing term occurrences. Phrases weighed higher.
+    Bonus if a term is also present in skills_norm.
+    """
+    score = 0.0
+    skills_set = set(skills_norm or [])
+    for t in terms or []:
+        t = (t or "").strip().lower()
+        if not t:
+            continue
+        occ = _count_occurrences(blob, t)
+        if occ <= 0:
+            continue
+        weight = 2.0 if " " in t else 1.0
+        score += occ * weight
+        # small bonus for explicit skill presence
+        if t in skills_set:
+            score += 0.5
+    return score
+
+def _pick_best_label(blob: str, skills_norm: List[str], mapping: Dict[str, List[str]]) -> Tuple[Optional[str], float, Dict[str, float]]:
+    """
+    Return (best_label, confidence, scores_dict). Confidence is stable (0-1),
+    based on margin between top-2 scores.
+    """
+    scores: Dict[str, float] = {}
+    for label, terms in mapping.items():
+        s = _score_by_keywords(blob, skills_norm, terms or [])
+        scores[label] = s
+
+    # pick best
+    best_label = None
+    best_score = 0.0
+    second = 0.0
+    for k, v in scores.items():
+        if v > best_score:
+            second = best_score
+            best_score = v
+            best_label = k
+        elif v > second:
+            second = v
+
+    if not best_label or best_score <= 0:
+        return None, 0.0, scores
+
+    # margin-based confidence, deterministic
+    margin = best_score - second
+    # normalized margin ratio ∈ [0,1]
+    ratio = margin / (best_score if best_score > 0 else 1.0)
+    confidence = 0.6 + 0.4 * max(0.0, min(1.0, ratio))  # ∈ [0.6, 1.0]
+    return best_label, round(confidence, 3), scores
 
 # ----------------------------
 # Master extractor
@@ -644,6 +1093,62 @@ def extract_info(text: str) -> dict:
     degrees_detected = _detect_degrees(text or "")
     schools_detected = _detect_schools(text or "")
 
+    # ---------- Precompute search_blob early (used by classification) ----------
+    try:
+        parts: List[str] = []
+        parts.append(name or "")
+        parts.append(current_title or "")
+        parts.append(location or "")
+        if skills:
+            parts.append(" ".join([s for s in skills if isinstance(s, str)]))
+        if projects:
+            proj_bits: List[str] = []
+            for p in projects[:6]:
+                if isinstance(p, dict):
+                    proj_bits.append(str(p.get("name") or ""))
+                    proj_bits.append(str(p.get("description") or ""))
+                elif isinstance(p, str):
+                    proj_bits.append(p)
+            parts.append(" ".join([x for x in proj_bits if x]))
+        if summary:
+            parts.append(summary[:800])
+        # include raw (truncated)
+        raw = text or ""
+        truncate_chars = int(os.getenv("SEARCH_BLOB_TRUNCATE_CHARS", "4000"))
+        if raw:
+            parts.append(raw[:truncate_chars])
+        # Build blob using shared helper (keeps behavior aligned)
+        search_blob = make_search_blob([p for p in parts if p], truncate_chars=truncate_chars)
+        if not search_blob:
+            # fallback to local cleaner just in case
+            search_blob = _clean_text_for_blob(" ".join([p for p in parts if p]).strip())
+    except Exception:
+        search_blob = _clean_text_for_blob((text or "")[:4000])
+
+    # ---------- Normalized canonical fields ----------
+    role_source = (current_title or "").strip() or None
+    role_norm = normalize_role(role_source)
+    skills_norm = normalize_tokens(skills)
+    proj_items: List[str] = []
+    for p in projects:
+        if isinstance(p, dict):
+            if p.get("name"):
+                proj_items.append(str(p["name"]))
+            if isinstance(p.get("tech"), list):
+                proj_items.extend([str(t) for t in p["tech"] if isinstance(t, (str,))])
+    projects_norm = normalize_tokens(proj_items)
+    yoe_num = to_years_of_experience(experience_float)
+    location_norm = norm_text(location) or None
+    city, country = _split_city_country(location) if location and location != "N/A" else (None, None)
+
+    # ---------- Deterministic role/category prediction with confidence ----------
+    # Use search_blob (lowercased) + skills_norm for scoring
+    best_role, role_conf, _role_scores = _pick_best_label(search_blob, skills_norm, ROLE_KEYWORDS)
+    best_cat, cat_conf, _cat_scores = _pick_best_label(search_blob, skills_norm, CATEGORY_KEYWORDS)
+
+    # fallbacks: if classifier couldn't find, use normalized current title as role
+    predicted_role = best_role or (role_norm if role_norm else None)
+
     info = {
         "name": name or "No Name",                 # fallback
         "email": email or None,
@@ -676,9 +1181,15 @@ def extract_info(text: str) -> dict:
 
         # Location
         "location": location,
+        "location_norm": location_norm,
+        "city": city,
+        "country": country,
 
-        # Raw text
+        # Raw/Index text
         "raw_text": text,
+        "search_blob": search_blob,
+        "index_blob": search_blob,
+        "index_embedding": None,  # to be filled by upstream ML if enabled
 
         # Nested resume section
         "resume": {
@@ -695,75 +1206,23 @@ def extract_info(text: str) -> dict:
         # Additive: strong-filter helpers (education)
         "degrees_detected": degrees_detected,
         "schools_detected": schools_detected,
+
+        # ---------- Normalized canonical fields for fast filtering ----------
+        "role_norm": role_norm,
+        "skills_norm": skills_norm,
+        "projects_norm": projects_norm,
+        "yoe_num": yoe_num,
+
+        # ---------- Role & Category predictions ----------
+        "predicted_role": predicted_role or None,
+        "ml_confidence": role_conf if predicted_role else 0.0,     # for cards: Role Prediction Confidence
+        "role_confidence": role_conf if predicted_role else 0.0,   # alias
+        "category": best_cat or None,
+        "category_confidence": cat_conf if best_cat else 0.0,
     }
 
-    # ---------- NEW: Precompute normalized fields for fast exact filters ----------
-    # role_norm: from best available role field
-    role_source = info.get("currentRole") or info.get("title") or info.get("job_title")
-    info["role_norm"] = normalize_role(role_source)
-
-    # skills_norm: canonicalized skill tokens
-    info["skills_norm"] = normalize_tokens(info.get("skills"))
-
-    # projects_norm: combine project names + tech tags (keep concise)
-    proj_items: List[str] = []
-    for p in projects:
-        if isinstance(p, dict):
-            if p.get("name"):
-                proj_items.append(str(p["name"]))
-            if isinstance(p.get("tech"), list):
-                proj_items.extend([str(t) for t in p["tech"] if isinstance(t, (str,))])
-    info["projects_norm"] = normalize_tokens(proj_items)
-
-    # yoe_num: integer-ish years for indexed range queries
-    info["yoe_num"] = to_years_of_experience(info.get("experience"))
-
-    # ---------- Precompute search_blob for fast ANN/text recall ----------
-    try:
-        parts: List[str] = []
-        parts.append(info.get("name") or "")
-        parts.append(info.get("currentRole") or info.get("title") or "")
-        parts.append(info.get("location") or "")
-        # skills
-        if info.get("skills"):
-            parts.append(" ".join([s for s in info["skills"] if isinstance(s, str)]))
-        # projects
-        if projects:
-            proj_bits: List[str] = []
-            for p in projects[:6]:
-                if isinstance(p, dict):
-                    proj_bits.append(str(p.get("name") or ""))
-                    proj_bits.append(str(p.get("description") or ""))
-                elif isinstance(p, str):
-                    proj_bits.append(p)
-            parts.append(" ".join([x for x in proj_bits if x]))
-        # summary (short)
-        if summary:
-            parts.append(summary[:600])
-        # total experience (numeric)
-        parts.append(str(experience_float))
-        # raw text (truncate to keep blob compact)
-        raw = text or ""
-        truncate_chars = int(os.getenv("SEARCH_BLOB_TRUNCATE_CHARS", "4000"))
-        if raw:
-            parts.append(raw[:truncate_chars])
-
-        search_blob = _clean_text_for_blob(" ".join([p for p in parts if p]).strip())
-        info["search_blob"] = search_blob
-    except Exception:
-        # Safe fallback: at least include raw_text cleaned
-        try:
-            info["search_blob"] = _clean_text_for_blob((text or "")[:4000])
-        except Exception:
-            info["search_blob"] = ""
-
-    # ---------- Additive fields for ANN indexing (non-disruptive) ----------
-    info["index_blob"] = info.get("search_blob", "")
-    # Embeddings, if any, should be filled by the upstream pipeline;
-    # keep placeholder None to avoid breaking consumers.
-    info["index_embedding"] = None
-
     return info
+
 
 def parse_resume_file(filename: str, content: bytes) -> dict:
     """

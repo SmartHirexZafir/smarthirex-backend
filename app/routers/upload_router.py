@@ -44,8 +44,8 @@ router = APIRouter()
 ALLOWED_EXTS = {".pdf", ".doc", ".docx"}
 MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 
-# ✅ UI timing hints for the frontend (ms)
-TOAST_HOLD_MS = 2500          # green toast ~2–3s
+# ✅ UI timing hints for the frontend (ms) — toaster should disappear ~3–4s
+TOAST_HOLD_MS = 3500          # green toast ~3.5s
 PROGRESS_HOLD_MS = 2000       # progress bar stays ~2s after 100%
 
 
@@ -120,8 +120,8 @@ async def upload_resumes(
 
         # --- Classic ML prediction (kept backward-compatible; guard if assets missing) ---
         cleaned = clean_text(raw_text)
-        predicted_label: str = "Unknown"
-        confidence_pct: float = 0.0
+        classic_ml_label: str = "Unknown"
+        classic_ml_conf_pct: float = 0.0
         try:
             if vectorizer is not None and model is not None and label_encoder is not None:
                 features = vectorizer.transform([cleaned])
@@ -129,11 +129,11 @@ async def upload_resumes(
                 # predict_proba may not exist; fallback safe
                 _proba = getattr(model, "predict_proba", lambda x: [[0.0]])(features)[0]
                 conf_val: float = float(max(_proba)) if isinstance(_proba, (list, tuple)) and _proba else 0.0
-                predicted_label = label_encoder.inverse_transform(prediction)[0]
-                confidence_pct = round(conf_val * 100.0, 2)
+                classic_ml_label = label_encoder.inverse_transform(prediction)[0]
+                classic_ml_conf_pct = round(conf_val * 100.0, 2)
         except Exception:
-            predicted_label = "Unknown"
-            confidence_pct = 0.0
+            classic_ml_label = "Unknown"
+            classic_ml_conf_pct = 0.0
 
         # ---------- Construct the doc to insert ----------
         # Stable ID (avoids an extra DB roundtrip)
@@ -199,35 +199,61 @@ async def upload_resumes(
         resume_data["ownerUserId"] = owner_id_str
 
         # ---------- Canonicalize & map role across synonyms ----------
-        # Prefer parsed role; if missing/placeholder, fallback to ML-predicted label.
+        # Prefer parser-provided predicted_role; if missing/placeholder, fallback to parsed titles or classic ML.
         def _bad_role(s: Any) -> bool:
             t = (str(s or "").strip().lower())
             return (not t) or t in {"n/a", "na", "none", "-", "unknown", "not specified"}
 
         parser_role = (resume_data.get("currentRole") or resume_data.get("title") or resume_data.get("job_title") or "").strip()
-        ml_role = (predicted_label or "").strip()
+        fallback_ml_role = (classic_ml_label or "").strip()
 
-        canonical_role = parser_role if not _bad_role(parser_role) else (ml_role if not _bad_role(ml_role) else "")
+        if not resume_data.get("predicted_role") or _bad_role(resume_data.get("predicted_role")):
+            canonical_role = parser_role if not _bad_role(parser_role) else (fallback_ml_role if not _bad_role(fallback_ml_role) else "")
+            if canonical_role:
+                resume_data["predicted_role"] = canonical_role
+                resume_data["currentRole"] = canonical_role
+                # refresh normalized role to align with canonical
+                try:
+                    resume_data["role_norm"] = normalize_role(canonical_role)
+                except Exception:
+                    pass
 
-        if canonical_role:
-            resume_data["predicted_role"] = canonical_role
-            resume_data["category"] = canonical_role
-            resume_data["currentRole"] = canonical_role
-            # refresh normalized role to align with canonical
+        # Do NOT clobber category if parser already provided it; only set if empty
+        if not resume_data.get("category") or _bad_role(resume_data.get("category")):
+            # fallback: align category to predicted_role if nothing better exists
+            if resume_data.get("predicted_role") and not _bad_role(resume_data["predicted_role"]):
+                resume_data["category"] = resume_data["predicted_role"]
+
+        # Keep classic ML outputs (namespaced to avoid collisions)
+        resume_data["legacy_ml_predicted_role"] = fallback_ml_role or "Unknown"
+        resume_data["legacy_ml_confidence_pct"] = classic_ml_conf_pct
+
+        # ---------- Role Prediction Confidence (stable, deterministic) ----------
+        # Prefer role_confidence from resume_parser (0–1). If absent, derive from classic ML %.
+        role_conf = 0.0
+        try:
+            if isinstance(resume_data.get("role_confidence"), (int, float)) and float(resume_data["role_confidence"]) > 0:
+                role_conf = float(resume_data["role_confidence"])
+            elif classic_ml_conf_pct > 0:
+                role_conf = round(float(classic_ml_conf_pct) / 100.0, 3)
+        except Exception:
+            role_conf = 0.0
+
+        resume_data["role_confidence"] = role_conf                      # 0–1
+        resume_data["role_confidence_pct"] = round(role_conf * 100.0, 2)  # 0–100
+
+        # For backward compatibility, normalize any existing ml_confidence to 0–1 and provide pct variant.
+        if "ml_confidence" in resume_data:
             try:
-                resume_data["role_norm"] = normalize_role(canonical_role)
+                v = float(resume_data["ml_confidence"])
+                resume_data["ml_confidence"] = v / 100.0 if v > 1.0 else v
             except Exception:
-                pass
+                resume_data["ml_confidence"] = role_conf
         else:
-            # keep fields searchable/non-null
-            resume_data["predicted_role"] = "N/A"
-            resume_data["category"] = "N/A"
-            resume_data["currentRole"] = resume_data.get("currentRole") or "N/A"
+            resume_data["ml_confidence"] = role_conf
+        resume_data["ml_confidence_pct"] = round(float(resume_data["ml_confidence"]) * 100.0, 2)
 
-        # Still keep ML outputs (read-only, for analytics/debug/UI)
-        resume_data["ml_predicted_role"] = ml_role or "Unknown"
-        resume_data["ml_confidence"] = confidence_pct
-
+        # File / identity & basics
         resume_data["filename"] = filename
         resume_data["experience"] = resume_data.get("experience", numeric_years)
         resume_data["name"] = (resume_data.get("name") or "").strip() or "No Name"
@@ -371,11 +397,12 @@ async def upload_resumes(
         parsed_resumes.append({
             "_id": resume_data["_id"],
             "name": resume_data["name"],
-            "predicted_role": resume_data["predicted_role"],
-            "category": resume_data["category"],
+            "predicted_role": resume_data.get("predicted_role"),
+            "category": resume_data.get("category"),
             "experience": resume_data["experience"],
             "location": resume_data["location"],
-            "confidence": resume_data.get("ml_confidence", 0.0),
+            # For cards: show Role Prediction Confidence as percent (stable)
+            "confidence": resume_data.get("role_confidence_pct", 0.0),
             "email": resume_data["email"],
             "phone": resume_data["phone"],
             "skills": resume_data["skills"],
@@ -410,7 +437,7 @@ async def upload_resumes(
             "parse_error": skipped_parse_error,
             "filenames": skipped_files,  # per-reason filename lists
         },
-        # ➕ UI hints the frontend will respect
+        # ➕ UI hints the frontend will respect (toaster auto-dismiss in ~3–4s)
         "ui": {
             "toast": {
                 "type": "success" if total_skipped == 0 else "warning",

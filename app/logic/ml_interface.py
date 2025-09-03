@@ -583,6 +583,68 @@ def best_role_by_similarity(text: str, roles: Optional[List[str]] = None, thresh
 
 
 # ---------------------------------------------------------
+# Number-words & comparator normalization (broader coverage)
+# ---------------------------------------------------------
+_NUM_ONES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9
+}
+_NUM_TEENS = {
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19
+}
+_NUM_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90
+}
+
+def _replace_number_words_for_years(p: str) -> str:
+    """
+    Convert 'four years', 'twenty three yrs' → '4 years', '23 yrs' (conservative).
+    """
+    def repl(m: re.Match) -> str:
+        a = m.group(1).lower()
+        b = (m.group(2) or "").lower().strip()
+        unit = m.group(3)
+        val = None
+        if a in _NUM_TEENS:
+            val = _NUM_TEENS[a]
+        elif a in _NUM_TENS:
+            val = _NUM_TENS[a] + (_NUM_ONES.get(b, 0) if b else 0)
+        else:
+            val = _NUM_ONES.get(a, None)
+            if val is None and a == "hundred":
+                val = 100
+        if val is None:
+            return m.group(0)
+        return f"{val} {unit}"
+    # tens + ones
+    p = re.sub(rf"\b({'|'.join(_NUM_TENS.keys())})\s+({'|'.join(_NUM_ONES.keys())})\s*(years?|yrs?|yoe)\b", repl, p, flags=re.IGNORECASE)
+    # teens / tens only / ones
+    p = re.sub(rf"\b({'|'.join(list(_NUM_TEENS.keys()) + list(_NUM_TENS.keys()) + list(_NUM_ONES.keys()) + ['hundred'])})\s*(years?|yrs?|yoe)\b",
+               lambda m: f"{_NUM_TEENS.get(m.group(1).lower(), _NUM_TENS.get(m.group(1).lower(), _NUM_ONES.get(m.group(1).lower(), 100))) } {m.group(2)}",
+               p, flags=re.IGNORECASE)
+    return p
+
+def _normalize_comparator_words(p: str) -> str:
+    """
+    Map 'less than or equal to', 'greater than equal to', 'atleast', 'upto' etc. to symbols or canonical phrases.
+    """
+    p = re.sub(r"\bat\s*least\b|\batleast\b", ">= ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\bat\s*most\b|\bno more than\b|\bnot more than\b|\bup ?to\b|\bupto\b", "<= ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\bless than or equal to\b|\bless than equal to\b", "<= ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\bgreater than or equal to\b|\bgreater than equal to\b", ">= ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\bless than\b", "< ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\bmore than\b|\bgreater than\b|\bover\b", "> ", p, flags=re.IGNORECASE)
+    return p
+
+def _prenormalize_experience_text(p: str) -> str:
+    p2 = _replace_number_words_for_years(p)
+    p2 = _normalize_comparator_words(p2)
+    return p2
+
+
+# ---------------------------------------------------------
 # Semantic matching (owner-scoped + strict/soft filtering)
 # ---------------------------------------------------------
 async def get_semantic_matches(
@@ -662,6 +724,9 @@ async def get_semantic_matches(
     # -----------------------------
     # Parse filters from prompt
     # -----------------------------
+    # Pre-normalize to catch number-words and comparator phrases
+    parsed_for_filters = _prenormalize_experience_text(parsed_text)
+
     min_years, max_years, strict_ge, strict_le = (None, None, None, None)
     must_include_skills: List[str] = []
     projects_required: bool = False
@@ -674,11 +739,11 @@ async def get_semantic_matches(
 
     # Parse everything, then override from options if provided
     # (parsing is cheap and keeps backward compatibility)
-    _p_min, _p_max, _p_ge, _p_le = _parse_experience_filters(parsed_text)
-    _p_skills = _parse_must_include_skills(parsed_text)
-    _p_proj = _parse_projects_required(parsed_text)
-    _p_loc = _parse_location(parsed_text)
-    _p_role = _parse_role(parsed_text)
+    _p_min, _p_max, _p_ge, _p_le = _parse_experience_filters(parsed_for_filters)
+    _p_skills = _parse_must_include_skills(parsed_for_filters)
+    _p_proj = _parse_projects_required(parsed_for_filters)
+    _p_loc = _parse_location(parsed_for_filters)
+    _p_role = _parse_role(parsed_for_filters)
     _p_schools, _p_degrees = _parse_education_requirements(raw_prompt)
     _p_must_phr, _p_excl_phr = _parse_phrase_requirements(raw_prompt)
 
@@ -844,9 +909,9 @@ async def get_semantic_matches(
         # Prefer ml_confidence if present; fall back to legacy 'confidence'
         conf_val = cv.get("ml_confidence", cv.get("confidence", 0))
         try:
-            confidence = round(float(conf_val or 0), 2)
+            role_pred_confidence = round(float(conf_val or 0), 2)
         except Exception:
-            confidence = 0.0
+            role_pred_confidence = 0.0
 
         cleaned_resume_text = clean_text(raw_text)
         skills = cv.get("skills", []) or []
@@ -900,17 +965,13 @@ async def get_semantic_matches(
             if not literal_hit:
                 continue  # exact mode: only keep literal hits
 
-            # derive a role score like the existing score_components ("role_match")
-            role_score_exact = 1.0 if (requested_role and clean_text(original_predicted_role) == requested_role) else 0.7
-            role_pred_score_pct = round(max(0.0, min(1.0, role_score_exact)) * 100.0, 2)
-
-            # Build simple item, score 100 for exact
+            # Build simple item, treat prompt matching as 100 in exact mode
             item = {
                 "_id": cv_id,
                 "name": (cv.get("name") or "").strip() or "No Name",
                 "predicted_role": original_predicted_role,
                 "category": cv.get("category", original_predicted_role),
-                "ml_predicted_role": cv.get("ml_predicted_role"),  # ✅ surface ML role too
+                "ml_predicted_role": cv.get("ml_predicted_role"),
                 "experience": experience,
                 "experience_display": experience_display,
                 "experience_rounded": experience_rounded,
@@ -921,14 +982,16 @@ async def get_semantic_matches(
                 "skillsOverflowCount": max(0, len(skills) - min(6, len(skills))),
                 "resume_url": cv.get("resume_url", ""),
                 "semantic_score": 100.0,
-                "confidence": confidence,
-                "ml_confidence": confidence,              # alias for UI
-                "role_prediction_score": role_pred_score_pct,  # ✅ Role Prediction Confidence
+                "confidence": role_pred_confidence,                 # kept for backward compatibility
+                "ml_confidence": role_pred_confidence,              # ML classifier confidence
+                "role_prediction_confidence": role_pred_confidence, # ✅ Role Prediction Confidence (prompt-invariant)
+                "role_prediction_score": role_pred_confidence,      # (alias)
                 "score_type": "Exact phrase match",
                 "final_score": 100.0,
+                "prompt_matching_score": 100.0,                     # ✅ Prompt Matching Score
                 "score_components": {
-                    "role_match": 1.0 if (requested_role and clean_text(original_predicted_role) == requested_role) else 0.7,
-                    "skills_match": 1.0 if all(clean_text(s) in [clean_text(x) for x in skills] for s in must_include_skills) else 0.6,
+                    "role_match": 1.0,
+                    "skills_match": 1.0,
                     "experience_match": 1.0,
                     "projects_match": 1.0,
                     "semantic_score": 100.0
@@ -954,7 +1017,6 @@ async def get_semantic_matches(
                 "nearLiteralHit": False,
             }
             strict_matches.append(item)
-            # continue to next CV (we don't need full scoring in exact mode)
             continue
 
         # ===== NORMAL / SEMANTIC MODE =====
@@ -1103,7 +1165,7 @@ async def get_semantic_matches(
             "name": (cv.get("name") or "").strip() or "No Name",
             "predicted_role": original_predicted_role,
             "category": cv.get("category", original_predicted_role),
-            "ml_predicted_role": cv.get("ml_predicted_role"),  # ✅ surface ML role too
+            "ml_predicted_role": cv.get("ml_predicted_role"),
             "experience": experience,
             "experience_display": experience_display,
             "experience_rounded": experience_rounded,
@@ -1114,11 +1176,16 @@ async def get_semantic_matches(
             "skillsOverflowCount": overflow,
             "resume_url": cv.get("resume_url", ""),
             "semantic_score": semantic_score,
-            "confidence": confidence,
-            "ml_confidence": confidence,                         # alias for UI
-            "role_prediction_score": round(max(0.0, min(1.0, role_score)) * 100.0, 2),  # ✅ Role Prediction Confidence
+            # Keep legacy 'confidence' fields (model's role prediction confidence)
+            "confidence": role_pred_confidence,
+            "ml_confidence": role_pred_confidence,
+            # ✅ Role Prediction Confidence (prompt-invariant, from ML classifier)
+            "role_prediction_confidence": role_pred_confidence,
+            "role_prediction_score": role_pred_confidence,  # alias for older UIs
             "score_type": "Weighted Role/Skills/Exp/Projects",
             "final_score": final_score,
+            # ✅ Explicit Prompt Matching Score (for UI clarity)
+            "prompt_matching_score": final_score,
             "score_components": {
                 "role_match": round(role_score, 4),
                 "skills_match": round(skills_score, 4),
@@ -1251,7 +1318,7 @@ def _parse_experience_filters(prompt: str) -> Tuple[Optional[float], Optional[fl
     """
     p = prompt
     # Range patterns first
-    m = re.search(rf"(?:between|from)\s+{_EXP_NUM}\s*(?:to|and|-|–|—)\s*{_EXP_NUM}\s*(?:years|yrs)\b", p)
+    m = re.search(rf"(?:between|from)\s+{_EXP_NUM}\s*(?:to|and|-|–|—)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)\b", p)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
         if lo > hi:
@@ -1263,49 +1330,45 @@ def _parse_experience_filters(prompt: str) -> Tuple[Optional[float], Optional[fl
         if lo > hi:
             lo, hi = hi, lo
         return lo, hi, None, None
-    m = re.search(rf"{_EXP_NUM}\s*[-–—]\s*{_EXP_NUM}\s*(?:years|yrs)\b", p)
+    m = re.search(rf"{_EXP_NUM}\s*[-–—]\s*{_EXP_NUM}\s*(?:years|yrs|yoe)\b", p)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
         if lo > hi:
             lo, hi = hi, lo
         return lo, hi, None, None
 
-    # One-sided / comparative
-    m = re.search(rf"(?:less than|under|below)\s+{_EXP_NUM}\s*(?:years|yrs)\b", p)
+    # One-sided / comparative (broader wording support)
+    m = re.search(rf"(?:less than or equal to|<=)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)?\b", p)
     if m:
-        return None, float(m.group(1)), None, False  # strict <
+        return None, float(m.group(1)), None, True  # <=
 
-    m = re.search(rf"(?:greater than|more than|over)\s+{_EXP_NUM}\s*(?:years|yrs)\b", p)
-    if m:
-        return float(m.group(1)) + 1e-9, None, False, None  # strict >
-
-    m = re.search(rf"(?:at least|min(?:imum)?)\s+{_EXP_NUM}\s*(?:years|yrs)\b", p)
+    m = re.search(rf"(?:greater than or equal to|>=)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)?\b", p)
     if m:
         return float(m.group(1)), None, True, None  # >=
 
-    m = re.search(rf">=\s*{_EXP_NUM}", p)
-    if m:
-        return float(m.group(1)), None, True, None
-
-    m = re.search(rf"<=\s*{_EXP_NUM}", p)
-    if m:
-        return None, float(m.group(1)), None, True
-
-    m = re.search(rf">\s*{_EXP_NUM}", p)
-    if m:
-        return float(m.group(1)) + 1e-9, None, False, None  # strict >
-
-    m = re.search(rf"<\s*{_EXP_NUM}", p)
+    m = re.search(rf"(?:less than|under|below|<)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)?\b", p)
     if m:
         return None, float(m.group(1)), None, False  # strict <
 
+    m = re.search(rf"(?:greater than|more than|over|>)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)?\b", p)
+    if m:
+        return float(m.group(1)) + 1e-9, None, False, None  # strict >
+
+    m = re.search(rf"(?:at least|min(?:imum)?|>=)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)?\b", p)
+    if m:
+        return float(m.group(1)), None, True, None  # >=
+
+    m = re.search(rf"(?:at most|max(?:imum)?|up to|<=)\s*{_EXP_NUM}\s*(?:years|yrs|yoe)?\b", p)
+    if m:
+        return None, float(m.group(1)), None, True  # <=
+
     # Simple "3+ years"
-    m = re.search(rf"{_EXP_NUM}\s*\+\s*(?:years|yrs)\b", p)
+    m = re.search(rf"{_EXP_NUM}\s*\+\s*(?:years|yrs|yoe)\b", p)
     if m:
         return float(m.group(1)), None, True, None
 
     # Simple "7 years"
-    m = re.search(rf"{_EXP_NUM}\s*(?:years|yrs)\b", p)
+    m = re.search(rf"{_EXP_NUM}\s*(?:years|yrs|yoe)\b", p)
     if m:
         return float(m.group(1)), None, True, None
 

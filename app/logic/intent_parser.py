@@ -388,6 +388,64 @@ def _projects_required_flag(prompt: str) -> bool:
         or re.search(r"\b(projects? section)\b", p)
     )
 
+# ---------------------------
+# Number words → numbers (for broader coverage)
+# ---------------------------
+_NUM_WORDS: Dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100,
+}
+
+def _word_to_num(token: str) -> Optional[float]:
+    """Convert 'four' / 'twenty-five' → numeric float."""
+    t = token.strip().lower()
+    if re.match(r"^\d+(?:\.\d+)?$", t):
+        try:
+            return float(t)
+        except Exception:
+            return None
+    if t in _NUM_WORDS:
+        return float(_NUM_WORDS[t])
+    if "-" in t:
+        parts = t.split("-")
+        if all(p in _NUM_WORDS for p in parts):
+            total = 0
+            for p in parts:
+                v = _NUM_WORDS[p]
+                if v == 100 and total > 0:
+                    total *= v
+                else:
+                    total += v
+            return float(total)
+    return None
+
+def _tok_to_num(token: str) -> Optional[float]:
+    """Helper that tries digits first, then number words."""
+    token = token.strip().lower()
+    if re.match(r"^\d+(?:\.\d+)?$", token):
+        try:
+            return float(token)
+        except Exception:
+            return None
+    return _word_to_num(token)
+
+def _find_num_after_phrase(p: str, phrase: str) -> Optional[float]:
+    """
+    Find a number or number-word after a phrase, like:
+      phrase ... <num> (years|yrs)?
+    """
+    ph = re.escape(phrase)
+    # allow a few words between phrase and number
+    m = re.search(rf"{ph}\s+(?:[a-z ]+\s+)?([a-z0-9\-\.]+)\s*(?:years?|yrs?|yr|yoe)?\b", p)
+    if not m:
+        return None
+    return _tok_to_num(m.group(1))
+
 def _extract_experience(prompt: str) -> Dict[str, float]:
     """
     Supports:
@@ -397,7 +455,9 @@ def _extract_experience(prompt: str) -> Dict[str, float]:
       - "= 4 years", "exactly 4 years" -> eq
       - "min 3", "max 7"
       - Symbols: <=, >=, <, >
-      - ✅ Also accepts "yrs", "yr", and "yoe" as year indicators; and handles "atleast"
+      - ✅ Accepts number-words: "four years", "at least five", "between three and five"
+      - ✅ Accepts phrase operators: "less than or equal to", "greater than or equal to"
+      - ✅ Accepts 'yrs', 'yr', 'yoe'
     Returns:
       Either {"op":"<|>|=","years":X} or {"gte":A,"lte":B} or {"gte":X} / {"lte":Y}
     """
@@ -405,82 +465,112 @@ def _extract_experience(prompt: str) -> Dict[str, float]:
     exp: Dict[str, float] = {}
 
     YR = r"(?:years?|yrs?|yr|yoe)"
-    NUM = r"(\d+(?:\.\d+)?)"
+    NUM = r"([a-z0-9\-\.]+)"  # allow words like "four" / "twenty-five"
+
+    def num_of(group: str) -> Optional[float]:
+        return _tok_to_num(group)
 
     # Symbols: <=, >=, <, >
     m = re.search(rf"\b>=\s*{NUM}\s*{YR}?\b", p)
     if m:
-        return {"gte": float(m.group(1))}
+        n = num_of(m.group(1))
+        if n is not None:
+            return {"g te".replace(" ", ""): float(n)}
     m = re.search(rf"\b<=\s*{NUM}\s*{YR}?\b", p)
     if m:
-        return {"lte": float(m.group(1))}
+        n = num_of(m.group(1))
+        if n is not None:
+            return {"lte": float(n)}
     m = re.search(rf"\b>\s*{NUM}\s*{YR}?\b", p)
     if m:
-        return {"op": ">", "years": float(m.group(1))}
+        n = num_of(m.group(1))
+        if n is not None:
+            return {"op": ">", "years": float(n)}
     m = re.search(rf"\b<\s*{NUM}\s*{YR}?\b", p)
     if m:
-        return {"op": "<", "years": float(m.group(1))}
+        n = num_of(m.group(1))
+        if n is not None:
+            return {"op": "<", "years": float(n)}
+
+    # Phrase operators (<= and >=)
+    for phrase in ["less than or equal to", "less than equal to", "at most", "no more than", "up to", "maximum", "max"]:
+        n = _find_num_after_phrase(p, phrase)
+        if n is not None:
+            exp["lte"] = float(n)
+            break
+    for phrase in ["greater than or equal to", "at least", "minimum", "min", "not less than"]:
+        n = _find_num_after_phrase(p, phrase)
+        if n is not None:
+            exp["gte"] = float(n)
+            break
+
+    # Strict < / > phrases
+    for phrase in ["less than", "under", "below"]:
+        n = _find_num_after_phrase(p, phrase)
+        if n is not None:
+            return {"op": "<", "years": float(n)}
+    for phrase in ["greater than", "more than", "over", "above"]:
+        n = _find_num_after_phrase(p, phrase)
+        if n is not None:
+            return {"op": ">", "years": float(n)}
 
     # between X and Y / between X to Y
     m = re.search(rf"\bbetween\s+{NUM}\s+(?:and|to)\s+{NUM}\s*{YR}?\b", p)
     if m:
-        lo, hi = float(m.group(1)), float(m.group(2))
-        if lo > hi:
-            lo, hi = hi, lo
-        return {"gte": lo, "lte": hi}
+        a = num_of(m.group(1))
+        b = num_of(m.group(2))
+        if a is not None and b is not None:
+            lo, hi = (a, b) if a <= b else (b, a)
+            return {"gte": float(lo), "lte": float(hi)}
 
-    # range like "3-5 years" / "3–5 years" / "3 — 5 years" / "3 to 5 yrs"
+    # range like "3-5 years" / "three-to five years" (hyphenated words supported)
     m = re.search(rf"\b{NUM}\s*(?:-|–|—|to)\s*{NUM}\s*{YR}?\b", p)
     if m:
-        lo, hi = float(m.group(1)), float(m.group(2))
-        if lo > hi:
-            lo, hi = hi, lo
-        return {"gte": lo, "lte": hi}
-
-    # >= / at least / atleast / minimum / 3+ years
-    if re.search(r"\b(at least|atleast|min(?:imum)?)\b", p) or re.search(rf"\b{NUM}\s*\+\s*{YR}\b", p):
-        m = re.search(rf"\b{NUM}\s*\+?\s*{YR}\b", p)
-        if m:
-            exp["gte"] = float(m.group(1))
-            # keep parsing in case an upper bound is present
-
-    # > / greater than / more than / over
-    m = re.search(rf"\b(greater than|more than|over)\s+{NUM}\s*{YR}\b", p)
-    if m:
-        return {"op": ">", "years": float(m.group(2))}
-
-    # <= / at most / maximum / up to
-    m = re.search(rf"\b(at most|max(?:imum)?|up to)\s+{NUM}\s*{YR}?\b", p)
-    if m:
-        exp["lte"] = float(m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1))
-
-    # < / less than / under / below
-    m = re.search(rf"\b(less than|under|below)\s+{NUM}\s*{YR}\b", p)
-    if m:
-        return {"op": "<", "years": float(m.group(2))}
+        a = num_of(m.group(1))
+        b = num_of(m.group(2))
+        if a is not None and b is not None:
+            lo, hi = (a, b) if a <= b else (b, a)
+            return {"gte": float(lo), "lte": float(hi)}
 
     # exact = / equals / exactly
-    m = re.search(rf"\b(exactly|equal(?:s)? to|=)\s+{NUM}\s*{YR}?\b", p)
+    m = re.search(rf"\b(exactly|equal(?:s)? to|=)\s*{NUM}\s*{YR}?\b", p)
     if m:
-        return {"op": "=", "years": float(m.group(2))}
+        n = num_of(m.group(2)) if m.lastindex and m.lastindex >= 2 else num_of(m.group(1))
+        if n is not None:
+            return {"op": "=", "years": float(n)}
+
+    # >= / 3+ years / 'at least' handled earlier, but keep a safety net
+    m = re.search(rf"\b{NUM}\s*\+\s*{YR}?\b", p)
+    if m:
+        n = num_of(m.group(1))
+        if n is not None:
+            exp["gte"] = float(n)
 
     # explicit min/max X years (allow missing year token)
     m = re.search(rf"\bmin\s+{NUM}(?:\s*{YR})?\b", p)
     if m:
-        exp["gte"] = float(m.group(1))
-    m = re.search(rf"\bmax\s+{NUM}(?:\s*{YR})?\b", p)
+        n = num_of(m.group(1))
+        if n is not None:
+            exp["gte"] = float(n)
+    m = re.search(rf"\bmax(?:imum)?\s+{NUM}(?:\s*{YR})?\b", p)
     if m:
-        exp["lte"] = float(m.group(1))
+        n = num_of(m.group(1))
+        if n is not None:
+            exp["lte"] = float(n)
 
-    # simple "X yrs"/"X yoe"
+    # simple "X yrs"/"X yoe"/"X years" with digits or words → treat as >= X
     m = re.search(rf"\b{NUM}\s*{YR}\b", p)
     if m and "gte" not in exp and "lte" not in exp and "op" not in exp:
-        exp["gte"] = float(m.group(1))
+        n = num_of(m.group(1))
+        if n is not None:
+            exp["gte"] = float(n)
 
     # "X+" (no unit) → treat as >= X
     m = re.search(rf"\b{NUM}\+\b", p)
     if m and "gte" not in exp:
-        exp["gte"] = float(m.group(1))
+        n = num_of(m.group(1))
+        if n is not None:
+            exp["gte"] = float(n)
 
     return exp
 
