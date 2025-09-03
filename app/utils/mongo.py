@@ -43,6 +43,8 @@ async def verify_mongo_connection():
         collections = await db.list_collection_names()
         print(f"✅ MongoDB connected to '{MONGO_DB_NAME}'. Collections: {collections}")
         # ✅ Indexes (idempotent)
+        await ensure_users_indexes()  # ← added for Google Login email/google_id lookups
+        await ensure_email_verification_indexes()  # ← added to support verification flow
         await ensure_meetings_indexes()
         await ensure_parsed_resumes_indexes()
         await ensure_chat_queries_indexes()
@@ -113,6 +115,38 @@ async def insert_unique_resume(doc: dict, owner_user_id: Optional[str] = None) -
 # -----------------------------------------------------------------------------
 # ✅ Index helpers
 # -----------------------------------------------------------------------------
+
+async def ensure_users_indexes() -> None:
+    """
+    Helpful indexes for the `users` collection.
+    Needed for fast lookups and uniqueness with Google Login.
+    Safe to call multiple times.
+    """
+    try:
+        # Primary unique identity
+        await db.users.create_index("email", unique=True)
+        # Google account linkage
+        await db.users.create_index("google_id")
+        await db.users.create_index([("auth_provider", 1)])
+        # Common query paths
+        await db.users.create_index([("created_at", -1)])
+        await db.users.create_index([("updated_at", -1)])
+    except Exception as e:
+        print("⚠️ Failed to create users indexes:", e)
+
+
+async def ensure_email_verification_indexes() -> None:
+    """
+    Indexes for email_verification_tokens used during signup verification.
+    """
+    try:
+        await db.email_verification_tokens.create_index("token", unique=True)
+        await db.email_verification_tokens.create_index([("user_id", 1)])
+        await db.email_verification_tokens.create_index([("expires_at", 1)])
+        await db.email_verification_tokens.create_index([("used", 1)])
+    except Exception as e:
+        print("⚠️ Failed to create email_verification_tokens indexes:", e)
+
 
 async def ensure_meetings_indexes() -> None:
     """

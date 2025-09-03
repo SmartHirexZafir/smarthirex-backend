@@ -1,6 +1,6 @@
 # app/routers/auth_router.py
 
-from fastapi import APIRouter, HTTPException, Request, status, Body, Query
+from fastapi import APIRouter, HTTPException, Request, status, Body, Query, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -8,9 +8,11 @@ from app.utils.mongo import db
 from app.utils.emailer import send_verification_email
 from dotenv import load_dotenv
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Dict
 from datetime import datetime, timedelta, timezone  # ✅ include timezone for aware datetimes
-import jwt, uuid, os
+import jwt, uuid, os, json
+from urllib.parse import urlencode, quote_plus
+from urllib.request import urlopen, Request as UrlRequest
 
 load_dotenv()
 
@@ -21,8 +23,16 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = os.getenv("JWT_SECRET", "smarthirex-secret")
 ALGORITHM = "HS256"
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:10000").rstrip("/")
 VERIFICATION_TTL_HOURS = 24
 JWT_EXPIRES_HOURS = int(os.getenv("JWT_EXPIRES_HOURS", "168"))  # ✅ default 7 days
+
+# --- Google OAuth Settings ---
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"  # token verification endpoint
 
 # ----------- Models -----------
 
@@ -37,6 +47,11 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+class CompleteProfileRequest(BaseModel):
+    name: str
+    role: str
+    company: str
 
 # ----------- Helpers -----------
 
@@ -82,6 +97,84 @@ def _wants_json(request: Request, redirect_param: Optional[str] = None) -> bool:
         return True
     accept = (request.headers.get("accept") or "").lower()
     return "application/json" in accept
+
+def _app_jwt_for_user(user: Dict) -> str:
+    """Issue our application JWT for a user record."""
+    now = _now_utc()
+    return jwt.encode(
+        {
+            "email": user["email"],
+            "id": str(user["_id"]),
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(hours=JWT_EXPIRES_HOURS)).timestamp()),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
+
+def _serialize_user_for_client(user: Dict) -> Dict:
+    """Return a client-safe user payload (mirrors existing login shape + adds convenience fields)."""
+    first = user.get("firstName", "") or ""
+    last = user.get("lastName", "") or ""
+    display_name = (first + " " + last).strip() or user.get("displayName", "")
+    role = user.get("jobTitle", "") or user.get("role", "")
+    return {
+        "email": user.get("email", ""),
+        "firstName": first,
+        "lastName": last,
+        "company": user.get("company", "") or "",
+        "jobTitle": user.get("jobTitle", "") or "",
+        # Convenience fields used by the frontend Google flow:
+        "name": display_name,
+        "role": role,
+        "id": str(user.get("_id")),
+        "authProvider": user.get("auth_provider", "password"),
+    }
+
+def _split_name(full_name: str) -> Dict[str, str]:
+    full_name = (full_name or "").strip()
+    if not full_name:
+        return {"firstName": "", "lastName": ""}
+    parts = full_name.split()
+    if len(parts) == 1:
+        return {"firstName": parts[0], "lastName": ""}
+    return {"firstName": " ".join(parts[:-1]), "lastName": parts[-1]}
+
+# ----------- Auth Dependency (moved up so it exists before use) -----------
+
+async def get_current_user(request: Request):
+    """
+    Dependency to extract and validate JWT from Authorization header or cookies.
+    Returns user object with `.id` and `.email`.
+    """
+    token: Optional[str] = None
+
+    # Try Authorization header
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1]
+
+    # Try cookies
+    if not token:
+        token = request.cookies.get("token")
+
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authentication token")
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("id")
+        email = payload.get("email")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+
+        # Return as a simple object with `.id` and `.email`
+        return SimpleNamespace(id=str(user_id), email=email)
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 # ----------- Signup -----------
 
@@ -207,38 +300,199 @@ async def login(data: LoginRequest):
         }
     }
 
-# ----------- Auth Dependency (unchanged) -----------
+# ----------- Me (used by Google flow to fetch current profile) -----------
 
-async def get_current_user(request: Request):
+@router.get("/me")
+async def me(current: SimpleNamespace = Depends(get_current_user)):
+    user = await db.users.find_one({"_id": current.id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": _serialize_user_for_client(user)}
+
+# ----------- Complete profile (Google flow) -----------
+
+@router.post("/complete-profile")
+async def complete_profile(
+    data: CompleteProfileRequest,
+    current: SimpleNamespace = Depends(get_current_user),
+):
+    name_parts = _split_name(data.name)
+    update_doc = {
+        "firstName": name_parts["firstName"],
+        "lastName": name_parts["lastName"],
+        "jobTitle": data.role.strip(),
+        "company": data.company.strip(),
+        # Keep convenience displayName for header if your app uses it elsewhere
+        "displayName": data.name.strip(),
+        "updated_at": _now_utc(),
+    }
+    await db.users.update_one({"_id": current.id}, {"$set": update_doc})
+    updated = await db.users.find_one({"_id": current.id})
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user": _serialize_user_for_client(updated)}
+
+# ----------- Google OAuth -----------
+
+@router.get("/google")
+async def google_login(redirect_url: Optional[str] = Query(None)):
     """
-    Dependency to extract and validate JWT from Authorization header or cookies.
-    Returns user object with `.id` and `.email`.
+    Initiates Google OAuth2 (OpenID Connect). We pack the desired post-login redirect
+    in a signed state token to protect against CSRF.
     """
-    token: Optional[str] = None
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="Google OAuth is not configured on the server")
 
-    # Try Authorization header
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.lower().startswith("bearer "):
-        token = auth_header.split(" ", 1)[1]
+    # Default to frontend /login which your client expects to read token from query
+    desired_redirect = (redirect_url or f"{FRONTEND_BASE_URL}/login").strip()
 
-    # Try cookies
-    if not token:
-        token = request.cookies.get("token")
+    # Signed state (short-lived)
+    now = _now_utc()
+    state = jwt.encode(
+        {
+            "r": desired_redirect,
+            "nonce": str(uuid.uuid4()),
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=10)).timestamp()),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
 
-    if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authentication token")
+    callback_url = f"{BACKEND_BASE_URL}/auth/google/callback"
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": callback_url,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "consent",
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+    }
+    url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+    return RedirectResponse(url=url, status_code=307)
+
+@router.get("/google/callback")
+async def google_callback(code: Optional[str] = Query(None), state: Optional[str] = Query(None)):
+    """
+    Handles Google's callback: exchanges code for tokens, validates id_token, and
+    creates/links a user. Redirects back to the frontend with ?oauth=google&token=...&needs_profile=0|1
+    """
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
 
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("id")
-        email = payload.get("email")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-
-        # Return as a simple object with `.id` and `.email`
-        return SimpleNamespace(id=str(user_id), email=email)
-
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        state_payload = jwt.decode(state, SECRET_KEY, algorithms=[ALGORITHM])
+        desired_redirect: str = state_payload.get("r") or f"{FRONTEND_BASE_URL}/login"
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    # Exchange code for tokens
+    callback_url = f"{BACKEND_BASE_URL}/auth/google/callback"
+    token_req_body = urlencode({
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": callback_url,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+
+    try:
+        req = UrlRequest(GOOGLE_TOKEN_URL, data=token_req_body, headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        })
+        with urlopen(req) as resp:
+            token_resp = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to exchange authorization code")
+
+    id_token = token_resp.get("id_token")
+    if not id_token:
+        raise HTTPException(status_code=400, detail="No id_token in token response")
+
+    # Validate id_token via Google's tokeninfo
+    try:
+        with urlopen(f"{GOOGLE_TOKENINFO_URL}?{urlencode({'id_token': id_token})}") as r:
+            tokeninfo = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to validate Google ID token")
+
+    # Basic checks
+    aud = tokeninfo.get("aud")
+    if aud != GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="Google ID token audience mismatch")
+
+    email = (tokeninfo.get("email") or "").strip().lower()
+    sub = tokeninfo.get("sub")  # Google's user id
+    email_verified = str(tokeninfo.get("email_verified", "false")).lower() == "true"
+    profile_name = tokeninfo.get("name") or ""
+    # picture = tokeninfo.get("picture")  # available if you want to store
+
+    if not email or not sub:
+        raise HTTPException(status_code=400, detail="Missing email or subject from Google")
+
+    # Upsert user
+    user = await db.users.find_one({"email": email})
+    if user:
+        # Link Google account if not linked yet
+        update = {
+            "google_id": sub,
+            "auth_provider": "google",
+            "is_verified": True if email_verified else True,  # treat as verified after Google
+            "updated_at": _now_utc(),
+        }
+        # If no name is present, prefill from Google
+        if not user.get("firstName") and not user.get("lastName") and profile_name:
+            parts = _split_name(profile_name)
+            update["firstName"] = parts["firstName"]
+            update["lastName"] = parts["lastName"]
+            update["displayName"] = profile_name
+        await db.users.update_one({"_id": user["_id"]}, {"$set": update})
+        user = await db.users.find_one({"_id": user["_id"]})
+    else:
+        # Create a new user record
+        parts = _split_name(profile_name)
+        user = {
+            "_id": str(uuid.uuid4()),
+            "email": email,
+            "firstName": parts["firstName"],
+            "lastName": parts["lastName"],
+            "displayName": profile_name,
+            "company": "",
+            "jobTitle": "",
+            "password": "",  # no password for Google accounts
+            "is_verified": True if email_verified else True,
+            "google_id": sub,
+            "auth_provider": "google",
+            "created_at": _now_utc(),
+            "updated_at": _now_utc(),
+        }
+        await db.users.insert_one(user)
+
+    # Issue our app token
+    token = _app_jwt_for_user(user)
+
+    # Determine if we need to ask for name/role/company (as requested)
+    serialized = _serialize_user_for_client(user)
+    has_name = bool(serialized.get("name"))
+    has_role = bool(serialized.get("role"))
+    has_company = bool(serialized.get("company"))
+    needs_profile = not (has_name and has_role and has_company)
+
+    # Redirect to frontend login page which will store token and show profile modal if needed
+    final_redirect = f"{desired_redirect.split('?')[0]}?oauth=google&token={quote_plus(token)}&needs_profile={'1' if needs_profile else '0'}"
+
+    # Set cookie as a convenience (client also reads the query param)
+    response = RedirectResponse(url=final_redirect, status_code=307)
+    secure_cookie = BACKEND_BASE_URL.startswith("https://")
+    response.set_cookie(
+        key="token",
+        value=token,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+        max_age=JWT_EXPIRES_HOURS * 3600,
+        path="/",
+    )
+    return response
