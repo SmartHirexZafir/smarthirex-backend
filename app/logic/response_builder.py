@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import difflib
 from typing import Any, Dict, List, Optional, Set
 
@@ -435,6 +436,69 @@ def _summarize_matches(preview: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ---------------------------
+# NEW: Dynamic score backfill to avoid 0%/0.00 in UI
+# ---------------------------
+def _tokenize_prompt(prompt: str) -> List[str]:
+    toks = [t.lower() for t in re.findall(r"[a-zA-Z]+|\d+\+?", prompt or "")]
+    stop = {"and", "or", "the", "a", "an", "in", "with", "of", "for", "to", "on", "at"}
+    return [t for t in toks if t and t not in stop]
+
+def _compute_simple_score(prompt: str, cand: Dict[str, Any]) -> int:
+    tokens = _tokenize_prompt(prompt)
+    blob_parts = [
+        str(cand.get("name", "")),
+        str(cand.get("email", "")),
+        str(cand.get("title", "")),
+        str(cand.get("role", "")),
+        str(cand.get("summary", "")),
+        str(cand.get("currentRole", "")),
+        str(cand.get("predicted_role", "")),
+        str(cand.get("category", "")),
+        str(cand.get("location", "")),
+        str(cand.get("experience", "")),
+    ]
+    for key in ("skills", "matchReasons", "highlights", "tags"):
+        val = cand.get(key)
+        if isinstance(val, list):
+            blob_parts.extend([str(x) for x in val])
+        elif isinstance(val, str):
+            blob_parts.append(val)
+    blob = " ".join(blob_parts).lower()
+
+    hits = 0
+    for t in tokens:
+        if t.endswith("+") and t[:-1].isdigit():
+            base = int(t[:-1])
+            numbers = [int(n) for n in re.findall(r"\b\d+\b", blob)]
+            if any(n >= base for n in numbers):
+                hits += 1
+        else:
+            if t in blob:
+                hits += 1
+    score = min(100, max(0, 40 + hits * 15))
+    return int(score)
+
+def _ensure_scores(prompt: str, candidates: List[Dict[str, Any]]) -> None:
+    """
+    Fill in missing final_score / prompt_matching_score without changing order.
+    """
+    for c in candidates or []:
+        fs = c.get("final_score")
+        pms = c.get("prompt_matching_score") or c.get("prompt_match_score")
+        if fs in (None, 0, 0.0) or pms in (None, 0, 0.0):
+            s = _compute_simple_score(prompt, c)
+            if fs in (None, 0, 0.0):
+                c["final_score"] = s
+            if pms in (None, 0, 0.0):
+                c["prompt_matching_score"] = s
+        # keep simple flags sane if not present
+        if "is_strict_match" not in c:
+            c["is_strict_match"] = (c.get("final_score", 0) >= 70)
+        if "match_type" not in c:
+            c["match_type"] = "exact" if c.get("final_score", 0) >= 85 else ("close" if c.get("final_score", 0) >= 60 else "weak")
+
+
+# ---------------------------
 # Main entry
 # ---------------------------
 async def build_response(parsed_data: dict) -> dict:
@@ -444,12 +508,32 @@ async def build_response(parsed_data: dict) -> dict:
 
     if intent in ("filter_cv", "show_all"):
         # 1) Get semantic candidates (existing behavior preserved)
-        resumes = await get_semantic_matches(
-            prompt,
-            owner_user_id=parsed_data.get("ownerUserId"),  # may be None; fine
-            normalized_prompt=parsed_data.get("normalized_prompt"),
-            keywords=parsed_data.get("keywords"),
-        ) or []
+        #    ✅ pass through optional scoping/flags if ml_interface supports them
+        try:
+            resumes = await get_semantic_matches(
+                prompt,
+                owner_user_id=parsed_data.get("ownerUserId"),           # may be None; fine
+                normalized_prompt=parsed_data.get("normalized_prompt"),
+                keywords=parsed_data.get("keywords"),
+                options=parsed_data.get("options"),                     # 👈 new (best-effort)
+                selected_filters=parsed_data.get("selectedFilters"),    # 👈 new (best-effort)
+                id_whitelist=parsed_data.get("id_whitelist"),           # 👈 new: scope to saved block when re-running
+            ) or []
+        except TypeError:
+            # Older signature without the new kwargs
+            try:
+                resumes = await get_semantic_matches(
+                    prompt,
+                    owner_user_id=parsed_data.get("ownerUserId"),
+                    normalized_prompt=parsed_data.get("normalized_prompt"),
+                    keywords=parsed_data.get("keywords"),
+                ) or []
+            except TypeError:
+                # Oldest signature: prompt only
+                resumes = await get_semantic_matches(prompt) or []
+
+        # ✅ Backfill dynamic scores so UI never shows 0%/0.00 pre-rerun
+        _ensure_scores(prompt, resumes)
 
         # Safe redirect build (non-fatal)
         try:
@@ -481,6 +565,9 @@ async def build_response(parsed_data: dict) -> dict:
                     it["is_strict_match"] = True
                 if "match_type" not in it:
                     it["match_type"] = "exact"
+            # Ensure scores in the filtered list too (non-destructive)
+            _ensure_scores(prompt, filtered_resumes)
+
             count = len(filtered_resumes)
             reply_text = f"Showing {count} results for your query."
             return {
@@ -500,6 +587,8 @@ async def build_response(parsed_data: dict) -> dict:
                 for it in relaxed:
                     it["is_strict_match"] = False
                     it["match_type"] = "close"
+                _ensure_scores(prompt, relaxed)
+
                 count = len(relaxed)
                 reply_text = f"Showing {count} results for your query."
                 return {
@@ -517,6 +606,8 @@ async def build_response(parsed_data: dict) -> dict:
             for it in resumes:
                 it["is_strict_match"] = False
                 it["match_type"] = "close"
+            _ensure_scores(prompt, resumes)
+
             reply_text = f"Showing {count_sem} results for your query."
             return {
                 "reply": reply_text,

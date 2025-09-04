@@ -767,9 +767,22 @@ def _compute_prompt_match_score(c: Dict[str, Any], prompt_like: str, keywords: L
     return score
 
 def _annotate_scores(preview: List[Dict[str, Any]], prompt_like: str, keywords: List[str]) -> None:
+    """
+    Ensure every candidate has a dynamic score the UI understands.
+    Frontend falls back in this order: final_score → prompt_matching_score → score → match_score.
+    To avoid '0% match' blanks, we set both synonyms if they're missing.
+    """
     for c in preview or []:
-        # Prompt Matching Score (0..100)
-        c["prompt_match_score"] = _compute_prompt_match_score(c, prompt_like, keywords)
+        # Compute a 0..100 score rounded to an INT for consistent chips
+        computed = int(round(_compute_prompt_match_score(c, prompt_like, keywords)))
+        # Prefer existing values; only fill if missing/falsey
+        if not c.get("final_score"):
+            c["final_score"] = computed
+        if not c.get("prompt_matching_score"):
+            c["prompt_matching_score"] = computed
+        # Keep the lightweight debug field too (harmless if unused)
+        c["prompt_match_score"] = computed
+
         # Role Prediction Confidence (prefer stable ML confidence if available)
         role_conf = c.get("ml_confidence", c.get("confidence"))
         c["role_prediction_confidence"] = _to_percent(role_conf)
@@ -997,7 +1010,7 @@ async def handle_chatbot_query(
             filtered_preview, selected_filters, normalized_prompt or prompt, expanded_keywords or []
         )
 
-    # ✅ Annotate card metrics: Prompt Matching Score vs Role Prediction Confidence
+    # ✅ Annotate card metrics: ensure dynamic % present with UI-recognized keys
     _annotate_scores(filtered_preview, normalized_prompt or prompt, expanded_keywords)
 
     # Summarize matches for UI messaging
@@ -1031,7 +1044,7 @@ async def handle_chatbot_query(
                 "timestamp_raw": timestamp_raw,
                 "timestamp_display": timestamp_display,
                 "totalMatches": len(filtered_preview),
-                "candidates": filtered_preview,
+                "candidates": filtered_preview,  # ⬅ carries final_score & prompt_matching_score now
                 "ownerUserId": owner_id,
                 "matchMeta": match_meta,
             }

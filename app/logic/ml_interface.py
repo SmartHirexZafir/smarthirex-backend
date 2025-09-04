@@ -318,6 +318,14 @@ def _to_object_id(maybe_id: Any) -> Optional[ObjectId]:
     except Exception:
         return None
 
+def _to_object_ids_list(id_list: Optional[List[Any]]) -> List[ObjectId]:
+    ids: List[ObjectId] = []
+    for x in (id_list or []):
+        oid = _to_object_id(x)
+        if oid is not None:
+            ids.append(oid)
+    return ids
+
 def _build_search_blob(cv: Dict[str, Any]) -> str:
     """
     Build a compact, generic text for ANN indexing. Uses cheap fields only.
@@ -602,7 +610,7 @@ def _replace_number_words_for_years(p: str) -> str:
     """
     Convert 'four years', 'twenty three yrs' → '4 years', '23 yrs' (conservative).
     """
-    def repl(m: re.Match) -> str:
+    def repl(m: re.Match) -> str:  # type: ignore[name-defined]
         a = m.group(1).lower()
         b = (m.group(2) or "").lower().strip()
         unit = m.group(3)
@@ -655,6 +663,7 @@ async def get_semantic_matches(
     normalized_prompt: Optional[str] = None,
     keywords: Optional[List[str]] = None,
     options: Optional[Dict[str, Any]] = None,
+    id_whitelist: Optional[List[str]] = None,  # ✅ NEW: restrict to a specific set of resume IDs (for scoped re-run)
 ) -> List[Dict[str, Any]]:
     """
     Returns ranked candidates with semantic + rule scores.
@@ -679,7 +688,10 @@ async def get_semantic_matches(
             "prefilter_role_regex": true      # optional: db-side prefilter on predicted_role/category with case-insensitive regex
           }
 
-    - Backward compatible if `options` is omitted.
+    - `id_whitelist`: If provided, the retrieval is strictly limited to this set of resume _id's
+      (ObjectIds). ANN recall will be intersected with this whitelist, never expanded beyond it.
+
+    - Backward compatible if `options`/`id_whitelist` are omitted.
     """
     options = options or {}
     selected_fields: Optional[List[str]] = options.get("selected")
@@ -813,9 +825,22 @@ async def get_semantic_matches(
     if owner_user_id:
         query["ownerUserId"] = owner_user_id
 
-    if ids_restrict:
-        obj_ids = [oid for oid in ([_to_object_id(i) for i in ids_restrict]) if oid is not None]
-        conditions.append({"_id": {"$in": obj_ids or ids_restrict}})
+    # ✅ NEW: Restrict to whitelist if provided (intersect with ANN recall if present)
+    whitelist_obj_ids = _to_object_ids_list(id_whitelist)
+    ann_obj_ids = _to_object_ids_list(ids_restrict) if ids_restrict else None
+    final_ids_cond: Optional[List[ObjectId]] = None
+    if whitelist_obj_ids and ann_obj_ids:
+        # intersect; never expand beyond whitelist
+        wl_set = set(whitelist_obj_ids)
+        inter = [i for i in ann_obj_ids if i in wl_set]
+        final_ids_cond = inter if inter else whitelist_obj_ids
+    elif whitelist_obj_ids:
+        final_ids_cond = whitelist_obj_ids
+    elif ann_obj_ids:
+        final_ids_cond = ann_obj_ids
+
+    if final_ids_cond:
+        conditions.append({"_id": {"$in": final_ids_cond}})
 
     # DB prefilter by experience if selected
     if _selected("experience") and (min_years is not None):
