@@ -1,6 +1,6 @@
 # app/routers/candidate_router.py
 from fastapi import APIRouter, HTTPException, Path, Body, Depends
-from typing import Literal, Optional, Any, Dict, TypedDict
+from typing import Literal, Optional, Any, Dict, TypedDict, List
 from app.utils.mongo import db
 
 # ✅ Auth (ownership scoping)
@@ -30,6 +30,24 @@ except Exception:
 router = APIRouter()
 
 
+def _job_role_of(doc: Dict[str, Any]) -> str:
+    """Best-effort job role normalization used across UI."""
+    return (
+        doc.get("job_role")
+        or doc.get("category")
+        or doc.get("predicted_role")
+        or (doc.get("resume") or {}).get("role")
+        or "General"
+    )
+
+
+def _email_of(doc: Dict[str, Any]) -> str:
+    return (
+        (doc.get("email") or "")
+        or ((doc.get("resume") or {}).get("email") or "")
+    ).strip()
+
+
 @router.get("/{candidate_id}")
 async def get_candidate(
     candidate_id: str = Path(...),
@@ -55,7 +73,12 @@ async def get_candidate(
 
     # Analysis fields (safe defaults)
     candidate["score"] = candidate.get("score", 0)
-    candidate["testScore"] = candidate.get("testScore", 0)
+    # Surface both snake_case and camelCase for test score
+    test_score_val = candidate.get("test_score")
+    if test_score_val is None:
+        test_score_val = candidate.get("testScore", 0)
+    candidate["testScore"] = test_score_val or 0
+
     candidate["matchedSkills"] = candidate.get("matchedSkills", [])
     candidate["missingSkills"] = candidate.get("missingSkills", [])
     candidate["strengths"] = candidate.get("strengths", [])
@@ -76,30 +99,108 @@ async def get_candidate(
     candidate["match_reason"] = candidate.get("match_reason", "ML classified")
     candidate["semantic_score"] = candidate.get("semantic_score", None)
 
+    # Ensure job_role is always present for UI (Meetings/Test pages use it)
+    candidate["job_role"] = _job_role_of(candidate)
+
+    # Also expose snake_case test_score for consistency with graders
+    candidate["test_score"] = candidate.get("test_score", candidate.get("testScore", 0))
+
+    # Compute/echo total_score if missing (avg of match + test)
+    if "total_score" not in candidate:
+        try:
+            m = float(candidate.get("score") or 0)
+            t = float(candidate.get("test_score") or 0)
+            candidate["total_score"] = round(((m + t) / 2.0), 1)
+        except Exception:
+            candidate["total_score"] = None
+
     return candidate
 
 
 @router.patch("/{candidate_id}/status")
 async def update_candidate_status(
     candidate_id: str = Path(...),
-    status: Literal["shortlisted", "rejected", "new", "interviewed"] = Body(..., embed=True),
+    status: Literal["shortlisted", "rejected", "new", "interviewed", "accepted"] = Body(..., embed=True),
     current_user: Any = Depends(get_current_user),
 ):
     """
     Update candidate status (scoped to owner).
-    Returns 404 only if the candidate doesn't exist or isn't owned by user.
+    Also (re)computes and persists `total_score` = avg(match score, test_score)
+    so the Dashboard can list candidates under Accepted/Rejected with totals.
     """
     owner_id = str(getattr(current_user, "id", None))
+    cand = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
+    if not cand:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # Compute total_score based on current fields
+    match_score = float(cand.get("score") or 0)
+    test_score = float(cand.get("test_score") if cand.get("test_score") is not None else cand.get("testScore") or 0)
+    total_score = round(((match_score + test_score) / 2.0), 1)
+
     result = await db.parsed_resumes.update_one(
         {"_id": candidate_id, "ownerUserId": owner_id},
-        {"$set": {"status": status}},
+        {"$set": {"status": status, "total_score": total_score}},
     )
 
     # In Mongo, modified_count may be 0 if value was already the same.
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    return {"message": f"Candidate status set to '{status}'."}
+    return {"message": f"Candidate status set to '{status}'.", "total_score": total_score}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ✅ NEW: Candidates with tests (for Meetings "choose candidate" list)
+#     GET /candidates/with-tests
+#     Returns only candidates owned by the user that have a test_score or at least
+#     one submission entry. Keeps the payload compact for dropdowns.
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get("/candidates/with-tests")
+async def list_candidates_with_tests(current_user: Any = Depends(get_current_user)):
+    owner_id = str(getattr(current_user, "id", None))
+
+    # Collect candidateIds that have submissions
+    try:
+        # Not all Mongo deployments enable distinct; fallback handled below.
+        submitted_ids: List[str] = await db.test_submissions.distinct("candidateId")
+    except Exception:
+        submitted_ids = []
+
+    query: Dict[str, Any] = {
+        "ownerUserId": owner_id,
+        "$or": [
+            {"test_score": {"$exists": True}},
+            {"_id": {"$in": submitted_ids}} if submitted_ids else {"_id": {"$exists": True, "$in": []}},
+        ],
+    }
+
+    projection = {
+        "_id": 1,
+        "name": 1,
+        "email": 1,
+        "resume.email": 1,
+        "avatar": 1,
+        "category": 1,
+        "predicted_role": 1,
+        "job_role": 1,
+        "test_score": 1,
+    }
+
+    cursor = db.parsed_resumes.find(query, projection=projection).sort("updatedAt", -1)
+    out: List[Dict[str, Any]] = []
+    async for c in cursor:
+        out.append({
+            "_id": c["_id"],
+            "name": c.get("name"),
+            "email": _email_of(c),
+            "avatar": c.get("avatar"),
+            "job_role": _job_role_of(c),
+            "test_score": c.get("test_score"),
+        })
+
+    return {"candidates": out}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -302,6 +403,140 @@ async def schedule_interview_for_candidate(
                 "starts_at_utc": body.starts_at.isoformat(),
                 "timezone": body.timezone,
                 "duration_mins": body.duration_mins,
+                "token": token,
+                "ownerUserId": owner_id,
+            },
+        )
+        await db.meetings.update_one(
+            {"_id": insert_res.inserted_id},
+            {"$set": {"email_sent": True, "email_sent_at": datetime.now(timezone.utc)}},
+        )
+    except Exception as e:
+        await db.meetings.update_one(
+            {"_id": insert_res.inserted_id},
+            {"$set": {"email_sent": False, "email_error": str(e), "status": "scheduled_email_failed"}},
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to send invite email: {e}")
+
+    return {"meetingUrl": meeting_url, "meetingId": meeting_id, "status": "scheduled"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ✅ NEW: Unified schedule endpoint used by UI
+#     POST /interviews/schedule
+#     Accepts a simpler payload and delegates to the same persistence/email flow.
+#     This matches the client call pattern with { candidateId, candidateEmail, role, when, ... }.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UnifiedScheduleBody(BaseModel):
+    candidateId: str
+    candidateEmail: Optional[EmailStr] = None
+    candidateName: Optional[str] = None
+    role: Optional[str] = None
+    when: str  # ISO datetime string (UTC or with offset)
+    timezone: Optional[str] = None  # optional; default UTC
+    durationMins: Optional[int] = Field(default=45, ge=1, le=480)
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    dateLabel: Optional[str] = None  # passthrough (unused persistence)
+    timeLabel: Optional[str] = None  # passthrough (unused persistence)
+
+def _parse_when_to_utc_iso(when: str) -> datetime:
+    try:
+        # support trailing 'Z'
+        iso = when.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid 'when' datetime: {e}")
+
+@router.post("/interviews/schedule")
+async def schedule_interview_unified(
+    body: UnifiedScheduleBody,
+    current_user: Any = Depends(get_current_user),
+) -> ScheduleResp:
+    owner_id = str(getattr(current_user, "id", None))
+    candidate = await db.parsed_resumes.find_one({"_id": body.candidateId, "ownerUserId": owner_id})
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    starts_at = _parse_when_to_utc_iso(body.when)
+    now_utc = datetime.now(timezone.utc)
+    if starts_at <= now_utc:
+        raise HTTPException(status_code=400, detail="'when' must be in the future")
+
+    email = (body.candidateEmail or _email_of(candidate))
+    if not email:
+        raise HTTPException(status_code=400, detail="Candidate email required")
+
+    tz = body.timezone or "UTC"
+    if ZoneInfo:
+        try:
+            ZoneInfo(tz)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid IANA timezone: {tz}") from e
+
+    token = uuid.uuid4().hex
+    if _build_meeting_url:
+        try:
+            meeting_url = _build_meeting_url(token)  # type: ignore
+        except Exception:
+            meeting_url = _build_meeting_url_fallback(token)
+    else:
+        meeting_url = _build_meeting_url_fallback(token)
+
+    # Persist meeting
+    doc = {
+        "candidate_id": body.candidateId,
+        "email": email,
+        "starts_at": starts_at,
+        "timezone": tz,
+        "duration_mins": int(body.durationMins or 45),
+        "title": (body.title or f"Interview with {candidate.get('name') or email}").strip(),
+        "notes": body.notes,
+        "status": "scheduled",
+        "token": token,
+        "meeting_url": meeting_url,
+        "created_at": now_utc,
+        "email_sent": False,
+        "ownerUserId": owner_id,
+        # Convenience for UI/debug
+        "role": body.role or _job_role_of(candidate),
+        "date_label": body.dateLabel,
+        "time_label": body.timeLabel,
+    }
+    try:
+        insert_res = await db.meetings.insert_one(doc)
+        meeting_id = str(insert_res.inserted_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
+
+    # Email
+    local_str = _format_local_dt(starts_at, tz)
+    subject = doc["title"]
+    html_body = _invite_html(
+        candidate_name=body.candidateName or candidate.get("name"),
+        title=subject,
+        local_datetime_str=local_str,
+        meeting_url=meeting_url,
+        notes=body.notes,
+        timezone_name=tz,
+        duration_mins=int(body.durationMins or 45),
+    )
+
+    try:
+        await _send_invite_email(
+            to=email,
+            subject=subject,
+            html_body=html_body,
+            meta={
+                "candidate_id": body.candidateId,
+                "meeting_id": meeting_id,
+                "starts_at_utc": starts_at.isoformat(),
+                "timezone": tz,
+                "duration_mins": int(body.durationMins or 45),
                 "token": token,
                 "ownerUserId": owner_id,
             },

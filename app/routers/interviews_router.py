@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 import uuid
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, Dict, List
 
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Query
 from pydantic import BaseModel, Field, EmailStr, field_validator
 
 # --- Optional/soft imports from your existing utils ---
@@ -121,6 +121,20 @@ class MeetingOut(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class EligibleCandidate(BaseModel):
+    _id: str
+    name: Optional[str] = None
+    email: Optional[str] = None
+    job_role: Optional[str] = None
+    test_score: Optional[float] = None
+    avatar: Optional[str] = None
+
+
+class TodayStats(BaseModel):
+    scheduled_today: int
+    timezone: str
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -232,6 +246,35 @@ def send_invite_email(
     raise RuntimeError("Email utility not available. Implement app.utils.emailer.send_interview_invite().")
 
 
+def _job_role_of(doc: Dict[str, Any]) -> str:
+    return (
+        doc.get("job_role")
+        or doc.get("category")
+        or doc.get("predicted_role")
+        or (doc.get("resume") or {}).get("role")
+        or "General"
+    )
+
+
+def _email_of(doc: Dict[str, Any]) -> str:
+    return (
+        (doc.get("email") or "")
+        or ((doc.get("resume") or {}).get("email") or "")
+    ).strip()
+
+
+def _candidate_has_test(db, candidate_id: str) -> bool:
+    """
+    Returns True if the candidate has a test_score OR at least one submission in test_submissions.
+    """
+    cand = db["parsed_resumes"].find_one({"_id": candidate_id})
+    if cand and cand.get("test_score") is not None:
+        return True
+    # fallback: check submissions
+    sub = db["test_submissions"].find_one({"candidateId": candidate_id})
+    return bool(sub)
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -245,10 +288,21 @@ def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
     Create a meeting record, generate a join URL, and send the invite email to the candidate.
     The join URL is the FRONTEND "gate" page (/meetings/{token}). We also store
     an external Google Meet URL which the gate will open at the right time.
+
+    Enhancement: by default, we enforce that a candidate must have taken a test before
+    scheduling. Set ALLOW_SCHEDULE_WITHOUT_TEST=1 to bypass this check.
     """
     now_utc = datetime.now(timezone.utc)
     if req.starts_at <= now_utc:
         raise HTTPException(status_code=400, detail="startsAt must be in the future.")
+
+    # Enforce "test before schedule" unless explicitly disabled
+    allow_without_test = os.getenv("ALLOW_SCHEDULE_WITHOUT_TEST", "0").lower() in {"1", "true", "yes", "on"}
+    if not allow_without_test and not _candidate_has_test(db, req.candidate_id):
+        raise HTTPException(
+            status_code=400,
+            detail="This candidate hasn't completed a test yet. Please ask them to complete the assessment before scheduling the interview.",
+        )
 
     token = uuid.uuid4().hex
     meeting_url = build_meeting_url(token)          # gate page
@@ -427,3 +481,90 @@ def get_meeting_by_token(token: str, db=Depends(get_db)):
 
     # Merge; snake_case fields take precedence for duplicate keys with same meaning
     return {**data_camel, **data_snake}
+
+
+# -------- New: Eligible candidates (have taken a test) --------
+@router.get("/eligible", response_model=List[EligibleCandidate])
+def list_eligible_candidates(
+    limit: int = Query(100, ge=1, le=500),
+    db=Depends(get_db),
+):
+    """
+    Returns candidates who are eligible for scheduling (i.e., have taken a test).
+    Eligibility rule:
+      - candidate.test_score exists, OR
+      - there is at least one submission in test_submissions
+    """
+    # First, gather IDs with submissions
+    try:
+        submitted_ids = list(db["test_submissions"].distinct("candidateId"))
+    except Exception:
+        submitted_ids = []
+
+    query: Dict[str, Any] = {
+        "$or": [
+            {"test_score": {"$exists": True}},
+            {"_id": {"$in": submitted_ids}} if submitted_ids else {"_id": None},  # harmless false branch
+        ]
+    }
+    projection = {
+        "_id": 1,
+        "name": 1,
+        "email": 1,
+        "resume.email": 1,
+        "avatar": 1,
+        "job_role": 1,
+        "category": 1,
+        "predicted_role": 1,
+        "test_score": 1,
+    }
+
+    cur = db["parsed_resumes"].find(query, projection=projection).sort("updatedAt", -1).limit(limit)
+    out: List[EligibleCandidate] = []
+    for c in cur:
+        out.append(
+            EligibleCandidate(
+                _id=c["_id"],
+                name=c.get("name"),
+                email=_email_of(c),
+                job_role=_job_role_of(c),
+                test_score=c.get("test_score"),
+                avatar=c.get("avatar"),
+            )
+        )
+    return out
+
+
+# -------- New: Today stats (scheduled count) --------
+@router.get("/stats/today", response_model=TodayStats)
+def stats_today(
+    tz: str = Query("UTC", description="IANA timezone (e.g., Asia/Karachi)"),
+    db=Depends(get_db),
+):
+    """
+    Returns number of meetings scheduled for 'today' in the given timezone.
+    Useful for the Meetings header badges (e.g., '5 Scheduled Today').
+    """
+    if ZoneInfo:
+        try:
+            z = ZoneInfo(tz)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid IANA timezone: {tz}") from e
+    else:
+        # Fallback: treat tz as UTC
+        z = timezone.utc  # type: ignore
+
+    now = datetime.now(timezone.utc).astimezone(z)
+    start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+
+    # Convert bounds to UTC-naive (to match stored 'starts_at')
+    start_utc_naive = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc_naive = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+    count = db["meetings"].count_documents({
+        "starts_at": {"$gte": start_utc_naive, "$lt": end_utc_naive},
+        "status": {"$in": ["scheduled", "rescheduled"]},
+    })
+
+    return TodayStats(scheduled_today=int(count), timezone=tz)

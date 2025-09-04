@@ -5,11 +5,11 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Path
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.utils.mongo import db  # AsyncIOMotorDatabase
 from app.utils.emailer import send_email, render_invite_html
@@ -19,7 +19,7 @@ from app.logic.evaluator import evaluate_test  # returns {"total_score": int, "d
 
 # --- Optional graders (robust import; fully optional) ------------------------
 USE_RULES = os.getenv("FREEFORM_RULES_GRADING", "1").strip().lower() in {"1", "true", "yes", "on"}
-USE_LLM   = os.getenv("FREEFORM_LLM_GRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
+USE_LLM = os.getenv("FREEFORM_LLM_GRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
 FREEFORM_MAX_POINTS = int(os.getenv("FREEFORM_MAX_POINTS", "5") or "5")
 
 _rules_grader = None
@@ -28,6 +28,7 @@ _llm_grader = None
 if USE_RULES:
     try:
         from app.logic.grader_rules import grade_free_form as _rules_grade  # type: ignore
+
         _rules_grader = _rules_grade
     except Exception:
         _rules_grader = None
@@ -36,6 +37,7 @@ if USE_RULES:
 if USE_LLM:
     try:
         from app.logic.grader_llm import grade_free_form_llm as _llm_grade  # type: ignore
+
         _llm_grader = _llm_grade
     except Exception:
         _llm_grader = None
@@ -46,7 +48,7 @@ if USE_LLM:
 CODE_RUNNER_ENABLED = os.getenv("CODE_RUNNER", "0").strip().lower() in {"1", "true", "yes", "on"}
 # Time/memory defaults (can be overridden per question)
 RUNNER_TIME_LIMIT = int(os.getenv("RUNNER_TIME_LIMIT_SEC", "2") or "2")
-RUNNER_MEM_MB     = int(os.getenv("RUNNER_MEMORY_MB", "128") or "128")
+RUNNER_MEM_MB = int(os.getenv("RUNNER_MEMORY_MB", "128") or "128")
 
 _runner_run = None
 if CODE_RUNNER_ENABLED:
@@ -67,6 +69,7 @@ FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
 TEST_TOKEN_EXPIRY_MINUTES = int(os.getenv("TEST_TOKEN_EXPIRY_MINUTES", "60"))
 
 # ---------- helpers ----------
+
 
 def _extract_int_years(value: Optional[str]) -> int:
     if not value:
@@ -149,17 +152,44 @@ def _code_tests_from_question(q: Dict[str, Any]) -> List[Dict[str, Any]]:
     for i, t in enumerate(tests):
         if not isinstance(t, dict):
             continue
-        out.append({
-            "name": _norm_text(t.get("name") or f"t{i+1}"),
-            "input": _norm_text(t.get("input") or ""),
-            "args": t.get("args") if isinstance(t.get("args"), list) else [],
-            "expected_stdout": t.get("expected_stdout"),
-            "match": _norm_text(t.get("match") or "exact") or "exact",
-        })
+        out.append(
+            {
+                "name": _norm_text(t.get("name") or f"t{i+1}"),
+                "input": _norm_text(t.get("input") or ""),
+                "args": t.get("args") if isinstance(t.get("args"), list) else [],
+                "expected_stdout": t.get("expected_stdout"),
+                "match": _norm_text(t.get("match") or "exact") or "exact",
+            }
+        )
     return out
 
 
 # ---------- request/response models ----------
+
+TestType = Literal["smart", "custom"]
+
+
+class CustomQuestion(BaseModel):
+    question: str = Field(..., description="Question prompt / body text")
+    type: Optional[str] = Field(default="text", description="mcq | code | scenario | text | freeform")
+    options: Optional[List[str]] = None
+    correct_answer: Optional[str] = None
+    tests: Optional[List[Dict[str, Any]]] = None  # for code
+    language: Optional[str] = None
+    id: Optional[Any] = None
+
+
+class CustomTest(BaseModel):
+    title: Optional[str] = None
+    questions: List[Dict[str, Any]] | List[CustomQuestion] = Field(default_factory=list)
+
+    @field_validator("questions")
+    @classmethod
+    def _non_empty(cls, v):
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError("custom.questions must be a non-empty list")
+        return v
+
 
 class InviteRequest(BaseModel):
     candidate_id: str = Field(..., description="Candidate _id from parsed_resumes")
@@ -167,6 +197,9 @@ class InviteRequest(BaseModel):
     body_html: Optional[str] = None  # optional custom HTML; {TEST_LINK} will be replaced
     # allow sender to choose number of questions
     question_count: Optional[int] = Field(default=4, ge=1, le=50)
+    # NEW: test type & optional custom
+    test_type: Optional[TestType] = Field(default="smart")
+    custom: Optional[CustomTest] = None
 
 
 class InviteResponse(BaseModel):
@@ -201,16 +234,21 @@ class SubmitTestRequest(BaseModel):
 class SubmitTestResponse(BaseModel):
     test_id: str
     candidate_id: str
-    score: float  # percent (MCQs only – unchanged)
+    score: float  # percent (MCQs only – unchanged; 0.0 for ungraded custom)
     details: List[Dict[str, Any]]
 
 
 # ---------- routes ----------
 
+
 @router.post("/invite", response_model=InviteResponse)
 async def create_invite(req: InviteRequest):
     """
     Create a test invite for a candidate and send an email with a secure link.
+
+    ENHANCEMENTS:
+    - Supports test_type: "smart" (default) or "custom"
+    - When custom, persist provided questions & title on the invite
     """
     candidate = await db.parsed_resumes.find_one({"_id": req.candidate_id})
     if not candidate:
@@ -228,6 +266,23 @@ async def create_invite(req: InviteRequest):
     test_link = f"{FRONTEND_BASE_URL.rstrip('/')}/test/{token}"
 
     question_count = _sanitize_question_count(req.question_count)
+    test_type: TestType = req.test_type or "smart"
+
+    # persist custom payload when applicable
+    custom_payload: Optional[Dict[str, Any]] = None
+    if test_type == "custom":
+        if not req.custom:
+            raise HTTPException(status_code=400, detail="custom test requires 'custom' payload")
+        # Store as plain dict for flexibility
+        custom_payload = {
+            "title": req.custom.title or "Custom Test",
+            "questions": [
+                q
+                if isinstance(q, dict)
+                else (q.model_dump() if hasattr(q, "model_dump") else q.dict())
+                for q in req.custom.questions
+            ],
+        }
 
     invite_doc = {
         "_id": uuid.uuid4().hex,
@@ -241,6 +296,8 @@ async def create_invite(req: InviteRequest):
         "expiresAt": expires_at,
         "createdAt": datetime.utcnow(),
         "questionCount": question_count,
+        "type": test_type,  # <-- NEW
+        "custom": custom_payload,  # <-- NEW (optional)
     }
     await db.test_invites.insert_one(invite_doc)
 
@@ -263,6 +320,9 @@ async def create_invite(req: InviteRequest):
 async def start_test(req: StartTestRequest):
     """
     Validate token & expiry, then generate a tailored test by role/experience.
+
+    ENHANCEMENTS:
+    - If invite.type == "custom", return the custom questions instead of generating.
     """
     invite = await db.test_invites.find_one({"token": req.token})
     if not invite:
@@ -276,20 +336,33 @@ async def start_test(req: StartTestRequest):
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    candidate_model = Candidate(
-        _id=candidate["_id"],
-        name=_name_from_candidate_doc(candidate),
-        email=_email_from_candidate_doc(candidate) or "",
-        phone=None,
-        skills=_skills_from_candidate_doc(candidate),
-        experience=_experience_string_from_doc(candidate),
-        resume_text=candidate.get("raw_text", ""),
-        job_role=_role_from_candidate_doc(candidate),
-    )
+    # Compute questions based on type
+    test_type: TestType = invite.get("type", "smart")
 
-    # honor the sender-selected question count (default 4)
-    question_count = _sanitize_question_count(invite.get("questionCount", 4))
-    questions = generate_test(candidate_model, question_count=question_count)
+    if test_type == "custom":
+        custom = invite.get("custom") or {}
+        questions = custom.get("questions") or []
+        if not isinstance(questions, list) or not questions:
+            # Fallback gracefully to generator if custom is empty/malformed
+            test_type = "smart"
+
+    if test_type == "smart":
+        candidate_model = Candidate(
+            _id=candidate["_id"],
+            name=_name_from_candidate_doc(candidate),
+            email=_email_from_candidate_doc(candidate) or "",
+            phone=None,
+            skills=_skills_from_candidate_doc(candidate),
+            experience=_experience_string_from_doc(candidate),
+            resume_text=candidate.get("raw_text", ""),
+            job_role=_role_from_candidate_doc(candidate),
+        )
+        # honor the sender-selected question count (default 4)
+        question_count = _sanitize_question_count(invite.get("questionCount", 4))
+        questions = generate_test(candidate_model, question_count=question_count)
+    else:
+        # custom path already set questions; still capture a sensible count
+        question_count = len(questions)
 
     test_doc = {
         "_id": uuid.uuid4().hex,
@@ -300,6 +373,7 @@ async def start_test(req: StartTestRequest):
         "status": "active",
         "startedAt": datetime.utcnow(),
         "questionCount": question_count,
+        "type": test_type,  # <-- NEW
     }
     await db.tests.insert_one(test_doc)
 
@@ -319,45 +393,93 @@ async def submit_test(req: SubmitTestRequest):
     Persist answers, grade with evaluator, return score + details.
     Also updates the candidate's 'test_score' (%) in parsed_resumes.
 
-    Unchanged behavior:
+    Unchanged behavior for SMART tests:
     - MCQ percent is calculated exactly as before.
     - If the test was already submitted, the stored result is returned.
 
-    Extensions (non-breaking):
-    - Free-form/scenario items can be auto-graded via rules/LLM when enabled.
-    - Code items can be executed via an optional runner; per-test results
+    Extensions:
+    - CUSTOM tests are stored as 'needs_marking' and return score=0.0 until graded via /tests/grade/{attempt_id}.
+    - Free-form/scenario items can be auto-graded via rules/LLM when enabled (SMART tests only).
+    - Code items can be executed via an optional runner (SMART tests only); per-test results
       are attached to the corresponding detail row.
     """
     test = await db.tests.find_one({"token": req.token})
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
 
+    # Inspect invite for type
+    invite = await db.test_invites.find_one({"token": req.token}) or {}
+    test_type: TestType = test.get("type") or invite.get("type") or "smart"
+
     # If already submitted, return the stored result (idempotent)
     if test.get("status") == "submitted":
         existing = await db.test_submissions.find_one({"testId": test["_id"]})
         if existing:
-            try:
-                await db.parsed_resumes.update_one(
-                    {"_id": test["candidateId"]},
-                    {"$set": {"test_score": float(existing["score"])}}
-                )
-            except Exception:
-                pass
+            # Only propagate to candidate profile for graded (i.e., not needs_marking)
+            if not existing.get("needs_marking", False):
+                try:
+                    await db.parsed_resumes.update_one(
+                        {"_id": test["candidateId"]},
+                        {"$set": {"test_score": float(existing.get("score", 0.0))}},
+                    )
+                except Exception:
+                    pass
             return SubmitTestResponse(
                 test_id=test["_id"],
                 candidate_id=test["candidateId"],
-                score=float(existing["score"]),
-                details=existing["details"],
+                score=float(existing.get("score", 0.0)),
+                details=existing.get("details", []),
             )
 
+    # ---------- CUSTOM TEST PATH (manual marking) ----------
+    if test_type == "custom":
+        # Build lightweight details pairing question/answer for UI preview
+        questions: List[Dict[str, Any]] = test.get("questions", [])
+        details: List[Dict[str, Any]] = []
+        for i, q in enumerate(questions):
+            details.append(
+                {
+                    "question": q.get("question", ""),
+                    "type": q.get("type", "text"),
+                    "answer": (req.answers[i].get("answer") if i < len(req.answers) else None),
+                    "is_correct": None,
+                }
+            )
+
+        submission_doc = {
+            "_id": uuid.uuid4().hex,
+            "testId": test["_id"],
+            "candidateId": test["candidateId"],
+            "answers": req.answers,
+            "score": 0.0,  # not graded yet
+            "details": details,
+            "submittedAt": datetime.utcnow(),
+            "needs_marking": True,
+            "type": "custom",
+        }
+        await db.test_submissions.insert_one(submission_doc)
+        await db.tests.update_one({"_id": test["_id"]}, {"$set": {"status": "submitted"}})
+        await db.test_invites.update_one({"token": req.token}, {"$set": {"status": "completed"}})
+
+        # Note: we DO NOT update candidate.test_score for custom until graded
+        return SubmitTestResponse(
+            test_id=test["_id"],
+            candidate_id=test["candidateId"],
+            score=0.0,
+            details=details,
+        )
+
+    # ---------- SMART TEST PATH (original logic + optional enhancers) ----------
     questions: List[Dict[str, Any]] = test.get("questions", [])
     correct_answers: List[Dict[str, Any]] = []
     for q in questions:
-        correct_answers.append({
-            "question": q.get("question", ""),
-            "correct_answer": q.get("correct_answer", ""),
-            "type": q.get("type", "mcq"),
-        })
+        correct_answers.append(
+            {
+                "question": q.get("question", ""),
+                "correct_answer": q.get("correct_answer", ""),
+                "type": q.get("type", "mcq"),
+            }
+        )
 
     # 1) Base evaluation: MCQs scored; free-form preserved (is_correct=False)
     base_result = evaluate_test(req.answers, correct_answers)
@@ -373,7 +495,13 @@ async def submit_test(req: SubmitTestRequest):
     for i, det in enumerate(details):
         # Ensure type is visible to the UI
         try:
-            qtype = str((questions[i].get("type") if i < len(questions) else correct_answers[i].get("type", "mcq"))).lower().strip()
+            qtype = (
+                str(
+                    (questions[i].get("type") if i < len(questions) else correct_answers[i].get("type", "mcq"))
+                )
+                .lower()
+                .strip()
+            )
         except Exception:
             qtype = "mcq"
         det["type"] = qtype
@@ -391,7 +519,7 @@ async def submit_test(req: SubmitTestRequest):
             continue
 
         # ---------------- Scenario / Free-form auto-grading ----------------
-        if qtype in {"scenario", "freeform", "free-form"}:
+        if qtype in {"scenario", "freeform", "free-form", "text"}:
             auto_points = 0.0
             auto_max = float(FREEFORM_MAX_POINTS)
             auto_feedback_parts: List[str] = []
@@ -454,13 +582,19 @@ async def submit_test(req: SubmitTestRequest):
         # ---------------- Code runner (optional) ----------------
         if qtype == "code" and CODE_RUNNER_ENABLED and _runner_run and submitted_text:
             # Figure out language preference: payload > question default > env default
-            lang = _norm_text(req.answers[i].get("language") or questions[i].get("language") or "python")
+            lang = _norm_text(
+                req.answers[i].get("language") or questions[i].get("language") or "python"
+            )
 
             # Normalize tests (if present on the question)
             tcases = _code_tests_from_question(questions[i]) if i < len(questions) else []
             # Per-question limits (optional)
-            q_time = int(questions[i].get("time_limit_sec", RUNNER_TIME_LIMIT)) if i < len(questions) else RUNNER_TIME_LIMIT
-            q_mem  = int(questions[i].get("memory_limit_mb", RUNNER_MEM_MB)) if i < len(questions) else RUNNER_MEM_MB
+            q_time = (
+                int(questions[i].get("time_limit_sec", RUNNER_TIME_LIMIT)) if i < len(questions) else RUNNER_TIME_LIMIT
+            )
+            q_mem = (
+                int(questions[i].get("memory_limit_mb", RUNNER_MEM_MB)) if i < len(questions) else RUNNER_MEM_MB
+            )
 
             payload = {
                 "language": lang,
@@ -494,7 +628,9 @@ async def submit_test(req: SubmitTestRequest):
                         if first_fail:
                             mode = (first_fail.get("match_result") or {}).get("mode")
                             exp = (first_fail.get("match_result") or {}).get("expected")
-                            det["explanation"] = det.get("explanation") or f"One or more tests failed. First failure mode: {mode or 'n/a'}."
+                            det["explanation"] = (
+                                det.get("explanation") or f"One or more tests failed. First failure mode: {mode or 'n/a'}."
+                            )
                             # Append expected if available (short)
                             if isinstance(exp, str) and len(exp.strip()) <= 120:
                                 det["explanation"] += f" Expected: {exp.strip()}"
@@ -502,11 +638,15 @@ async def submit_test(req: SubmitTestRequest):
                 if isinstance(runner_result, dict) and isinstance(runner_result.get("compile"), dict):
                     if not runner_result["compile"].get("ok", True):
                         msg = runner_result["compile"].get("stderr") or runner_result["compile"].get("stdout") or "Compilation error"
-                        det["explanation"] = (det.get("explanation") or "") + ((" " if det.get("explanation") else "") + f"[compile] {msg[:240]}")
+                        det["explanation"] = (det.get("explanation") or "") + (
+                            (" " if det.get("explanation") else "") + f"[compile] {msg[:240]}"
+                        )
                         det["is_correct"] = False
             except Exception as e:
                 # Don’t fail submission if runner has issues
-                det["explanation"] = (det.get("explanation") or "") + ((" " if det.get("explanation") else "") + f"[runner] {str(e)[:240]}")
+                det["explanation"] = (det.get("explanation") or "") + (
+                    (" " if det.get("explanation") else "") + f"[runner] {str(e)[:240]}"
+                )
                 det["is_correct"] = det.get("is_correct", False)
 
     # 3) MCQ percent (unchanged)
@@ -524,6 +664,8 @@ async def submit_test(req: SubmitTestRequest):
         "score": percent,  # store MCQ percent (unchanged for UI compatibility)
         "details": details,
         "submittedAt": datetime.utcnow(),
+        "needs_marking": False,  # SMART tests are auto-graded
+        "type": "smart",
     }
 
     # Include free-form grading summary for reporting (non-breaking)
@@ -550,10 +692,7 @@ async def submit_test(req: SubmitTestRequest):
 
     # Update candidate profile with latest test_score (%)
     try:
-        await db.parsed_resumes.update_one(
-            {"_id": test["candidateId"]},
-            {"$set": {"test_score": percent}}
-        )
+        await db.parsed_resumes.update_one({"_id": test["candidateId"]}, {"$set": {"test_score": percent}})
     except Exception:
         pass  # not fatal
 
@@ -563,3 +702,122 @@ async def submit_test(req: SubmitTestRequest):
         score=percent,
         details=submission_doc["details"],
     )
+
+
+# =======================
+# NEW: Manual grading API
+# =======================
+
+
+class GradeRequest(BaseModel):
+    score: float = Field(..., ge=0, le=100, description="Final percent score to record for this attempt")
+
+
+class GradeResponse(BaseModel):
+    ok: bool
+    attempt_id: str
+    score: float
+    candidate_id: str
+
+
+@router.post("/grade/{attempt_id}", response_model=GradeResponse)
+async def grade_attempt(
+    attempt_id: str = Path(..., description="test_submissions._id"),
+    body: GradeRequest = None,
+):
+    """
+    Manually set the score for a custom test submission, and update the candidate's test_score.
+    """
+    attempt = await db.test_submissions.find_one({"_id": attempt_id})
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    # Only custom tests should be manually graded
+    if attempt.get("type") != "custom":
+        raise HTTPException(status_code=400, detail="Only custom test attempts can be manually graded")
+
+    score = float(body.score)
+    await db.test_submissions.update_one(
+        {"_id": attempt_id},
+        {
+            "$set": {
+                "score": score,
+                "needs_marking": False,
+                "gradedAt": datetime.utcnow(),
+            }
+        },
+    )
+
+    candidate_id = attempt.get("candidateId")
+    if candidate_id:
+        try:
+            await db.parsed_resumes.update_one({"_id": candidate_id}, {"$set": {"test_score": score}})
+        except Exception:
+            pass
+
+    return GradeResponse(ok=True, attempt_id=attempt_id, score=score, candidate_id=candidate_id or "")
+
+
+# =========================================
+# NEW: Lightweight history/preview endpoints
+# =========================================
+
+
+def _attach_candidate_stub(doc: Dict[str, Any], cand: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    cstub = None
+    if cand:
+        cstub = {
+            "_id": cand.get("_id"),
+            "name": _name_from_candidate_doc(cand),
+            "email": _email_from_candidate_doc(cand),
+            "resume": {"email": cand.get("resume", {}).get("email")} if isinstance(cand.get("resume"), dict) else {},
+        }
+    out = {
+        "_id": doc.get("_id"),
+        "candidateId": doc.get("candidateId"),
+        "type": doc.get("type", "smart"),
+        "score": doc.get("score"),
+        "submitted_at": doc.get("submittedAt"),
+        "created_at": doc.get("submittedAt"),  # for sorting in UI
+        "candidate": cstub,
+    }
+    return out
+
+
+@router.get("/history/all")
+async def get_history_all():
+    """
+    Return recent attempts for preview, plus the subset that needs manual marking.
+    Shape aligns with UI expectations:
+      { attempts: [...], needs_marking: [...] }
+    """
+    # Pull recent submissions
+    cur = db.test_submissions.find({}).sort("submittedAt", -1).limit(100)
+    subs = [s async for s in cur]
+
+    # Fetch candidates in one pass
+    cand_ids = list({s.get("candidateId") for s in subs if s.get("candidateId")})
+    cand_map: Dict[str, Dict[str, Any]] = {}
+    if cand_ids:
+        async for c in db.parsed_resumes.find({"_id": {"$in": cand_ids}}):
+            cand_map[c["_id"]] = c
+
+    attempts = [_attach_candidate_stub(s, cand_map.get(s.get("candidateId"))) for s in subs]
+    needs = [a for a in attempts if any(x for x in subs if x["_id"] == a["_id"] and x.get("needs_marking"))]
+
+    return {
+        "attempts": attempts,
+        "needs_marking": needs,
+    }
+
+
+@router.get("/history/{candidate_id}")
+async def get_history_for_candidate(candidate_id: str):
+    """
+    Return attempts for a specific candidate, newest first.
+    """
+    cur = db.test_submissions.find({"candidateId": candidate_id}).sort("submittedAt", -1).limit(50)
+    subs = [s async for s in cur]
+    cand = await db.parsed_resumes.find_one({"_id": candidate_id})
+    attempts = [_attach_candidate_stub(s, cand) for s in subs]
+    return {"attempts": attempts}
