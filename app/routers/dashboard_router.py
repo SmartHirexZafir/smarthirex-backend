@@ -254,6 +254,20 @@ async def dashboard_lists(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ✅ NEW (alias): GET /dashboard/overview
+#   Backward-compatible alias that returns the same shape as /dashboard/lists.
+#   This keeps older frontends working without code changes.
+# ──────────────────────────────────────────────────────────────────────────────
+@router.get("/overview")
+async def dashboard_overview(
+    limit_per_bucket: int = Query(100, ge=1, le=1000),
+    current_user: Any = Depends(get_current_user),
+) -> JSONResponse:
+    # Delegate to the canonical /lists implementation
+    return await dashboard_lists(limit_per_bucket=limit_per_bucket, current_user=current_user)  # type: ignore[return-value]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # GET /dashboard/leaderboard
 #   Top N candidates across accepted/shortlisted/in_review by total_score.
 # ──────────────────────────────────────────────────────────────────────────────
