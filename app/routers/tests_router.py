@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict, Literal
 
-from fastapi import APIRouter, HTTPException, Path
+from fastapi import APIRouter, HTTPException, Path, Depends
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 
@@ -16,6 +16,7 @@ from app.utils.emailer import send_email, render_invite_html
 from app.models.auto_test_models import Candidate
 from app.logic.generator import generate_test
 from app.logic.evaluator import evaluate_test  # returns {"total_score": int, "details": [...]}
+from app.routers.auth_router import get_current_user  # ✅ auth dependency
 
 # --- Optional graders (robust import; fully optional) ------------------------
 USE_RULES = os.getenv("FREEFORM_RULES_GRADING", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -242,7 +243,7 @@ class SubmitTestResponse(BaseModel):
 
 
 @router.post("/invite", response_model=InviteResponse)
-async def create_invite(req: InviteRequest):
+async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     """
     Create a test invite for a candidate and send an email with a secure link.
 
@@ -724,6 +725,7 @@ class GradeResponse(BaseModel):
 async def grade_attempt(
     attempt_id: str = Path(..., description="test_submissions._id"),
     body: GradeRequest = None,
+    current=Depends(get_current_user),
 ):
     """
     Manually set the score for a custom test submission, and update the candidate's test_score.
@@ -785,7 +787,7 @@ def _attach_candidate_stub(doc: Dict[str, Any], cand: Optional[Dict[str, Any]]) 
 
 
 @router.get("/history/all")
-async def get_history_all():
+async def get_history_all(current=Depends(get_current_user)):
     """
     Return recent attempts for preview, plus the subset that needs manual marking.
     Shape aligns with UI expectations:
@@ -812,7 +814,7 @@ async def get_history_all():
 
 
 @router.get("/history/{candidate_id}")
-async def get_history_for_candidate(candidate_id: str):
+async def get_history_for_candidate(candidate_id: str, current=Depends(get_current_user)):
     """
     Return attempts for a specific candidate, newest first.
     """

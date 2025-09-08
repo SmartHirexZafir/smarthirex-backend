@@ -1,10 +1,11 @@
 # 📄 app/routers/history_router.py
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from bson import ObjectId
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from app.utils.mongo import db
+from app.routers.auth_router import get_current_user
 import re
 
 router = APIRouter()
@@ -281,7 +282,8 @@ async def get_history(
     dateFrom: Optional[str] = Query(None),
     dateTo: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
-    sort: Optional[str] = Query("latest")
+    sort: Optional[str] = Query("latest"),
+    current=Depends(get_current_user),
 ):
     query: Dict[str, Any] = {}
 
@@ -310,7 +312,7 @@ async def get_history(
 
 
 @router.get("/history-result/{history_id}")
-async def get_history_result(history_id: str):
+async def get_history_result(history_id: str, current=Depends(get_current_user)):
     """
     Return a saved history block with candidates.
     ✅ Ensures every candidate carries dynamic match % fields so UI never shows '0% match' blanks.
@@ -337,7 +339,7 @@ async def get_history_result(history_id: str):
 
 # ---------------------- NEW: re-run prompt (scoped) ----------------------
 @router.post("/rerun/{history_id}")
-async def rerun_history_block(history_id: str, payload: Dict[str, Any]):
+async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=Depends(get_current_user)):
     """
     Re-run a refined prompt ONLY against the CVs already saved inside this history block.
     The same history document is updated in-place with the narrowed/updated candidate list.

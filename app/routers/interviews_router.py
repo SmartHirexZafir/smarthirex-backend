@@ -9,6 +9,7 @@ from typing import Optional, Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from pydantic import BaseModel, Field, EmailStr, field_validator
+from app.routers.auth_router import get_current_user  # ✅ require auth for Meetings endpoints
 
 # --- Optional/soft imports from your existing utils ---
 try:
@@ -283,7 +284,11 @@ def _candidate_has_test(db, candidate_id: str) -> bool:
     response_model=ScheduleInterviewResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
+def schedule_interview(
+    req: ScheduleInterviewRequest,
+    db=Depends(get_db),
+    current=Depends(get_current_user),  # ✅ protect scheduling
+):
     """
     Create a meeting record, generate a join URL, and send the invite email to the candidate.
     The join URL is the FRONTEND "gate" page (/meetings/{token}). We also store
@@ -390,7 +395,11 @@ def schedule_interview(req: ScheduleInterviewRequest, db=Depends(get_db)):
 
 
 @router.get("/by-candidate/{candidate_id}", response_model=List[MeetingOut])
-def list_interviews_for_candidate(candidate_id: str, db=Depends(get_db)):
+def list_interviews_for_candidate(
+    candidate_id: str,
+    db=Depends(get_db),
+    current=Depends(get_current_user),  # ✅ protect listing
+):
     """
     Return meetings for a specific candidate, most recent first.
     """
@@ -488,6 +497,7 @@ def get_meeting_by_token(token: str, db=Depends(get_db)):
 def list_eligible_candidates(
     limit: int = Query(100, ge=1, le=500),
     db=Depends(get_db),
+    current=Depends(get_current_user),  # ✅ protect eligible list
 ):
     """
     Returns candidates who are eligible for scheduling (i.e., have taken a test).
@@ -540,6 +550,7 @@ def list_eligible_candidates(
 def stats_today(
     tz: str = Query("UTC", description="IANA timezone (e.g., Asia/Karachi)"),
     db=Depends(get_db),
+    current=Depends(get_current_user),  # ✅ protect stats endpoint
 ):
     """
     Returns number of meetings scheduled for 'today' in the given timezone.

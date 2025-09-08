@@ -288,7 +288,7 @@ async def login(data: LoginRequest):
         algorithm=ALGORITHM
     )
 
-    return {
+    payload = {
         "token": token,
         "message": "Login successful",
         "user": {
@@ -299,6 +299,25 @@ async def login(data: LoginRequest):
             "jobTitle": user.get("jobTitle", "")
         }
     }
+
+    secure_cookie = BACKEND_BASE_URL.startswith("https://")
+    response = JSONResponse(payload)
+    response.set_cookie(
+        key="token",
+        value=token,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+        max_age=JWT_EXPIRES_HOURS * 3600,
+        path="/",
+    )
+    return response
+
+@router.post("/logout")
+async def logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("token", path="/")
+    return response
 
 # ----------- Me (used by Google flow to fetch current profile) -----------
 
