@@ -71,6 +71,56 @@ def resume_lean_projection(extra_excludes: Optional[Dict[str, int]] = None) -> D
     return proj
 
 
+# ✅ NEW: Sanitize documents before insert/update to avoid null proliferation
+def sanitize_doc(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For known fields only; do not mutate large blobs unnecessarily.
+    Replaces None with sensible defaults so frontend can rely on shapes.
+    """
+    out = dict(d)
+
+    defaults = {
+        "name": "",
+        "email": "",
+        "phone": "",
+        "predicted_role": "",
+        "role_norm": "",
+        "location": "",
+        "experience": 0,
+        "yoe_num": 0,
+        "resume_url": "",
+        "company": "",
+        "category": "",
+        "raw_text": "",
+    }
+    for k, v in defaults.items():
+        if out.get(k) is None:
+            out[k] = v
+
+    # list defaults
+    if out.get("skills") is None or not isinstance(out.get("skills"), list):
+        out["skills"] = []
+    if out.get("skills_norm") is None or not isinstance(out.get("skills_norm"), list):
+        out["skills_norm"] = []
+    if out.get("education") is None or not isinstance(out.get("education"), list):
+        out["education"] = []
+    if out.get("projects") is None or not isinstance(out.get("projects"), list):
+        out["projects"] = []
+
+    # Normalize nested resume
+    r = out.get("resume") or {}
+    out["resume"] = {
+        "summary": r.get("summary") or "",
+        "education": r.get("education") or [],
+        "workHistory": r.get("workHistory") or [],
+        "projects": r.get("projects") or [],
+        "filename": r.get("filename") or out.get("filename") or "resume.pdf",
+        "url": r.get("url") or out.get("resume_url") or "",
+    }
+
+    return out
+
+
 # ✅ NEW: Compute SHA256 hash of resume content for duplicate detection
 def compute_cv_hash(text: str) -> str:
     if not text:

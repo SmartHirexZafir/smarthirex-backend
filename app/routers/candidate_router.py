@@ -48,6 +48,18 @@ def _email_of(doc: Dict[str, Any]) -> str:
     ).strip()
 
 
+def _num(v: Any) -> Optional[float]:
+    """Coerce possibly-string numbers to float; return None when not parseable."""
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str) and v.strip() != "":
+            return float(v.strip())
+    except Exception:
+        return None
+    return None
+
+
 @router.get("/{candidate_id}")
 async def get_candidate(
     candidate_id: str = Path(...),
@@ -56,11 +68,24 @@ async def get_candidate(
     """
     Fetch full candidate detail by ID (scoped to owner).
     Ensures all expected frontend fields are present with safe defaults.
+    Also includes:
+      - match_score / final_score / prompt_matching_score (coalesced to numbers)
+      - test_score / testScore (normalized 0–100)
+      - skills as an array
+      - resume.url populated from resume_url when missing
+      - attempts[] list if test submissions exist (with linkable pdf/report URLs)
     """
     owner_id = str(getattr(current_user, "id", None))
     candidate = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # ---------------- Profile/defaults (no nulls) ----------------
+    candidate["name"] = candidate.get("name") or "No Name"
+    candidate["location"] = candidate.get("location") or "N/A"
+    candidate["currentRole"] = candidate.get("currentRole") or "N/A"
+    candidate["company"] = candidate.get("company") or "N/A"
+    candidate["avatar"] = candidate.get("avatar") or ""
 
     # Resume object & defaults
     resume = candidate.setdefault("resume", {})
@@ -69,50 +94,102 @@ async def get_candidate(
     resume.setdefault("workHistory", [])
     resume.setdefault("projects", [])
     resume.setdefault("filename", candidate.get("filename", "resume.pdf"))
-    resume.setdefault("url", candidate.get("resume_url", ""))  # optional download link
+    # ensure a downloadable URL lives under resume.url
+    resume.setdefault("url", candidate.get("resume_url", "") or candidate.get("resumeUrl", "") or "")
 
-    # Analysis fields (safe defaults)
-    candidate["score"] = candidate.get("score", 0)
-    # Surface both snake_case and camelCase for test score
-    test_score_val = candidate.get("test_score")
+    # ---------------- Scores & skills normalization ----------------
+    # Legacy overall match score field
+    legacy_match = _num(candidate.get("score")) or 0.0
+
+    # Normalize/coalesce the three score fields the UI may read
+    match_score = _num(candidate.get("match_score"))
+    final_score = _num(candidate.get("final_score") or candidate.get("finalScore"))
+    prompt_matching_score = _num(candidate.get("prompt_matching_score") or candidate.get("promptMatchingScore"))
+
+    # If any are missing, backfill from the others (then fall back to legacy score)
+    if match_score is None:
+        match_score = final_score if final_score is not None else (prompt_matching_score if prompt_matching_score is not None else legacy_match)
+    if final_score is None:
+        final_score = match_score if match_score is not None else (prompt_matching_score if prompt_matching_score is not None else legacy_match)
+    if prompt_matching_score is None:
+        prompt_matching_score = final_score if final_score is not None else (match_score if match_score is not None else legacy_match)
+
+    # Clamp to 0..100
+    def _clamp01(x: Optional[float]) -> float:
+        if x is None:
+            return 0.0
+        try:
+            return max(0.0, min(100.0, float(x)))
+        except Exception:
+            return 0.0
+
+    match_score = _clamp01(match_score)
+    final_score = _clamp01(final_score)
+    prompt_matching_score = _clamp01(prompt_matching_score)
+    legacy_match = _clamp01(legacy_match)
+
+    # Persist normalized numbers back to the response shape
+    candidate["match_score"] = match_score
+    candidate["final_score"] = final_score
+    candidate["prompt_matching_score"] = prompt_matching_score
+    candidate["score"] = legacy_match  # keep legacy for existing UI bits
+
+    # Surface both snake_case and camelCase for test score (0–100)
+    test_score_val = _num(candidate.get("test_score"))
     if test_score_val is None:
-        test_score_val = candidate.get("testScore", 0)
-    candidate["testScore"] = test_score_val or 0
+        test_score_val = _num(candidate.get("testScore")) or 0.0
+    candidate["test_score"] = _clamp01(test_score_val)
+    candidate["testScore"] = candidate["test_score"]
 
-    candidate["matchedSkills"] = candidate.get("matchedSkills", [])
-    candidate["missingSkills"] = candidate.get("missingSkills", [])
-    candidate["strengths"] = candidate.get("strengths", [])
-    candidate["redFlags"] = candidate.get("redFlags", [])
-    candidate["selectionReason"] = candidate.get("selectionReason", "")
+    # Arrays that should never be null
+    candidate["skills"] = candidate.get("skills") or []
+    candidate["matchedSkills"] = candidate.get("matchedSkills") or []
+    candidate["missingSkills"] = candidate.get("missingSkills") or []
+    candidate["strengths"] = candidate.get("strengths") or []
+    candidate["redFlags"] = candidate.get("redFlags") or []
+    candidate["selectionReason"] = candidate.get("selectionReason") or ""
     candidate["rank"] = candidate.get("rank", 0)
 
-    # Profile info
-    candidate["name"] = candidate.get("name", "No Name")
-    candidate["location"] = candidate.get("location", "N/A")
-    candidate["currentRole"] = candidate.get("currentRole", "N/A")
-    candidate["company"] = candidate.get("company", "N/A")
-    candidate["avatar"] = candidate.get("avatar", "")
-
     # Model output fields
-    candidate["category"] = candidate.get("category") or candidate.get("predicted_role", "")
-    candidate["confidence"] = candidate.get("confidence", 0)
-    candidate["match_reason"] = candidate.get("match_reason", "ML classified")
-    candidate["semantic_score"] = candidate.get("semantic_score", None)
+    candidate["category"] = candidate.get("category") or candidate.get("predicted_role") or ""
+    candidate["confidence"] = _num(candidate.get("confidence")) or 0.0
+    candidate["match_reason"] = candidate.get("match_reason") or "ML classified"
+    candidate["semantic_score"] = _num(candidate.get("semantic_score"))
 
     # Ensure job_role is always present for UI (Meetings/Test pages use it)
     candidate["job_role"] = _job_role_of(candidate)
 
-    # Also expose snake_case test_score for consistency with graders
-    candidate["test_score"] = candidate.get("test_score", candidate.get("testScore", 0))
-
     # Compute/echo total_score if missing (avg of match + test)
-    if "total_score" not in candidate:
+    if "total_score" not in candidate or candidate.get("total_score") is None:
         try:
-            m = float(candidate.get("score") or 0)
+            m = float(candidate.get("final_score") or candidate.get("match_score") or candidate.get("score") or 0)
             t = float(candidate.get("test_score") or 0)
             candidate["total_score"] = round(((m + t) / 2.0), 1)
         except Exception:
             candidate["total_score"] = None
+
+    # ---------------- Attempts list (linkable URLs if stored) ----------------
+    # If your project stores test attempts in test_submissions, expose a compact list for the History tab.
+    attempts: List[Dict[str, Any]] = []
+    try:
+        cursor = db.test_submissions.find({"candidateId": candidate_id}).sort("createdAt", -1)
+        async for a in cursor:
+            raw_score = a.get("score") or a.get("result_score") or a.get("test_score")
+            parsed_score = None
+            n = _num(raw_score)
+            if n is not None:
+                parsed_score = int(round(_clamp01(n)))
+            attempts.append({
+                "id": str(a.get("_id") or a.get("id") or uuid.uuid4().hex),
+                "submittedAt": a.get("submittedAt") or a.get("createdAt") or a.get("created_at") or a.get("timestamp"),
+                "score": parsed_score,
+                "pdfUrl": a.get("pdfUrl") or a.get("pdf_url") or a.get("reportUrl") or a.get("report_url") or "",
+            })
+    except Exception:
+        # Silently ignore if the collection doesn't exist
+        attempts = []
+
+    candidate["attempts"] = attempts
 
     return candidate
 
@@ -134,9 +211,15 @@ async def update_candidate_status(
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     # Compute total_score based on current fields
-    match_score = float(cand.get("score") or 0)
-    test_score = float(cand.get("test_score") if cand.get("test_score") is not None else cand.get("testScore") or 0)
-    total_score = round(((match_score + test_score) / 2.0), 1)
+    # Prefer normalized final/match scores if available
+    match_score = (
+        _num(cand.get("final_score"))
+        or _num(cand.get("match_score"))
+        or _num(cand.get("score"))
+        or 0.0
+    )
+    test_score = _num(cand.get("test_score")) or _num(cand.get("testScore")) or 0.0
+    total_score = round(((float(match_score) + float(test_score)) / 2.0), 1)
 
     result = await db.parsed_resumes.update_one(
         {"_id": candidate_id, "ownerUserId": owner_id},

@@ -112,23 +112,60 @@ def _app_jwt_for_user(user: Dict) -> str:
         algorithm=ALGORITHM
     )
 
+def _iso(dt: Optional[datetime]) -> str:
+    if isinstance(dt, datetime):
+        try:
+            # ensure timezone-aware in ISO
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        except Exception:
+            return ""
+    return ""
+
+def _coalesce_str(v) -> str:
+    return v if isinstance(v, str) else ("" if v is None else str(v))
+
 def _serialize_user_for_client(user: Dict) -> Dict:
-    """Return a client-safe user payload (mirrors existing login shape + adds convenience fields)."""
-    first = user.get("firstName", "") or ""
-    last = user.get("lastName", "") or ""
-    display_name = (first + " " + last).strip() or user.get("displayName", "")
-    role = user.get("jobTitle", "") or user.get("role", "")
+    """
+    Return a client-safe user payload with safe defaults (no nulls).
+    Includes common avatar fields and timestamps as ISO strings.
+    """
+    first = _coalesce_str(user.get("firstName", ""))
+    last = _coalesce_str(user.get("lastName", ""))
+    display_name = (first + " " + last).strip() or _coalesce_str(user.get("displayName", ""))
+    role = _coalesce_str(user.get("jobTitle", "") or user.get("role", ""))
+    company = _coalesce_str(user.get("company", ""))
+    email = _coalesce_str(user.get("email", ""))
+
+    # avatar fields harmonized
+    avatar_url = (
+        _coalesce_str(user.get("avatarUrl"))
+        or _coalesce_str(user.get("avatar_url"))
+        or _coalesce_str(user.get("avatar"))
+        or _coalesce_str(user.get("photoUrl"))
+        or _coalesce_str(user.get("photo_url"))
+    )
+    created_at = user.get("created_at")
+    updated_at = user.get("updated_at")
+
     return {
-        "email": user.get("email", ""),
+        "id": _coalesce_str(user.get("_id")),
+        "email": email,
         "firstName": first,
         "lastName": last,
-        "company": user.get("company", "") or "",
-        "jobTitle": user.get("jobTitle", "") or "",
-        # Convenience fields used by the frontend Google flow:
-        "name": display_name,
+        "company": company,
+        "jobTitle": _coalesce_str(user.get("jobTitle", "")),
         "role": role,
-        "id": str(user.get("_id")),
-        "authProvider": user.get("auth_provider", "password"),
+        "name": display_name,
+        "authProvider": _coalesce_str(user.get("auth_provider", "password")),
+        # avatar variants (frontend will pick what it needs)
+        "avatar": avatar_url,          # generic
+        "avatarUrl": avatar_url,       # camelCase
+        "photoUrl": avatar_url,        # legacy
+        # timestamps (ISO)
+        "createdAt": _iso(created_at),
+        "updatedAt": _iso(updated_at),
     }
 
 def _split_name(full_name: str) -> Dict[str, str]:
@@ -291,13 +328,7 @@ async def login(data: LoginRequest):
     payload = {
         "token": token,
         "message": "Login successful",
-        "user": {
-            "email": user["email"],
-            "firstName": user.get("firstName", ""),
-            "lastName": user.get("lastName", ""),
-            "company": user.get("company", ""),
-            "jobTitle": user.get("jobTitle", "")
-        }
+        "user": _serialize_user_for_client(user),
     }
 
     secure_cookie = BACKEND_BASE_URL.startswith("https://")
@@ -315,17 +346,19 @@ async def login(data: LoginRequest):
 
 @router.post("/logout")
 async def logout():
+    # ✅ ensure cookie is cleared; keep payload simple and stable
     response = JSONResponse({"ok": True})
     response.delete_cookie("token", path="/")
     return response
 
-# ----------- Me (used by Google flow to fetch current profile) -----------
+# ----------- Me (used by Google flow / profile page to fetch current profile) -----------
 
 @router.get("/me")
 async def me(current: SimpleNamespace = Depends(get_current_user)):
     user = await db.users.find_one({"_id": current.id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # ✅ return complete, null-safe profile inside "user" for frontend compatibility
     return {"user": _serialize_user_for_client(user)}
 
 # ----------- Complete profile (Google flow) -----------

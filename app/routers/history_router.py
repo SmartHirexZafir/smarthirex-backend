@@ -78,7 +78,7 @@ def _extract_year_bounds(prompt_like: str) -> Tuple[Optional[float], Optional[fl
     if m and min_v is None:
         min_v = to_num(m.group(1))
 
-    # strict > / <
+    # strict > / < (without equals)
     if min_v is None:
         m = re.search(r"(?:>\s*)(\d+(?:\.\d+)?)\s*(?:years?|yrs?)", txt)
         if m: min_v = to_num(m.group(1))
@@ -275,6 +275,144 @@ def _simple_filter_candidates(prompt: str, candidates: List[Dict[str, Any]]) -> 
     return _apply_naive_refiners(prompt, scored)
 
 
+# ---------------------- Section-focused helpers (scoped search) ----------------------
+
+def _focus_match(candidate: Dict[str, Any], prompt: str, section: str) -> bool:
+    """
+    Returns True iff the candidate matches the prompt when searching ONLY within the given section.
+    Sections: 'role' | 'experience' | 'education' | 'skills' | 'projects' | 'location' | 'phrases'
+    """
+    p = (prompt or "").strip().lower()
+    if not p:
+        return True
+
+    tokens = _tokenize_prompt(p)
+
+    def _in_text(txt: str) -> bool:
+        low = txt.lower()
+        # token-based contains
+        return any(t in low for t in tokens) if tokens else (p in low)
+
+    # role-focused fields
+    if section == "role":
+        fields = [
+            candidate.get("job_role"),
+            candidate.get("predicted_role"),
+            candidate.get("category"),
+            candidate.get("role"),
+            candidate.get("title"),
+            candidate.get("currentRole"),
+        ]
+        joined = " ".join([str(x) for x in fields if x])
+        return _in_text(joined)
+
+    if section == "skills":
+        skills = candidate.get("skills") or []
+        skills_text = " ".join([str(s) for s in skills if s])
+        return _in_text(skills_text)
+
+    if section == "location":
+        loc = str(candidate.get("location") or "")
+        return _in_text(loc)
+
+    if section == "education":
+        edu_sources: List[str] = []
+        # flat fields if present
+        for k in ("education", "schools", "degrees", "degree", "university", "college"):
+            v = candidate.get(k)
+            if isinstance(v, list):
+                edu_sources.extend([str(x) for x in v])
+            elif isinstance(v, str):
+                edu_sources.append(v)
+        # from resume subtree
+        resume = candidate.get("resume") or {}
+        for k in ("education", "schools", "degrees"):
+            v = resume.get(k)
+            if isinstance(v, list):
+                edu_sources.extend([str(x) for x in v])
+            elif isinstance(v, str):
+                edu_sources.append(v)
+        return _in_text(" ".join(edu_sources))
+
+    if section == "projects":
+        proj_sources: List[str] = []
+        # simple places projects might be found
+        for k in ("projects", "project_highlights"):
+            v = candidate.get(k)
+            if isinstance(v, list):
+                proj_sources.extend([str(x) for x in v])
+            elif isinstance(v, str):
+                proj_sources.append(v)
+        resume = candidate.get("resume") or {}
+        # workHistory often contains projects/roles
+        wh = resume.get("workHistory") or []
+        if isinstance(wh, list):
+            for item in wh:
+                if isinstance(item, dict):
+                    for k in ("title", "description", "projects"):
+                        v = item.get(k)
+                        if isinstance(v, list):
+                            proj_sources.extend([str(x) for x in v])
+                        elif isinstance(v, str):
+                            proj_sources.append(v)
+                else:
+                    proj_sources.append(str(item))
+        return _in_text(" ".join(proj_sources))
+
+    if section == "phrases":
+        # exact-ish phrase search across a broad blob
+        blob_parts = [
+            str(candidate.get("name", "")),
+            str(candidate.get("email", "")),
+            str(candidate.get("title", "")),
+            str(candidate.get("role", "")),
+            str(candidate.get("summary", "")),
+            str(candidate.get("currentRole", "")),
+            str(candidate.get("predicted_role", "")),
+            str(candidate.get("category", "")),
+            str(candidate.get("location", "")),
+            str(candidate.get("experience", "")),
+        ]
+        for key in ("skills", "matchReasons", "highlights", "tags"):
+            val = candidate.get(key)
+            if isinstance(val, list):
+                blob_parts.extend([str(x) for x in val])
+            elif isinstance(val, str):
+                blob_parts.append(val)
+        resume = candidate.get("resume") or {}
+        for k in ("workHistory", "projects", "education", "summary"):
+            v = resume.get(k)
+            if isinstance(v, list):
+                blob_parts.extend([str(x) for x in v])
+            elif isinstance(v, str):
+                blob_parts.append(v)
+        blob = " ".join(blob_parts).lower()
+        return p in blob  # phrase presence
+
+    if section == "experience":
+        # Only apply experience bounds; if none detected, accept all
+        min_y, max_y = _extract_year_bounds(p)
+        yrs = _candidate_years(candidate)
+        if min_y is not None and yrs < float(min_y):
+            return False
+        if max_y is not None and yrs > float(max_y):
+            return False
+        return True
+
+    # Fallback: if the section is unknown, don't filter out
+    return True
+
+
+def _apply_focus_section(matches: List[Dict[str, Any]], prompt: str, focus_section: Optional[str]) -> List[Dict[str, Any]]:
+    if not focus_section:
+        return matches
+    section = focus_section.strip().lower()
+    allowed = {"role", "experience", "education", "skills", "projects", "location", "phrases"}
+    if section not in allowed:
+        return matches
+    return [c for c in matches if _focus_match(c, prompt, section)]
+
+
 # --------------------------- Routes -----------------------------------
 
 @router.get("/user-history")
@@ -344,6 +482,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
     Re-run a refined prompt ONLY against the CVs already saved inside this history block.
     The same history document is updated in-place with the narrowed/updated candidate list.
     Response shape is chat-friendly for the popup UI.
+
+    Supports options.focus_section to scope search within a specific section:
+      role | experience | education | skills | projects | location | phrases
     """
     # Validate history id
     try:
@@ -360,6 +501,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
     if not isinstance(prompt, str) or not prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required")
     prompt = prompt.strip()
+
+    options = (payload or {}).get("options") or {}
+    focus_section = (options.get("focus_section") or "").strip().lower() if isinstance(options, dict) else ""
 
     # Collect whitelist of candidate IDs from the saved block
     original_candidates = h.get("candidates") or []
@@ -400,6 +544,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
             matches = _apply_naive_refiners(prompt, matches)
     else:
         matches = _simple_filter_candidates(prompt, original_candidates)
+
+    # 🔎 Apply section-focused scope (role/experience/education/skills/projects/location/phrases)
+    matches = _apply_focus_section(matches, prompt, focus_section)
 
     # Prepare metadata & timestamps
     ts_raw = datetime.utcnow()

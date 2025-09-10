@@ -49,6 +49,65 @@ TOAST_HOLD_MS = 3500          # green toast ~3.5s
 PROGRESS_HOLD_MS = 2000       # progress bar stays ~2s after 100%
 
 
+def _round_to_half(n: float) -> float:
+    try:
+        return round(n * 2) / 2.0
+    except Exception:
+        return 0.0
+
+
+def _experience_display(n: float) -> str:
+    try:
+        if n > 0 and n < 1:
+            return "< 1 year"
+        if n >= 1:
+            r = int(round(n))
+            return f"{r} year" + ("" if r == 1 else "s")
+    except Exception:
+        pass
+    return "Not specified"
+
+
+def _sanitize_for_mongo(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Replace obvious None values with safe defaults for known fields so Mongo
+    doesn't get nulls that break the UI. Only touches a conservative set.
+    """
+    string_fields = [
+        "name", "location", "company", "predicted_role", "category", "currentRole",
+        "email", "phone", "filename", "resume_url", "legacy_ml_predicted_role",
+    ]
+    list_fields = ["skills", "resume.education", "resume.workHistory", "resume.projects"]
+
+    for f in string_fields:
+        if "." in f:
+            parent, child = f.split(".", 1)
+            if parent in doc and isinstance(doc[parent], dict) and doc[parent].get(child) is None:
+                doc[parent][child] = ""
+        else:
+            if doc.get(f) is None:
+                doc[f] = ""
+
+    for f in list_fields:
+        if "." in f:
+            parent, child = f.split(".", 1)
+            if parent in doc and isinstance(doc[parent], dict) and not isinstance(doc[parent].get(child), list):
+                doc[parent][child] = []
+        else:
+            if not isinstance(doc.get(f), list):
+                doc[f] = []
+
+    # Numbers with sensible defaults (only for known numeric fields)
+    for nf in ["experience", "total_experience_years", "years_of_experience", "experience_years", "yoe"]:
+        v = doc.get(nf)
+        try:
+            doc[nf] = float(v) if v is not None else 0.0
+        except Exception:
+            doc[nf] = 0.0
+
+    return doc
+
+
 @router.post("/upload-resumes")
 async def upload_resumes(
     files: List[UploadFile] = File(...),
@@ -310,6 +369,28 @@ async def upload_resumes(
             index_blob = ""
         resume_data["index_blob"] = index_blob or None
 
+        # ---------- Derived light fields (for UI queries & display) ----------
+        resume_data["experience_rounded"] = _round_to_half(float(numeric_years))
+        resume_data["experience_display"] = _experience_display(float(numeric_years))
+        # location_norm: lowercased & trimmed (keep "n/a" as-is if already that)
+        try:
+            loc = (resume_data.get("location") or "").strip()
+            resume_data["location_norm"] = loc.lower()
+        except Exception:
+            resume_data["location_norm"] = ""
+        # search_blob: concise, sanitized text for quick text searches
+        try:
+            search_blob = " | ".join([
+                str(resume_data.get("name") or ""),
+                str(resume_data.get("predicted_role") or ""),
+                " ".join([s for s in (resume_data.get("skills") or []) if isinstance(s, str)]),
+                str(resume_data.get("location") or ""),
+                str(resume_data.get("company") or ""),
+            ])
+            resume_data["search_blob"] = clean_text(search_blob)[:4096]
+        except Exception:
+            resume_data["search_blob"] = None
+
         # ---------- Embedding lifecycle fields (observable) ----------
         # If parser already provided an embedding, respect it and mark ready.
         existing_vec = resume_data.get("index_embedding")
@@ -366,6 +447,9 @@ async def upload_resumes(
                 # Embedding failed; keep pending/failed state
                 resume_data["embedding_status"] = "failed"
                 resume_data["ann_ready"] = False
+
+        # ---------- Sanitize before persistence ----------
+        resume_data = _sanitize_for_mongo(resume_data)
 
         # ---------- Persist once (single insert) ----------
         await db.parsed_resumes.insert_one(resume_data)

@@ -31,6 +31,8 @@ _ALLOWED_FILTERS = {
     "cv_content_matching": "cv",
     "education": "education",      # ✅ Education
     "edu": "education",
+    # mapping for focus_section convenience (handled explicitly as well)
+    "phrases": "cv",
 }
 
 # Minimal baseline skills for routing-level filtering (kept as final fallback)
@@ -788,6 +790,34 @@ def _annotate_scores(preview: List[Dict[str, Any]], prompt_like: str, keywords: 
         c["role_prediction_confidence"] = _to_percent(role_conf)
 
 
+def _normalize_related_roles(preview: List[Dict[str, Any]]) -> None:
+    """
+    Normalize any existing related roles to ensure a percentage field is present.
+    Does not invent data—only converts 0..1 to 0..100 or forwards existing 0..100.
+    Accepts either 'related_roles' or 'relatedRoles' on each candidate.
+    """
+    for c in preview or []:
+        rr = c.get("related_roles") or c.get("relatedRoles")
+        if not isinstance(rr, list):
+            continue
+        norm_list: List[Dict[str, Any]] = []
+        for it in rr:
+            if not isinstance(it, dict):
+                continue
+            role = it.get("role") or it.get("title") or it.get("name")
+            score = it.get("match")
+            if score is None:
+                score = it.get("score")
+            # Convert to 0..100 if necessary
+            if isinstance(score, (int, float)):
+                pct = _to_percent(float(score))
+            else:
+                pct = 0.0
+            norm_list.append({"role": role, "match": pct})
+        # Prefer 'related_roles' as canonical
+        c["related_roles"] = norm_list
+
+
 # ------------------------ structured options derivation ----------------------
 
 def _derive_structured_options(
@@ -857,6 +887,17 @@ async def handle_chatbot_query(
     selected_filters_raw = data.get("selected_filters") or data.get("filters") or data.get("selectedFilters") or []
     selected_filters = _canon_filters(selected_filters_raw)
 
+    # ✅ NEW: accept options.focus_section and enforce single-section filtering
+    req_options = data.get("options") or {}
+    focus_section_raw = str(req_options.get("focus_section", "") or "").strip().lower()
+    if focus_section_raw:
+        mapped = _ALLOWED_FILTERS.get(focus_section_raw, "")
+        # special-case synonyms: 'phrases' should map to cv
+        if not mapped and focus_section_raw == "phrases":
+            mapped = "cv"
+        if mapped:
+            selected_filters = [mapped]  # 🔒 enforce ONLY this section
+
     if not prompt:
         return {
             "reply": "Prompt is empty.",
@@ -917,6 +958,9 @@ async def handle_chatbot_query(
     # Include a role hint if parser detected one
     if "job_title" in parsed and parsed["job_title"]:
         options["role"] = parsed["job_title"]
+    # ✅ reflect requested focus section in options for downstream components
+    if focus_section_raw:
+        options["focus_section"] = _ALLOWED_FILTERS.get(focus_section_raw, "cv" if focus_section_raw == "phrases" else focus_section_raw)
     parsed["options"] = options  # build_response may consume or ignore
 
     # Step 2: Build response (existing pipeline)
@@ -1012,6 +1056,8 @@ async def handle_chatbot_query(
 
     # ✅ Annotate card metrics: ensure dynamic % present with UI-recognized keys
     _annotate_scores(filtered_preview, normalized_prompt or prompt, expanded_keywords)
+    # ✅ Normalize any existing related roles to have percent match (no inference)
+    _normalize_related_roles(filtered_preview)
 
     # Summarize matches for UI messaging
     match_meta = _summarize_matches(filtered_preview)
