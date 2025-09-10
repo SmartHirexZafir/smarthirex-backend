@@ -1,9 +1,6 @@
-# ✅ File: app/chatbot_router.py
-
 from fastapi import APIRouter, Request, Depends
 from datetime import datetime, timezone
 from typing import Any, Optional, Dict, List, Iterable, Tuple
-
 from bson import ObjectId
 from app.logic.intent_parser import parse_prompt
 from app.logic.response_builder import build_response
@@ -19,38 +16,62 @@ router = APIRouter()
 # --- Allowed filters (canonical keys) ---------------------------------------
 # ✅ Added education mapping and common aliases
 _ALLOWED_FILTERS = {
-    "role": "role",                # Job Role
+    "role": "role",  # Job Role
     "job_role": "role",
     "jobrole": "role",
-    "skills": "skills",            # Skills
-    "location": "location",        # Location
-    "projects": "projects",        # Projects
-    "experience": "experience",    # Experience
-    "cv": "cv",                    # CV Content Matching
+    "skills": "skills",  # Skills
+    "location": "location",  # Location
+    "projects": "projects",  # Projects
+    "experience": "experience",  # Experience
+    "cv": "cv",  # CV Content Matching
     "cv_content": "cv",
     "cv_content_matching": "cv",
-    "education": "education",      # ✅ Education
-    "edu": "education",
-    # mapping for focus_section convenience (handled explicitly as well)
+    "education": "education",  # ✅ Education
+    "edu": "education",  # mapping for focus_section convenience (handled explicitly as well)
     "phrases": "cv",
 }
 
 # Minimal baseline skills for routing-level filtering (kept as final fallback)
-_BASELINE_SKILLS_FALLBACK = set([
-    "react", "aws", "node", "excel", "django", "figma",
-    "pandas", "tensorflow", "keras", "java", "python",
-    "pytorch", "spark", "sql", "scikit", "mlflow", "docker",
-    "kubernetes", "typescript", "next", "nextjs", "next.js",
-    "powerpoint", "flora", "html", "css"
-])
+_BASELINE_SKILLS_FALLBACK = set(
+    [
+        "react",
+        "aws",
+        "node",
+        "excel",
+        "django",
+        "figma",
+        "pandas",
+        "tensorflow",
+        "keras",
+        "java",
+        "python",
+        "pytorch",
+        "spark",
+        "sql",
+        "scikit",
+        "mlflow",
+        "docker",
+        "kubernetes",
+        "typescript",
+        "next",
+        "nextjs",
+        "next.js",
+        "powerpoint",
+        "flora",
+        "html",
+        "css",
+    ]
+)
 
 # ✅ Dynamically loaded vocab/synonyms to avoid hardcoding; falls back gracefully
 _SKILL_VOCAB: Optional[set] = None
 _SYNONYMS: Dict[str, List[str]] = {}
 
+
 def _resource_path(*parts: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "resources", *parts))
+
 
 def _load_skill_vocab() -> set:
     global _SKILL_VOCAB
@@ -70,6 +91,7 @@ def _load_skill_vocab() -> set:
     # fallback if file missing/empty
     _SKILL_VOCAB = vocab or set(_BASELINE_SKILLS_FALLBACK)
     return _SKILL_VOCAB
+
 
 def _load_synonyms() -> Dict[str, List[str]]:
     global _SYNONYMS
@@ -96,13 +118,26 @@ def _load_synonyms() -> Dict[str, List[str]]:
 
     # ✅ Make sure relational operator synonyms exist for experience parsing
     # (kept here to broaden coverage even if file is missing)
-    syn.setdefault("<=", ["≤", "less than or equal to", "less than equal to", "at most", "no more than", "up to"])
-    syn.setdefault(">=", ["≥", "greater than or equal to", "at least", "minimum", "min", "no less than"])
+    syn.setdefault(
+        "<=",
+        [
+            "≤",
+            "less than or equal to",
+            "less than equal to",
+            "at most",
+            "no more than",
+            "up to",
+        ],
+    )
+    syn.setdefault(
+        ">=",
+        ["≥", "greater than or equal to", "at least", "minimum", "min", "no less than"],
+    )
     syn.setdefault("<", ["less than", "under", "below"])
     syn.setdefault(">", ["greater than", "more than", "over", "above"])
-
     _SYNONYMS = syn
     return _SYNONYMS
+
 
 # Preload dynamic resources once
 _load_skill_vocab()
@@ -110,9 +145,7 @@ _load_synonyms()
 
 
 def _canon_filters(raw_filters: Any) -> List[str]:
-    """
-    Canonicalize selected filter keys and preserve the original order.
-    """
+    """ Canonicalize selected filter keys and preserve the original order. """
     if not isinstance(raw_filters, (list, tuple)):
         return []
     out: List[str] = []
@@ -129,10 +162,7 @@ def _canon_filters(raw_filters: Any) -> List[str]:
 
 
 def _to_object_id(val: Any) -> Optional[ObjectId]:
-    """
-    Safely convert unknown id shape to ObjectId.
-    Returns None if conversion not possible.
-    """
+    """ Safely convert unknown id shape to ObjectId. Returns None if conversion not possible. """
     if isinstance(val, ObjectId):
         return val
     if isinstance(val, dict) and "$oid" in val:
@@ -154,9 +184,7 @@ def _to_object_id(val: Any) -> Optional[ObjectId]:
 
 
 def _candidate_text_blob(c: Dict[str, Any]) -> str:
-    """
-    Build a lowercase searchable haystack from candidate fields.
-    """
+    """ Build a lowercase searchable haystack from candidate fields. """
     parts: List[str] = []
 
     def push(v: Any):
@@ -193,7 +221,6 @@ def _candidate_text_blob(c: Dict[str, Any]) -> str:
 
     # raw_text (from ml layer) if passed through
     push(c.get("raw_text"))
-
     return " • ".join(parts).lower()
 
 
@@ -215,8 +242,8 @@ def _candidate_title_text(c: Dict[str, Any]) -> str:
 def _role_matches(wanted_role: Optional[str], c: Dict[str, Any]) -> bool:
     """
     Returns True if:
-      - no role requested, or
-      - requested role (or its suffix word) appears in candidate title text
+    - no role requested, or
+    - requested role (or its suffix word) appears in candidate title text
     """
     if not wanted_role:
         return True
@@ -242,15 +269,18 @@ def _role_matches(wanted_role: Optional[str], c: Dict[str, Any]) -> bool:
     if "designer" in want or "design" in want:
         if any(tok in title_blob for tok in ["designer", "design", "ui", "ux"]):
             return True
-
     return False
 
 
 def _candidate_years(c: Dict[str, Any]) -> float:
-    """
-    Try to convert experience into a number of years (handles multiple aliases).
-    """
-    for k in ("experience", "total_experience_years", "years_of_experience", "experience_years", "yoe"):
+    """ Try to convert experience into a number of years (handles multiple aliases). """
+    for k in (
+        "experience",
+        "total_experience_years",
+        "years_of_experience",
+        "experience_years",
+        "yoe",
+    ):
         exp = c.get(k)
         if isinstance(exp, (int, float)):
             return float(exp)
@@ -268,11 +298,11 @@ async def _owner_has_resume(owner_id: str) -> bool:
     return await db.parsed_resumes.count_documents({"ownerUserId": owner_id}) > 0
 
 
-async def _owner_preview_filter(items: List[Dict[str, Any]], owner_id: str) -> List[Dict[str, Any]]:
+async def _owner_preview_filter(
+    items: List[Dict[str, Any]], owner_id: str
+) -> List[Dict[str, Any]]:
     """
-    Keep only previews that belong to the current owner.
-    Support both string UUID _id and ObjectId _id stored in DB.
-
+    Keep only previews that belong to the current owner. Support both string UUID _id and ObjectId _id stored in DB.
     🔧 Performance fix: resolve ownership in BULK (avoids N+1 DB lookups).
     """
     if not items:
@@ -301,6 +331,7 @@ async def _owner_preview_filter(items: List[Dict[str, Any]], owner_id: str) -> L
 
     cursor = db.parsed_resumes.find({"$or": or_conditions}, {"_id": 1})
     owned = await cursor.to_list(length=10_000)
+
     owned_ids: set = set()
     for d in owned:
         _id = d.get("_id")
@@ -319,14 +350,33 @@ async def _owner_preview_filter(items: List[Dict[str, Any]], owner_id: str) -> L
 
 
 # ------------------------ keyword helpers / expansion ------------------------
-
 _NUM_WORDS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
-    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
-    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
 }
+
 
 def _word_to_number(tok: str) -> Optional[int]:
     t = tok.strip().lower()
@@ -338,6 +388,7 @@ def _word_to_number(tok: str) -> Optional[int]:
         if all(p in _NUM_WORDS for p in parts):
             return sum(_NUM_WORDS[p] for p in parts)
     return None
+
 
 def _expand_keywords(keywords: List[str]) -> List[str]:
     """
@@ -370,11 +421,8 @@ def _expand_keywords(keywords: List[str]) -> List[str]:
 
 
 # ------------------------ server-side SEQUENTIAL FILTERS ---------------------
-
 def _extract_location_from_prompt(prompt_like: str) -> Optional[str]:
-    """
-    Lightweight location extractor: looks for 'in <place>'.
-    """
+    """ Lightweight location extractor: looks for 'in <place>'. """
     p = " " + (prompt_like or "").lower() + " "
     m = re.search(r"\bin\s+([a-z][a-z .,'-]{1,60})", p)
     if not m:
@@ -403,10 +451,10 @@ def _looks_like_location_token(tok: str) -> bool:
 def _extract_year_bounds(prompt_like: str) -> Tuple[Optional[float], Optional[float]]:
     """
     Extract min/max experience from a prompt using a broader set of phrases:
-      - ">= 3 years", "at least 3 years", "minimum 3 years"
-      - "<= 5 years", "at most 5 yrs", "up to five years", "no more than 5"
-      - "between 3 and 5 years"
-      - words for numbers also supported ("four", "ten", "twenty-five")
+    - ">= 3 years", "at least 3 years", "minimum 3 years"
+    - "<= 5 years", "at most 5 yrs", "up to five years", "no more than 5"
+    - "between 3 and 5 years"
+    - words for numbers also supported ("four", "ten", "twenty-five")
     Returns (min_years, max_years). Any can be None.
     """
     txt = (prompt_like or "").lower()
@@ -422,7 +470,9 @@ def _extract_year_bounds(prompt_like: str) -> Tuple[Optional[float], Optional[fl
         return float(w) if w is not None else None
 
     # between X and Y
-    m = re.search(r"between\s+([a-z0-9\-\.]+)\s+and\s+([a-z0-9\-\.]+)\s+(?:years?|yrs?)", txt)
+    m = re.search(
+        r"between\s+([a-z0-9\-\.]+)\s+and\s+([a-z0-9\-\.]+)\s+(?:years?|yrs?)", txt
+    )
     if m:
         a = to_num(m.group(1))
         b = to_num(m.group(2))
@@ -457,13 +507,11 @@ def _extract_year_bounds(prompt_like: str) -> Tuple[Optional[float], Optional[fl
     max_v = find_bound(le_phrases, is_max=True)
     min_v = find_bound(ge_phrases, is_max=False)
 
-    # strict < or >
+    # strict < or > 
     if max_v is None:
-        max_v = find_bound(lt_phrases, is_max=True)
-        # for strict "< 5", interpret as <= (inclusive bound) for filtering
+        max_v = find_bound(lt_phrases, is_max=True)  # for strict "< 5", interpret as <= (inclusive bound) for filtering
     if min_v is None:
-        min_v = find_bound(gt_phrases, is_max=False)
-        # for strict "> 3", interpret as >=
+        min_v = find_bound(gt_phrases, is_max=False)  # for strict "> 3", interpret as >=
 
     # fallback to legacy extract_min_years if no min found
     if min_v is None:
@@ -500,12 +548,9 @@ def _filter_by_experience(cands: Iterable[Dict[str, Any]], prompt: str) -> List[
 
 
 def _filter_by_skills(cands: Iterable[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
-    """
-    Match skills using dynamic vocabulary where possible, falling back to candidate-provided skills.
-    """
+    """ Match skills using dynamic vocabulary where possible, falling back to candidate-provided skills. """
     vocab = _load_skill_vocab()
     expanded = set(_expand_keywords(keywords or []))
-
     # plausible skill tokens: in vocab OR look like tech tokens (letters, "+" allowed)
     focus = [k for k in expanded if (k in vocab or re.match(r"^[a-z0-9\+\.\#\-]{2,}$", k))]
     if not focus:
@@ -527,10 +572,11 @@ def _filter_by_skills(cands: Iterable[Dict[str, Any]], keywords: List[str]) -> L
     return out
 
 
-def _filter_by_location(cands: Iterable[Dict[str, Any]], prompt: str, keywords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def _filter_by_location(
+    cands: Iterable[Dict[str, Any]], prompt: str, keywords: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
     """
-    Match location either via "in <place>" or via location-like tokens in keywords,
-    against multiple location fields on the candidate.
+    Match location either via "in <place>" or via location-like tokens in keywords, against multiple location fields on the candidate.
     """
     loc = _extract_location_from_prompt(prompt)
     kw_locs = [k for k in (keywords or []) if _looks_like_location_token(k)]
@@ -541,9 +587,16 @@ def _filter_by_location(cands: Iterable[Dict[str, Any]], prompt: str, keywords: 
     for c in cands:
         r = c.get("resume") or {}
         fields = [
-            c.get("location"), c.get("city"), c.get("country"), c.get("address"),
-            r.get("location"), r.get("city"), r.get("country"), r.get("address"),
-            r.get("work_location"), r.get("current_location"),
+            c.get("location"),
+            c.get("city"),
+            c.get("country"),
+            c.get("address"),
+            r.get("location"),
+            r.get("city"),
+            r.get("country"),
+            r.get("address"),
+            r.get("work_location"),
+            r.get("current_location"),
         ]
         loc_blob = " ".join(str(x) for x in fields if x).lower()
         if not loc_blob:
@@ -562,10 +615,7 @@ def _filter_by_location(cands: Iterable[Dict[str, Any]], prompt: str, keywords: 
 
 
 def _filter_by_projects(cands: Iterable[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
-    """
-    Project-category-only filter.
-    Looks ONLY at 'projects' field (strings or dicts with name/description).
-    """
+    """ Project-category-only filter. Looks ONLY at 'projects' field (strings or dicts with name/description). """
     if not keywords:
         return list(cands)
     keys = [k.strip().lower() for k in _expand_keywords([*keywords]) if k and isinstance(k, str)]
@@ -623,17 +673,33 @@ def _filter_by_cv_content(cands: Iterable[Dict[str, Any]], prompt: str, keywords
 
 
 def _filter_by_education(cands: Iterable[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
-    """
-    Education-only filter: match degree names, institutions, majors against keywords.
-    """
+    """ Education-only filter: match degree names, institutions, majors against keywords. """
     if not keywords:
         return list(cands)
     keys = [k.strip().lower() for k in _expand_keywords([*keywords]) if k and isinstance(k, str)]
     # common degree tokens to widen coverage
     degree_tokens = {
-        "bachelor", "bachelors", "ba", "bs", "bsc", "be", "b.e", "b.tech", "btech",
-        "master", "masters", "ms", "msc", "m.tech", "mtech", "mba", "mphil",
-        "phd", "doctorate", "associate", "diploma",
+        "bachelor",
+        "bachelors",
+        "ba",
+        "bs",
+        "bsc",
+        "be",
+        "b.e",
+        "b.tech",
+        "btech",
+        "master",
+        "masters",
+        "ms",
+        "msc",
+        "m.tech",
+        "mtech",
+        "mba",
+        "mphil",
+        "phd",
+        "doctorate",
+        "associate",
+        "diploma",
     }
     keys_set = set(keys) | degree_tokens
 
@@ -728,7 +794,6 @@ def _summarize_matches(preview: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ------------------------ scoring/metrics for cards --------------------------
-
 def _to_percent(val: Optional[float]) -> float:
     if val is None:
         return 0.0
@@ -742,6 +807,7 @@ def _to_percent(val: Optional[float]) -> float:
     v = max(0.0, min(v, 100.0))
     return round(v, 1)
 
+
 def _compute_prompt_match_score(c: Dict[str, Any], prompt_like: str, keywords: List[str]) -> float:
     """
     Deterministic prompt-match scoring based on keyword hits + optional semantic_score.
@@ -750,15 +816,19 @@ def _compute_prompt_match_score(c: Dict[str, Any], prompt_like: str, keywords: L
     blob = _candidate_text_blob(c)
     if not blob:
         return 0.0
+
     p = (prompt_like or "").lower().strip()
     keys = [k for k in _expand_keywords(keywords or []) if k and len(k) > 1]
     hits = 0.0
+
     for k in keys:
         if k in blob:
             hits += 1.0
+
     # small bonus for prompt substring
     if p and p in blob:
         hits += 1.5
+
     # include semantic_score gently if present (assumed 0..1 or 0..100)
     sem = c.get("semantic_score")
     if sem is not None:
@@ -767,6 +837,7 @@ def _compute_prompt_match_score(c: Dict[str, Any], prompt_like: str, keywords: L
     # Normalize: assume up to ~10 meaningful tokens contributes strongly
     score = min(100.0, round((hits / 10.0) * 100.0, 1))
     return score
+
 
 def _annotate_scores(preview: List[Dict[str, Any]], prompt_like: str, keywords: List[str]) -> None:
     """
@@ -790,44 +861,266 @@ def _annotate_scores(preview: List[Dict[str, Any]], prompt_like: str, keywords: 
         c["role_prediction_confidence"] = _to_percent(role_conf)
 
 
-def _normalize_related_roles(preview: List[Dict[str, Any]]) -> None:
+def _ensure_related_roles(preview: List[Dict[str, Any]]) -> None:
     """
-    Normalize any existing related roles to ensure a percentage field is present.
-    Does not invent data—only converts 0..1 to 0..100 or forwards existing 0..100.
-    Accepts either 'related_roles' or 'relatedRoles' on each candidate.
+    Ensure each candidate has a 'related_roles' array.
+    - If missing/empty, call infer_related_roles(candidate) to attach results.
+    - Normalize scores to percent (0..100) and keys to {'role','match'}.
+    - Provide 3–5 items from server side; client may clamp to 3.
     """
+    # Lazy import to avoid cyclic deps; fall back gracefully if unavailable
+    infer_fn = None
+    try:
+        from app.logic.ml_interface import infer_related_roles  # type: ignore
+        infer_fn = infer_related_roles
+    except Exception:
+        infer_fn = None
+
     for c in preview or []:
         rr = c.get("related_roles") or c.get("relatedRoles")
-        if not isinstance(rr, list):
-            continue
+        needs_infer = not isinstance(rr, list) or len(rr) == 0
+        if needs_infer and infer_fn:
+            try:
+                rr = infer_fn(c) or []
+            except Exception:
+                rr = rr or []
+
+        # Normalize to list of dicts with 'role' and percent 'match'
         norm_list: List[Dict[str, Any]] = []
-        for it in rr:
-            if not isinstance(it, dict):
-                continue
-            role = it.get("role") or it.get("title") or it.get("name")
-            score = it.get("match")
-            if score is None:
-                score = it.get("score")
-            # Convert to 0..100 if necessary
-            if isinstance(score, (int, float)):
-                pct = _to_percent(float(score))
-            else:
-                pct = 0.0
-            norm_list.append({"role": role, "match": pct})
-        # Prefer 'related_roles' as canonical
+        if isinstance(rr, list):
+            for it in rr:
+                if isinstance(it, dict):
+                    role = it.get("role") or it.get("title") or it.get("name")
+                    score = it.get("match")
+                    if score is None:
+                        score = it.get("score")
+                else:
+                    role = str(it)
+                    score = None
+                pct = _to_percent(score) if isinstance(score, (int, float)) else 0.0
+                norm_list.append({"role": role, "match": pct})
+
+        # attach normalized
         c["related_roles"] = norm_list
 
 
-# ------------------------ structured options derivation ----------------------
+# ------------------------ per-candidate match flag helpers -------------------
+# (Used ONLY to compute is_strict_match & match_type as requested)
+def _candidate_matches_role_single(c: Dict[str, Any], prompt_like: str) -> bool:
+    wanted_role = (parse_prompt(prompt_like) or {}).get("job_title")
+    return _role_matches(wanted_role, c)
 
+
+def _candidate_matches_experience_single(c: Dict[str, Any], prompt_like: str) -> bool:
+    min_years, max_years = _extract_year_bounds(prompt_like)
+    yrs = _candidate_years(c)
+    if min_years is not None and yrs < float(min_years):
+        return False
+    if max_years is not None and yrs > float(max_years):
+        return False
+    return True
+
+
+def _candidate_matches_skills_single(c: Dict[str, Any], keywords: List[str]) -> bool:
+    vocab = _load_skill_vocab()
+    expanded = set(_expand_keywords(keywords or []))
+    focus = [k for k in expanded if (k in vocab or re.match(r"^[a-z0-9\+\.\#\-]{2,}$", k))]
+    if not focus:
+        # if no concrete skill terms, treat as not constraining
+        return True
+    focus_set = set(focus)
+    skills = c.get("skills") or []
+    skills_lc = set(str(s).strip().lower() for s in skills if s)
+    r = c.get("resume") or {}
+    extra = r.get("skills") or r.get("technical_skills") or []
+    if isinstance(extra, list):
+        skills_lc.update(str(s).strip().lower() for s in extra if s)
+    elif isinstance(extra, str):
+        skills_lc.update(t.strip() for t in extra.lower().split(","))
+    return bool(skills_lc & focus_set)
+
+
+def _candidate_matches_location_single(c: Dict[str, Any], prompt_like: str, keywords: List[str]) -> bool:
+    loc = _extract_location_from_prompt(prompt_like)
+    kw_locs = [k for k in (keywords or []) if _looks_like_location_token(k)]
+    if not loc and not kw_locs:
+        return True
+    r = c.get("resume") or {}
+    fields = [
+        c.get("location"),
+        c.get("city"),
+        c.get("country"),
+        c.get("address"),
+        r.get("location"),
+        r.get("city"),
+        r.get("country"),
+        r.get("address"),
+        r.get("work_location"),
+        r.get("current_location"),
+    ]
+    loc_blob = " ".join(str(x) for x in fields if x).lower()
+    if not loc_blob:
+        return False
+    if loc and loc in loc_blob:
+        return True
+    for t in kw_locs:
+        if t.lower() in loc_blob:
+            return True
+    return False
+
+
+def _candidate_matches_projects_single(c: Dict[str, Any], keywords: List[str]) -> bool:
+    if not keywords:
+        return True
+    keys = [k.strip().lower() for k in _expand_keywords([*keywords]) if k and isinstance(k, str)]
+    txt = ""
+    projs = c.get("projects", [])
+    if isinstance(projs, list):
+        for p in projs:
+            if isinstance(p, str):
+                txt += " " + p
+            elif isinstance(p, dict):
+                txt += " " + str(p.get("name", "")) + " " + str(p.get("description", ""))
+    r = c.get("resume") or {}
+    rpj = r.get("projects")
+    if isinstance(rpj, list):
+        for p in rpj:
+            if isinstance(p, str):
+                txt += " " + p
+            elif isinstance(p, dict):
+                txt += " " + str(p.get("name", "")) + " " + str(p.get("description", ""))
+    elif isinstance(rpj, str):
+        txt += " " + rpj
+    txt = txt.lower()
+    return bool(txt and any(k in txt for k in keys))
+
+
+def _candidate_matches_cv_single(c: Dict[str, Any], prompt_like: str, keywords: List[str]) -> bool:
+    p = (prompt_like or "").lower().strip()
+    keys = [k for k in _expand_keywords(keywords or []) if k and len(k) > 1]
+    blob = (
+        str(c.get("raw_text") or "")
+        + " "
+        + str((c.get("resume") or {}).get("summary") or "")
+        + " "
+        + str((c.get("resume") or {}).get("workHistory") or "")
+    ).lower()
+    if not blob:
+        return False
+    if p and p in blob:
+        return True
+    if keys and any(k in blob for k in keys):
+        return True
+    return False
+
+
+def _candidate_matches_education_single(c: Dict[str, Any], keywords: List[str]) -> bool:
+    if not keywords:
+        # no edu tokens provided → not constraining
+        return True
+    keys = [k.strip().lower() for k in _expand_keywords([*keywords]) if k and isinstance(k, str)]
+    degree_tokens = {
+        "bachelor",
+        "bachelors",
+        "ba",
+        "bs",
+        "bsc",
+        "be",
+        "b.e",
+        "b.tech",
+        "btech",
+        "master",
+        "masters",
+        "ms",
+        "msc",
+        "m.tech",
+        "mtech",
+        "mba",
+        "mphil",
+        "phd",
+        "doctorate",
+        "associate",
+        "diploma",
+    }
+    keys_set = set(keys) | degree_tokens
+    r = c.get("resume") or {}
+    parts: List[str] = []
+    for fld in ("education", "education_details", "degrees", "universities", "institutions"):
+        v = r.get(fld) or c.get(fld)
+        if not v:
+            continue
+        if isinstance(v, list):
+            for x in v:
+                if isinstance(x, dict):
+                    parts.append(str(x.get("degree", "")))
+                    parts.append(str(x.get("field", "")))
+                    parts.append(str(x.get("institution", "")))
+                    parts.append(str(x.get("university", "")))
+                else:
+                    parts.append(str(x))
+        elif isinstance(v, dict):
+            parts.extend(str(x) for x in v.values())
+        else:
+            parts.append(str(v))
+    blob = " ".join(parts).lower()
+    return bool(blob and any(k in blob for k in keys_set))
+
+
+def _compute_match_flags_for_candidate(
+    c: Dict[str, Any],
+    selected_filters: List[str],
+    prompt_like: str,
+    expanded_keywords: List[str],
+) -> Tuple[bool, str]:
+    """
+    Compute (is_strict_match, match_type).
+    - If selected_filters provided: EXACT when candidate satisfies *all* active namespaces.
+    - If no selected_filters: EXACT when candidate has clear prompt/keyword hits; otherwise CLOSE.
+    """
+    # When filters are selected, require all of them to be satisfied
+    if selected_filters:
+        ok_all = True
+        for f in selected_filters:
+            if f == "role":
+                ok_all = ok_all and _candidate_matches_role_single(c, prompt_like)
+            elif f == "experience":
+                ok_all = ok_all and _candidate_matches_experience_single(c, prompt_like)
+            elif f == "skills":
+                ok_all = ok_all and _candidate_matches_skills_single(c, expanded_keywords)
+            elif f == "location":
+                ok_all = ok_all and _candidate_matches_location_single(c, prompt_like, expanded_keywords)
+            elif f == "projects":
+                ok_all = ok_all and _candidate_matches_projects_single(c, expanded_keywords)
+            elif f == "cv":
+                ok_all = ok_all and _candidate_matches_cv_single(c, prompt_like, expanded_keywords)
+            elif f == "education":
+                ok_all = ok_all and _candidate_matches_education_single(c, expanded_keywords)
+            if not ok_all:
+                break
+        return (ok_all, "exact" if ok_all else "close")
+
+    # No explicit filters → rely on prompt/keyword presence for EXACT
+    blob = _candidate_text_blob(c)
+    p = (prompt_like or "").lower().strip()
+    keys = [k for k in (expanded_keywords or []) if k and len(k) > 1]
+    hit = False
+    if blob:
+        if p and p in blob:
+            hit = True
+        elif any(k in blob for k in keys):
+            hit = True
+    return (hit, "exact" if hit else "close")
+
+
+# ------------------------ structured options derivation ----------------------
 def _derive_structured_options(
     prompt_like: str,
     expanded_keywords: List[str],
     selected_filters: List[str],
 ) -> Dict[str, Any]:
     """
-    Build a structured 'options' payload from the prompt and keywords so downstream
-    components (including ML) can optionally use strong hints without hardcoding.
+    Build a structured 'options' payload from the prompt and keywords so downstream components (including ML)
+    can optionally use strong hints without hardcoding.
     """
     vocab = _load_skill_vocab()
     min_years, max_years = _extract_year_bounds(prompt_like)
@@ -838,9 +1131,27 @@ def _derive_structured_options(
 
     # Education tokens (lightweight, same set used in filter)
     degree_tokens = {
-        "bachelor", "bachelors", "ba", "bs", "bsc", "be", "b.e", "b.tech", "btech",
-        "master", "masters", "ms", "msc", "m.tech", "mtech", "mba", "mphil",
-        "phd", "doctorate", "associate", "diploma",
+        "bachelor",
+        "bachelors",
+        "ba",
+        "bs",
+        "bsc",
+        "be",
+        "b.e",
+        "b.tech",
+        "btech",
+        "master",
+        "masters",
+        "ms",
+        "msc",
+        "m.tech",
+        "mtech",
+        "mba",
+        "mphil",
+        "phd",
+        "doctorate",
+        "associate",
+        "diploma",
     }
     edu_terms = sorted({k for k in expanded_keywords if k in degree_tokens})
 
@@ -862,8 +1173,7 @@ async def handle_chatbot_query(
     current_user=Depends(get_current_user),
 ):
     """
-    Receives a natural language prompt from user,
-    identifies intent, processes it, and responds accordingly.
+    Receives a natural language prompt from user, identifies intent, processes it, and responds accordingly.
     """
     try:
         data = await request.json()
@@ -877,14 +1187,17 @@ async def handle_chatbot_query(
             "ui": {
                 "primaryMessage": "Invalid request payload.",
                 "query": "",
-                "showCandidates": False,    # ✅ ensure UI hides sections
+                "showCandidates": False,  # ✅ ensure UI hides sections
                 "showRouter": False,
                 "toast": {"message": "Invalid request payload.", "type": "error", "durationMs": 3500},  # ✅ auto-dismiss hint
             },
         }
 
     prompt = (data.get("prompt") or "").strip()
-    selected_filters_raw = data.get("selected_filters") or data.get("filters") or data.get("selectedFilters") or []
+
+    selected_filters_raw = (
+        data.get("selected_filters") or data.get("filters") or data.get("selectedFilters") or []
+    )
     selected_filters = _canon_filters(selected_filters_raw)
 
     # ✅ NEW: accept options.focus_section and enforce single-section filtering
@@ -908,7 +1221,7 @@ async def handle_chatbot_query(
             "ui": {
                 "primaryMessage": "Prompt is empty.",
                 "query": "",
-                "showCandidates": False,    # ✅ hide candidates/router on empty prompt
+                "showCandidates": False,  # ✅ hide candidates/router on empty prompt
                 "showRouter": False,
                 "toast": {"message": "Please enter a prompt.", "type": "info", "durationMs": 3500},
             },
@@ -928,7 +1241,7 @@ async def handle_chatbot_query(
             "ui": {
                 "primaryMessage": "You haven't uploaded any resumes yet.",
                 "query": prompt,
-                "showCandidates": False,   # ✅ do not render candidate list/router
+                "showCandidates": False,  # ✅ do not render candidate list/router
                 "showRouter": False,
                 "toast": {"message": "No CVs uploaded.", "type": "warning", "durationMs": 3500},
             },
@@ -937,6 +1250,7 @@ async def handle_chatbot_query(
     # --- normalization (use client-provided if available, else compute)
     normalized_prompt = (data.get("normalized_prompt") or "").strip()
     keywords = data.get("keywords")
+
     if not normalized_prompt or not isinstance(keywords, list):
         norm = normalize_prompt(prompt)  # 🔧 correct function
         normalized_prompt = norm["normalized_prompt"]
@@ -960,7 +1274,9 @@ async def handle_chatbot_query(
         options["role"] = parsed["job_title"]
     # ✅ reflect requested focus section in options for downstream components
     if focus_section_raw:
-        options["focus_section"] = _ALLOWED_FILTERS.get(focus_section_raw, "cv" if focus_section_raw == "phrases" else focus_section_raw)
+        options["focus_section"] = _ALLOWED_FILTERS.get(
+            focus_section_raw, "cv" if focus_section_raw == "phrases" else focus_section_raw
+        )
     parsed["options"] = options  # build_response may consume or ignore
 
     # Step 2: Build response (existing pipeline)
@@ -995,6 +1311,7 @@ async def handle_chatbot_query(
     if not filtered_preview:
         try:
             from app.logic.ml_interface import get_semantic_matches  # lazy import to avoid cycles
+
             # Try to pass options/filters if supported; fall back gracefully
             try:
                 sem_candidates = await get_semantic_matches(
@@ -1014,24 +1331,41 @@ async def handle_chatbot_query(
                     keywords=expanded_keywords,
                 )
         except Exception:
-            sem_candidates = []
-        # keep ownership safety
+            sem_candidates = []  # keep ownership safety
+
         filtered_preview = await _owner_preview_filter(sem_candidates, owner_id)
 
     # ✅ If STILL empty → fall back to legacy fuzzy scan (previous behavior, kept intact)
     if not filtered_preview:
         from app.logic.normalize import normalize_prompt as _np  # lazy import safe
+
         norm2 = _np(normalized_prompt or prompt)
         fallback_keywords = _expand_keywords(norm2["keywords"])
         fallback = []
         cursor = db.parsed_resumes.find(
-            {"ownerUserId": owner_id},
             {
-                "_id": 1, "name": 1, "predicted_role": 1, "category": 1, "experience": 1,
-                "location": 1, "confidence": 1, "ml_confidence": 1,  # ⬅ added
-                "email": 1, "phone": 1, "skills": 1,
-                "resume_url": 1, "filename": 1, "currentRole": 1, "resume": 1,
-                "semantic_score": 1, "final_score": 1, "raw_text": 1, "projects": 1,
+                "ownerUserId": owner_id,
+            },
+            {
+                "_id": 1,
+                "name": 1,
+                "predicted_role": 1,
+                "category": 1,
+                "experience": 1,
+                "location": 1,
+                "confidence": 1,
+                "ml_confidence": 1,  # ⬅ added
+                "email": 1,
+                "phone": 1,
+                "skills": 1,
+                "resume_url": 1,
+                "filename": 1,
+                "currentRole": 1,
+                "resume": 1,
+                "semantic_score": 1,
+                "final_score": 1,
+                "raw_text": 1,
+                "projects": 1,
                 "education": 1,
             },
         )
@@ -1040,10 +1374,14 @@ async def handle_chatbot_query(
             hay = _candidate_text_blob(c)
             score = 0.0
             for k in (fallback_keywords or []):
-                if k in hay: score += 10
-            if "developer" in hay or "engineer" in hay: score += 5
-            if c.get("semantic_score"): score += float(c["semantic_score"])
-            if c.get("final_score"): score += float(c["final_score"])
+                if k in hay:
+                    score += 10
+            if "developer" in hay or "engineer" in hay:
+                score += 5
+            if c.get("semantic_score"):
+                score += float(c["semantic_score"])
+            if c.get("final_score"):
+                score += float(c["final_score"])
             if score > 0:
                 fallback.append(c)
         filtered_preview = fallback
@@ -1054,10 +1392,24 @@ async def handle_chatbot_query(
             filtered_preview, selected_filters, normalized_prompt or prompt, expanded_keywords or []
         )
 
+    # ✅ NEW: Emit consistent match flags per candidate (exact vs close)
+    # Rule: exact when ALL active namespaces satisfied; close otherwise.
+    # If no selected filters, treat prompt/keyword hit as exact; else close.
+    for cand in filtered_preview:
+        strict, mtype = _compute_match_flags_for_candidate(
+            cand,
+            selected_filters=selected_filters,
+            prompt_like=normalized_prompt or prompt,
+            expanded_keywords=expanded_keywords or [],
+        )
+        cand["is_strict_match"] = bool(strict)
+        cand["match_type"] = mtype  # "exact" | "close"
+
     # ✅ Annotate card metrics: ensure dynamic % present with UI-recognized keys
     _annotate_scores(filtered_preview, normalized_prompt or prompt, expanded_keywords)
-    # ✅ Normalize any existing related roles to have percent match (no inference)
-    _normalize_related_roles(filtered_preview)
+
+    # ✅ Ensure/normalize related roles (infer when missing)
+    _ensure_related_roles(filtered_preview)
 
     # Summarize matches for UI messaging
     match_meta = _summarize_matches(filtered_preview)
@@ -1107,20 +1459,20 @@ async def handle_chatbot_query(
         "primaryMessage": reply_text,
         "query": prompt,
         "showCandidates": not no_results,  # hide when no results
-        "showRouter": not no_results,       # hide when no results
+        "showRouter": not no_results,  # hide when no results
         # ✅ optional toast hint with auto-dismiss duration 3–4s; frontend can ignore or use
         "toast": {"message": reply_text, "type": "info", "durationMs": 3500},
     }
 
     return {
-        "reply": reply_text,                     # for the chat bubble
-        "resumes_preview": filtered_preview,     # cards
+        "reply": reply_text,  # for the chat bubble
+        "resumes_preview": filtered_preview,  # cards
         "normalized_prompt": normalized_prompt,  # extra context for UI
-        "keywords": keywords,                    # original keywords
+        "keywords": keywords,  # original keywords
         "keywords_expanded": expanded_keywords,  # ✅ broadened keywords (debug/UX)
-        "selectedFilters": selected_filters,     # ✅ echo back selection
-        "options": options,                      # ✅ structured hints for UI/debug
-        "matchMeta": match_meta,                 # counts for banners
+        "selectedFilters": selected_filters,  # ✅ echo back selection
+        "options": options,  # ✅ structured hints for UI/debug
+        "matchMeta": match_meta,  # counts for banners
         "no_results": no_results,
         "no_cvs_uploaded": False,
         "redirect": response.get("redirect"),

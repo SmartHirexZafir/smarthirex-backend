@@ -413,6 +413,52 @@ def _apply_focus_section(matches: List[Dict[str, Any]], prompt: str, focus_secti
     return [c for c in matches if _focus_match(c, prompt, section)]
 
 
+# ---------------------- NEW: selectedFilters helpers ----------------------
+
+_ALLOWED_SECTIONS = {"role", "experience", "education", "skills", "projects", "location", "phrases"}
+
+def _normalize_selected_filters(selected_filters: Any) -> List[str]:
+    """
+    Normalize various selectedFilters payload shapes into a list of allowed section names.
+    Supported shapes (mirrors /chatbot/query semantics):
+      - list[str]: ["skills","location"]
+      - dict with 'sections': {"sections": ["skills","location"]}
+      - dict of booleans: {"skills": true, "location": true, "education": false}
+    Any unknown values are ignored.
+    """
+    sections: List[str] = []
+
+    if isinstance(selected_filters, list):
+        sections = [str(s).strip().lower() for s in selected_filters]
+    elif isinstance(selected_filters, dict):
+        if isinstance(selected_filters.get("sections"), list):
+            sections = [str(s).strip().lower() for s in selected_filters.get("sections", [])]
+        else:
+            # treat truthy keys as chosen sections
+            for k, v in selected_filters.items():
+                if v and isinstance(k, str):
+                    sections.append(k.strip().lower())
+
+    # keep only allowed
+    return [s for s in sections if s in _ALLOWED_SECTIONS]
+
+def _apply_selected_filters(matches: List[Dict[str, Any]], prompt: str, selected_filters: Any) -> List[Dict[str, Any]]:
+    """
+    Apply multi-section filtering using the same section-wise matching logic used elsewhere.
+    A candidate is kept if it matches in ANY of the selected sections.
+    If selected_filters is empty/invalid, returns matches unchanged.
+    """
+    sections = _normalize_selected_filters(selected_filters)
+    if not sections:
+        return matches
+
+    kept: List[Dict[str, Any]] = []
+    for c in matches:
+        if any(_focus_match(c, prompt, sec) for sec in sections):
+            kept.append(c)
+    return kept
+
+
 # --------------------------- Routes -----------------------------------
 
 @router.get("/user-history")
@@ -485,6 +531,10 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
 
     Supports options.focus_section to scope search within a specific section:
       role | experience | education | skills | projects | location | phrases
+
+    Also accepts `selectedFilters` in the payload and applies the same section-wise semantics
+    as used by /chatbot/query. When provided, candidates are kept if they match the prompt
+    within ANY of the selected sections.
     """
     # Validate history id
     try:
@@ -504,6 +554,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
 
     options = (payload or {}).get("options") or {}
     focus_section = (options.get("focus_section") or "").strip().lower() if isinstance(options, dict) else ""
+
+    # NEW: read selectedFilters (mirrors /chatbot/query semantics)
+    selected_filters = (payload or {}).get("selectedFilters", None)
 
     # Collect whitelist of candidate IDs from the saved block
     original_candidates = h.get("candidates") or []
@@ -547,6 +600,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
 
     # 🔎 Apply section-focused scope (role/experience/education/skills/projects/location/phrases)
     matches = _apply_focus_section(matches, prompt, focus_section)
+
+    # 🔎 Apply selectedFilters (same semantics as /chatbot/query; OR across chosen sections)
+    matches = _apply_selected_filters(matches, prompt, selected_filters)
 
     # Prepare metadata & timestamps
     ts_raw = datetime.utcnow()

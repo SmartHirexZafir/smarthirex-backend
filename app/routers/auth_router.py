@@ -66,6 +66,17 @@ def _verify_link(token: str) -> str:
     """
     return f"{FRONTEND_BASE_URL}/verify/{token}"
 
+# ✅ NEW: normalize any datetime (or ISO string) to aware UTC for safe comparisons
+def _to_aware_utc(dt) -> datetime:
+    if isinstance(dt, str):
+        dt = datetime.fromisoformat(dt)
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    # If it's neither str nor datetime, raise a clear error
+    raise HTTPException(status_code=500, detail="Invalid datetime format in token")
+
 async def _create_verify_token(user_id: str) -> str:
     token = str(uuid.uuid4())
     await db.email_verification_tokens.insert_one({
@@ -81,7 +92,9 @@ async def _verify_token_and_mark_used(token: str):
     tok = await db.email_verification_tokens.find_one({"token": token})
     if (not tok) or tok.get("used"):
         raise HTTPException(status_code=400, detail="Invalid or used token")
-    if tok["expires_at"] < _now_utc():  # ✅ aware comparison
+    # ✅ CHANGE: normalize stored expires_at to aware UTC before comparing
+    exp = _to_aware_utc(tok["expires_at"])
+    if exp < _now_utc():  # ✅ aware comparison
         raise HTTPException(status_code=400, detail="Token expired")
 
     # mark user as verified + token as used
