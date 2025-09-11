@@ -112,12 +112,14 @@ def _wants_json(request: Request, redirect_param: Optional[str] = None) -> bool:
     return "application/json" in accept
 
 def _app_jwt_for_user(user: Dict) -> str:
-    """Issue our application JWT for a user record."""
+    """Issue our application JWT for a user record (with unique jti)."""
     now = _now_utc()
+    jti = str(uuid.uuid4())  # ✅ unique token id for revocation
     return jwt.encode(
         {
             "email": user["email"],
             "id": str(user["_id"]),
+            "jti": jti,  # ✅ include jti
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(hours=JWT_EXPIRES_HOURS)).timestamp()),
         },
@@ -215,8 +217,14 @@ async def get_current_user(request: Request):
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("id")
         email = payload.get("email")
-        if not user_id:
+        jti = payload.get("jti")  # ✅ must be present
+        if not user_id or not jti:
             raise HTTPException(status_code=401, detail="Invalid token payload")
+
+        # ✅ Revocation check (blacklist)
+        revoked = await db.token_blacklist.find_one({"jti": jti})
+        if revoked:
+            raise HTTPException(status_code=401, detail="Token revoked")
 
         # Return as a simple object with `.id` and `.email`
         return SimpleNamespace(id=str(user_id), email=email)
@@ -325,12 +333,14 @@ async def login(data: LoginRequest):
     if not user.get("is_verified"):
         raise HTTPException(status_code=403, detail="Email not verified")
 
-    # ✅ add exp/iat claims so tokens expire (caught by get_current_user handler)
+    # ✅ add exp/iat claims AND jti so tokens are revocable
     now = _now_utc()
+    jti = str(uuid.uuid4())
     token = jwt.encode(
         {
             "email": user["email"],
             "id": str(user["_id"]),
+            "jti": jti,  # ✅ include jti
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(hours=JWT_EXPIRES_HOURS)).timestamp()),
         },
@@ -358,7 +368,57 @@ async def login(data: LoginRequest):
     return response
 
 @router.post("/logout")
-async def logout():
+async def logout(request: Request):
+    """
+    Real logout: revoke the current JWT by storing its jti in a blacklist
+    (TTL via expires_at index). Always clears the cookie.
+    """
+    token: Optional[str] = None
+
+    # Try Authorization header
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1]
+
+    # Try cookie
+    if not token:
+        token = request.cookies.get("token")
+
+    if token:
+        try:
+            # Decode but ignore expiration to capture claims for blacklisting if possible
+            payload = jwt.decode(
+                token,
+                SECRET_KEY,
+                algorithms=[ALGORITHM],
+                options={"verify_exp": False}
+            )
+            jti = payload.get("jti")
+            uid = str(payload.get("id") or "")
+            exp_ts = payload.get("exp")
+            if jti:
+                expires_at = (
+                    datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+                    if isinstance(exp_ts, (int, float))
+                    else _now_utc() + timedelta(hours=1)
+                )
+                # Upsert into blacklist
+                await db.token_blacklist.update_one(
+                    {"jti": jti},
+                    {
+                        "$set": {
+                            "jti": jti,
+                            "user_id": uid,
+                            "expires_at": expires_at,
+                            "revoked_at": _now_utc(),
+                        }
+                    },
+                    upsert=True,
+                )
+        except Exception:
+            # Swallow errors: we still clear the cookie and return ok
+            pass
+
     # ✅ ensure cookie is cleared; keep payload simple and stable
     response = JSONResponse({"ok": True})
     response.delete_cookie("token", path="/")
@@ -535,7 +595,7 @@ async def google_callback(code: Optional[str] = Query(None), state: Optional[str
         }
         await db.users.insert_one(user)
 
-    # Issue our app token
+    # Issue our app token (helper includes jti)
     token = _app_jwt_for_user(user)
 
     # Determine if we need to ask for name/role/company (as requested)

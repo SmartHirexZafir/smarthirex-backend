@@ -25,6 +25,30 @@ def _maybe_oid(val: str) -> Optional[ObjectId]:
     return None
 
 
+def to_pct_number(v: Any) -> Optional[float]:
+  """
+  Normalize a possibly-ratio/percent-string score to a 0..100 float.
+  Accepts:
+    - 0..1 ratios (multiplied by 100)
+    - plain numbers (clamped 0..100)
+    - strings like '85' or '85%' or '0.85'
+  Returns None if it cannot be parsed.
+  """
+  if v is None:
+    return None
+  if isinstance(v, (int, float)):
+    n = float(v)
+    return max(0.0, min(100.0, n * 100.0 if n <= 1.0 else n))
+  if isinstance(v, str):
+    s = v.strip().replace("%", "")
+    try:
+      n = float(s)
+      return max(0.0, min(100.0, n * 100.0 if n <= 1.0 else n))
+    except ValueError:
+      return None
+  return None
+
+
 async def _get_candidate_guarded(candidate_id: str, current_user: Any) -> Dict[str, Any]:
   """
   Enforce ownership, mirroring candidate_router behavior (ownerUserId scope).
@@ -56,7 +80,9 @@ async def list_attempts(
   cursor = db.test_submissions.find(query).sort("submittedAt", -1)
   async for doc in cursor:
     attempt_id = str(doc.get("_id"))
-    score = doc.get("score") if doc.get("score") is not None else doc.get("total_score")
+    # ✅ Normalize to numeric 0..100 for frontend consistency (no percent strings)
+    raw_score = doc.get("score") if doc.get("score") is not None else doc.get("total_score")
+    score = to_pct_number(raw_score)
     attempts.append(
       {
         "id": attempt_id,

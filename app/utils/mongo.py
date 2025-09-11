@@ -49,6 +49,7 @@ async def verify_mongo_connection():
         await ensure_parsed_resumes_indexes()
         await ensure_chat_queries_indexes()
         await ensure_search_history_indexes()
+        await ensure_token_blacklist_indexes()  # ✅ NEW: token blacklist indexes
     except Exception as e:
         print("❌ MongoDB connection failed:", str(e))
         raise
@@ -284,8 +285,23 @@ async def ensure_search_history_indexes() -> None:
     try:
         await db.search_history.create_index([("ownerUserId", 1), ("timestamp_raw", -1)])
         await db.search_history.create_index([("timestamp_raw", -1)])
+        await db.search_history.create_index([("totalMatches", -1)])  # ✅ for "Most Matches" sort
+        await db.search_history.create_index([("prompt", 1)])         # ✅ for regex filtering
     except Exception as e:
         print("⚠️ Failed to create search_history indexes:", e)
+
+
+# ✅ NEW: token blacklist indexes (for auth/session revocation)
+async def ensure_token_blacklist_indexes() -> None:
+    """
+    Indexes for token_blacklist collection.
+    """
+    try:
+        await db.token_blacklist.create_index("jti", unique=True)
+        await db.token_blacklist.create_index("expires_at", expireAfterSeconds=0)
+        await db.token_blacklist.create_index([("user_id", 1), ("revoked_at", -1)])
+    except Exception as e:
+        print("⚠️ Failed to create token_blacklist indexes:", e)
 
 
 # -----------------------------------------------------------------------------

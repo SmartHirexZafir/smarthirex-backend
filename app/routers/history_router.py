@@ -469,10 +469,14 @@ async def get_history(
     sort: Optional[str] = Query("latest"),
     current=Depends(get_current_user),
 ):
-    query: Dict[str, Any] = {}
+    # ✅ Scope to current user
+    owner_id = str(getattr(current, "id", None) or getattr(current, "_id", None) or "")
+
+    # ✅ AND all filters together
+    conditions: List[Dict[str, Any]] = [{"ownerUserId": owner_id}]
 
     if search:
-        query["prompt"] = {"$regex": search, "$options": "i"}
+        conditions.append({"prompt": {"$regex": search, "$options": "i"}})
 
     if dateFrom or dateTo:
         time_filter: Dict[str, Any] = {}
@@ -480,14 +484,19 @@ async def get_history(
             time_filter["$gte"] = datetime.fromisoformat(dateFrom)
         if dateTo:
             time_filter["$lte"] = datetime.fromisoformat(dateTo)
-        query["timestamp_raw"] = time_filter
+        conditions.append({"timestamp_raw": time_filter})
 
-    sort_key = "timestamp_raw"
-    sort_order = -1 if sort == "latest" else 1
+    query: Dict[str, Any] = {"$and": conditions} if len(conditions) > 1 else conditions[0]
+
+    # ✅ Stable sorting
     if sort == "mostMatches":
-        sort_key = "totalMatches"
+        sort_keys = [("totalMatches", -1), ("timestamp_raw", -1), ("_id", -1)]
+    elif sort == "oldest":
+        sort_keys = [("timestamp_raw", 1), ("_id", 1)]
+    else:  # latest (default)
+        sort_keys = [("timestamp_raw", -1), ("_id", -1)]
 
-    cursor = db.search_history.find(query).sort(sort_key, sort_order)
+    cursor = db.search_history.find(query).sort(sort_keys)
     results: List[Dict[str, Any]] = []
     async for doc in cursor:
         doc["timestamp"] = doc.get("timestamp_display")
@@ -500,12 +509,15 @@ async def get_history_result(history_id: str, current=Depends(get_current_user))
     """
     Return a saved history block with candidates.
     ✅ Ensures every candidate carries dynamic match % fields so UI never shows '0% match' blanks.
+    ✅ Enforces ownership on fetch.
     """
     try:
         oid = ObjectId(history_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid history id")
-    doc = await db.search_history.find_one({"_id": oid})
+
+    owner_id = str(getattr(current, "id", None) or getattr(current, "_id", None) or "")
+    doc = await db.search_history.find_one({"_id": oid, "ownerUserId": owner_id})
     if not doc:
         raise HTTPException(status_code=404, detail="History entry not found")
 
