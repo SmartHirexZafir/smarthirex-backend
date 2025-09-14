@@ -1079,25 +1079,25 @@ def _compute_match_flags_for_candidate(
     """
     # When filters are selected, require all of them to be satisfied
     if selected_filters:
-        ok_all = True
-        for f in selected_filters:
-            if f == "role":
-                ok_all = ok_all and _candidate_matches_role_single(c, prompt_like)
-            elif f == "experience":
-                ok_all = ok_all and _candidate_matches_experience_single(c, prompt_like)
-            elif f == "skills":
-                ok_all = ok_all and _candidate_matches_skills_single(c, expanded_keywords)
-            elif f == "location":
-                ok_all = ok_all and _candidate_matches_location_single(c, prompt_like, expanded_keywords)
-            elif f == "projects":
-                ok_all = ok_all and _candidate_matches_projects_single(c, expanded_keywords)
-            elif f == "cv":
-                ok_all = ok_all and _candidate_matches_cv_single(c, prompt_like, expanded_keywords)
-            elif f == "education":
-                ok_all = ok_all and _candidate_matches_education_single(c, expanded_keywords)
-            if not ok_all:
-                break
-        return (ok_all, "exact" if ok_all else "close")
+      ok_all = True
+      for f in selected_filters:
+          if f == "role":
+              ok_all = ok_all and _candidate_matches_role_single(c, prompt_like)
+          elif f == "experience":
+              ok_all = ok_all and _candidate_matches_experience_single(c, prompt_like)
+          elif f == "skills":
+              ok_all = ok_all and _candidate_matches_skills_single(c, expanded_keywords)
+          elif f == "location":
+              ok_all = ok_all and _candidate_matches_location_single(c, prompt_like, expanded_keywords)
+          elif f == "projects":
+              ok_all = ok_all and _candidate_matches_projects_single(c, expanded_keywords)
+          elif f == "cv":
+              ok_all = ok_all and _candidate_matches_cv_single(c, prompt_like, expanded_keywords)
+          elif f == "education":
+              ok_all = ok_all and _candidate_matches_education_single(c, expanded_keywords)
+          if not ok_all:
+              break
+      return (ok_all, "exact" if ok_all else "close")
 
     # No explicit filters → rely on prompt/keyword presence for EXACT
     blob = _candidate_text_blob(c)
@@ -1411,6 +1411,31 @@ async def handle_chatbot_query(
     # ✅ Ensure/normalize related roles (infer when missing)
     _ensure_related_roles(filtered_preview)
 
+    # ✅ NEW (per requirement 4): Persist latest match % back to candidate documents
+    try:
+        for c in filtered_preview or []:
+            cid = str(c.get("_id") or c.get("id") or "")
+            if not cid:
+                continue
+            raw = c.get("final_score")
+            if raw is None:
+                raw = c.get("prompt_matching_score")
+            if raw is None:
+                continue
+            try:
+                pct = float(raw)
+            except Exception:
+                continue
+            pct = max(0.0, min(100.0, pct))
+            pct_int = int(round(pct))
+            await db.parsed_resumes.update_one(
+                {"_id": cid, "ownerUserId": owner_id},
+                {"$set": {"prompt_matching_score": pct_int, "final_score": pct_int}},
+            )
+    except Exception:
+        # best-effort only; never block chat on persistence
+        pass
+
     # Summarize matches for UI messaging
     match_meta = _summarize_matches(filtered_preview)
     no_results = match_meta["total"] == 0
@@ -1432,7 +1457,7 @@ async def handle_chatbot_query(
     # Step 4: Save history for filter intents
     if (parsed.get("intent") == "filter_cv") and filtered_preview:
         timestamp_raw = datetime.now(timezone.utc)
-        timestamp_display = datetime.now().strftime("%B %d, %Y – %I:%M %p")
+        timestamp_display = datetime.now().strftime("%B  %d, %Y – %I:%M %p")
         await db.search_history.insert_one(
             {
                 "prompt": prompt,

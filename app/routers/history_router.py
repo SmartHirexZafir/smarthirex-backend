@@ -616,6 +616,28 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
     # 🔎 Apply selectedFilters (same semantics as /chatbot/query; OR across chosen sections)
     matches = _apply_selected_filters(matches, prompt, selected_filters)
 
+    # 🔐 NEW: Persist latest match % to candidate profiles (best-effort)
+    try:
+        for m in matches:
+            cid_any = m.get("_id") or m.get("id")
+            if cid_any is None:
+                continue
+            try:
+                v = float(m.get("final_score") or m.get("prompt_matching_score") or m.get("score") or 0)
+            except Exception:
+                v = 0.0
+            # Normalize: allow 0..1 inputs (convert to %) then clamp and round
+            if 0.0 <= v <= 1.0:
+                v *= 100.0
+            pct = int(round(max(0.0, min(100.0, v))))
+            await db.parsed_resumes.update_one(
+                {"_id": ObjectId(cid_any)} if isinstance(cid_any, str) and len(cid_any) in (12, 24) else {"_id": cid_any},
+                {"$set": {"prompt_matching_score": pct, "final_score": pct}},
+            )
+    except Exception:
+        # Do not fail the re-run API if persistence has issues
+        pass
+
     # Prepare metadata & timestamps
     ts_raw = datetime.utcnow()
     ts_disp = _now_display()
