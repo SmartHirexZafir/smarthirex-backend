@@ -73,7 +73,7 @@ def _load_embedding_model() -> SentenceTransformer:
     except Exception:
         pass
     # 3) Try cache-only
-    return SentenceTransformer(MODEL_ID, local_files_only=True)
+    return SentenceTransformer(MODEL_ID)
 
 embedding_model = _load_embedding_model()
 
