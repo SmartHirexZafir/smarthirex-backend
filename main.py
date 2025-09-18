@@ -1,6 +1,6 @@
 # ✅ File: main.py
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, Response, JSONResponse
@@ -37,7 +37,12 @@ except Exception:
 import uvicorn
 import os
 import base64
+import json
+import secrets
+import inspect
 from pathlib import Path
+from typing import Optional, List, Any
+from pydantic import BaseModel
 
 
 app = FastAPI(
@@ -132,10 +137,10 @@ _DEFAULT_AVATAR_B64 = (
 
 @app.get("/default-avatar.png")
 async def default_avatar() -> Response:
-  for p in _DEF_AVATAR_CANDIDATES:
-      if p.is_file():
-          return FileResponse(str(p), media_type="image/png")
-  return Response(content=base64.b64decode(_DEFAULT_AVATAR_B64), media_type="image/png")
+    for p in _DEF_AVATAR_CANDIDATES:
+        if p.is_file():
+            return FileResponse(str(p), media_type="image/png")
+    return Response(content=base64.b64decode(_DEFAULT_AVATAR_B64), media_type="image/png")
 
 
 # ---------------------------
@@ -145,10 +150,192 @@ async def default_avatar() -> Response:
 async def healthz():
     return JSONResponse({"status": "ok", "service": "smarthirex-api"})
 
+
+# ===========================
+# Helpers (DB + tokens)
+# ===========================
+async def _get_db_optional() -> Optional[Any]:
+    """
+    Try to obtain a DB handle from app.utils.mongo (async or sync),
+    but never crash if the helper isn't available.
+    """
+    try:
+        from app.utils.mongo import get_db  # type: ignore
+        maybe = get_db()
+        return await maybe if inspect.isawaitable(maybe) else maybe
+    except Exception:
+        try:
+            from app.utils.mongo import get_database  # type: ignore
+            maybe = get_database()
+            return await maybe if inspect.isawaitable(maybe) else maybe
+        except Exception:
+            return None
+
+
+def _make_candidate_token(sub: str, email: Optional[str] = None) -> str:
+    """
+    Lightweight, app-local token (NOT a full JWT).
+    Encodes role=candidate + subject + issued-at + random nonce.
+    Frontend treats it as an opaque bearer token.
+    """
+    payload = {
+        "role": "candidate",
+        "sub": sub or "unknown",
+        "email": email or None,
+        "iat": int(os.environ.get("FAKE_JWT_IAT", "0")) or __import__("time").time(),
+        "nonce": secrets.token_urlsafe(6),
+    }
+    b64 = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"cand.{b64}.{secrets.token_urlsafe(8)}"
+
+
+def _extract_bearer_or_cookie_token(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth and auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    # common cookie names used by frontend
+    for key in ("access_token", "AUTH_TOKEN", "token", "authToken"):
+        v = request.cookies.get(key)
+        if v:
+            return v
+    return None
+
+
+def _cookie_secure_default() -> bool:
+    # secure cookies off for localhost by default; enable with COOKIE_SECURE=1
+    return os.getenv("COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ===========================
+# Req. 1 & 2 & 7 endpoints
+# ===========================
+
+class CandidateSessionRequest(BaseModel):
+    # Accept either "test_token" or "token" (both optional names for the same thing)
+    test_token: Optional[str] = None
+    token: Optional[str] = None
+    candidate_id: Optional[str] = None
+    email: Optional[str] = None
+
+
+@app.post("/auth/candidate-session")
+async def create_candidate_session(body: CandidateSessionRequest, request: Request):
+    """
+    Create a candidate-scoped session from a test token, without creating a normal website user.
+    Returns an opaque bearer token and also sets common cookies used by the frontend.
+    """
+    supplied = body.test_token or body.token
+    if not supplied:
+        return JSONResponse({"detail": "test_token required"}, status_code=400)
+
+    subject = body.candidate_id or (body.email or "candidate")
+    tok = _make_candidate_token(subject, body.email)
+
+    # Optionally persist session (best effort)
+    db = await _get_db_optional()
+    if db:
+        try:
+            doc = {
+                "kind": "candidate_session",
+                "token": tok,
+                "test_token": supplied,
+                "candidate_id": body.candidate_id,
+                "email": body.email,
+                "created_at": __import__("datetime").datetime.utcnow(),
+                "user_agent": request.headers.get("user-agent"),
+                "ip": request.client.host if request.client else None,
+            }
+            ins = db["sessions"].insert_one(doc)
+            if inspect.isawaitable(ins):
+                await ins
+        except Exception:
+            # non-fatal
+            pass
+
+    # Set cookies commonly read by the frontend
+    secure = _cookie_secure_default()
+    resp = JSONResponse({"ok": True, "role": "candidate", "token": tok})
+    resp.set_cookie("access_token", tok, path="/", httponly=False, samesite="lax", secure=secure)
+    resp.set_cookie("AUTH_TOKEN", tok, path="/", httponly=False, samesite="lax", secure=secure)
+    resp.set_cookie("role", "candidate", path="/", httponly=False, samesite="lax", secure=secure)
+    return resp
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    """
+    Invalidate server session (if stored) and expire auth cookies.
+    """
+    tok = _extract_bearer_or_cookie_token(request)
+
+    # Best-effort server invalidation (if sessions collection exists)
+    db = await _get_db_optional()
+    if db and tok:
+        try:
+            res = db["sessions"].delete_many({"token": tok})
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
+            # ignore failures; client cookies will still be cleared
+            pass
+
+    resp = JSONResponse({"ok": True})
+    # Expire common auth cookies
+    for c in ("access_token", "refresh_token", "AUTH_TOKEN", "Authorization", "session", "sessionid", "jwt", "authToken", "token", "role"):
+        try:
+            resp.delete_cookie(c, path="/")
+        except Exception:
+            pass
+    return resp
+
+
+class ResultsSaveRequest(BaseModel):
+    ids: List[str]
+    metadata: Optional[dict] = None
+    source: Optional[str] = None
+
+
+@app.post("/results/save")
+async def save_filtered_results(body: ResultsSaveRequest, request: Request):
+    """
+    Persist selected results for the current actor (website user or candidate).
+    Associates by token (opaque) and stores basic metadata.
+    """
+    if not body.ids:
+        return JSONResponse({"detail": "ids array is required"}, status_code=400)
+
+    owner_token = _extract_bearer_or_cookie_token(request)
+
+    saved_id = None
+    db = await _get_db_optional()
+    if db:
+        try:
+            doc = {
+                "kind": "saved_results",
+                "ids": body.ids,
+                "metadata": body.metadata or {},
+                "source": body.source or "unknown",
+                "owner_token": owner_token,
+                "created_at": __import__("datetime").datetime.utcnow(),
+                "user_agent": request.headers.get("user-agent"),
+                "ip": request.client.host if request.client else None,
+            }
+            ins = db["saved_results"].insert_one(doc)
+            if inspect.isawaitable(ins):
+                ins = await ins
+            saved_id = getattr(ins, "inserted_id", None)
+        except Exception:
+            # fall through to OK response without DB id
+            pass
+
+    return JSONResponse({"ok": True, "savedId": str(saved_id) if saved_id else None})
+
+
 # ✅ Confirm MongoDB connection at startup
 @app.on_event("startup")
 async def startup_db_check():
     await verify_mongo_connection()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
