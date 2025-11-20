@@ -118,6 +118,12 @@ async def upload_resumes(
     and warm the owner-scoped ANN index. Operates best-effort for embeddings—never fails
     the upload because of the ANN/embedding step.
     """
+    # Input validation
+    if not files or len(files) == 0:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+    if len(files) > 50:  # Reasonable limit to prevent abuse
+        raise HTTPException(status_code=400, detail="Maximum 50 files allowed per upload")
+    
     parsed_resumes: List[Dict[str, Any]] = []
 
     received_count = len(files)
@@ -160,7 +166,10 @@ async def upload_resumes(
         # Parse safely
         try:
             resume_data = parse_resume_file(filename, contents)
-        except Exception:
+        except Exception as e:
+            # Log parse errors for debugging but don't fail the entire upload
+            import logging
+            logging.warning(f"Failed to parse resume {filename}: {e}")
             skipped_parse_error += 1
             skipped_files["parse_error"].append(filename)
             continue

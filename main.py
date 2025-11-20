@@ -70,10 +70,12 @@ if _extra:
             origins.append(o)
 
 _allow_all = os.getenv("CORS_ALLOW_ALL", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Security: Cannot use allow_credentials=True with allow_origins=["*"]
+# If allow_all is enabled, disable credentials for security
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _allow_all else origins,
-    allow_credentials=True,
+    allow_credentials=not _allow_all,  # Disable credentials when allowing all origins
     allow_methods=["*"],
     allow_headers=["*"],
 )
