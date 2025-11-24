@@ -97,8 +97,8 @@ def _sanitize_for_mongo(doc: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(doc.get(f), list):
                 doc[f] = []
 
-    # Numbers with sensible defaults (only for known numeric fields)
-    for nf in ["experience", "total_experience_years", "years_of_experience", "experience_years", "yoe"]:
+    # ✅ Numbers with sensible defaults (only canonical experience field)
+    for nf in ["experience", "total_experience_years"]:  # Keep total_experience_years for backward compat
         v = doc.get(nf)
         try:
             doc[nf] = float(v) if v is not None else 0.0
@@ -307,19 +307,10 @@ async def upload_resumes(
         except Exception:
             role_conf = 0.0
 
-        resume_data["role_confidence"] = role_conf                      # 0–1
-        resume_data["role_confidence_pct"] = round(role_conf * 100.0, 2)  # 0–100
-
-        # For backward compatibility, normalize any existing ml_confidence to 0–1 and provide pct variant.
-        if "ml_confidence" in resume_data:
-            try:
-                v = float(resume_data["ml_confidence"])
-                resume_data["ml_confidence"] = v / 100.0 if v > 1.0 else v
-            except Exception:
-                resume_data["ml_confidence"] = role_conf
-        else:
-            resume_data["ml_confidence"] = role_conf
-        resume_data["ml_confidence_pct"] = round(float(resume_data["ml_confidence"]) * 100.0, 2)
+        # ✅ Store only canonical fields (remove redundant aliases)
+        resume_data["role_confidence"] = role_conf                      # 0–1 (canonical)
+        resume_data["ml_confidence"] = role_conf                       # 0–1 (alias for compatibility)
+        # Remove redundant: role_confidence_pct, ml_confidence_pct (can be computed from role_confidence * 100)
 
         # File / identity & basics
         resume_data["filename"] = filename
@@ -344,8 +335,25 @@ async def upload_resumes(
             "url": resume_data.get("resume_url", ""),
         }
 
-        # Clean old transient fields if present
-        for key in ["matchedSkills", "missingSkills", "score", "testScore", "rank", "filter_skills"]:
+        # ✅ Clean redundant/transient fields before persistence
+        redundant_fields = [
+            # Transient scoring fields (recomputed on query)
+            "matchedSkills", "missingSkills", "score", "testScore", "rank", "filter_skills",
+            "final_score", "prompt_matching_score", "semantic_score",
+            # Redundant experience aliases (keep only experience, experience_rounded, experience_display)
+            "years_of_experience", "experience_years", "yoe",  # Keep total_experience_years for backward compat
+            # Redundant title aliases (keep only currentRole and title)
+            "job_title", "current_title",
+            # Redundant confidence fields (keep only role_confidence and ml_confidence)
+            "role_confidence_pct", "ml_confidence_pct", "confidence_pct",
+            # Redundant location fields (keep location, location_norm, city, country)
+            # (city and country are useful for filtering, so keep them)
+            # Redundant role fields (keep predicted_role, category, currentRole, role_norm)
+            "ml_predicted_role",  # Keep for backward compatibility but mark as redundant
+            # Redundant blob fields (keep only index_blob and search_blob)
+            "resume_blob", "text_blob", "full_text",
+        ]
+        for key in redundant_fields:
             resume_data.pop(key, None)
 
         # ---------- Build/use index blob (used for embedding + ANN warm) ----------

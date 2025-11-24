@@ -817,8 +817,10 @@ async def get_semantic_matches(
             ids_restrict = None
 
     # -----------------------------
-    # Build Mongo query (prefilters)
+    # ✅ CATEGORY-FIRST FILTERING: Build Mongo query with strict priority
     # -----------------------------
+    # Priority order: role → experience → skills → location → education → projects → phrases
+    # If role filter exists and fails → candidate is excluded immediately (no other checks)
     query: Dict[str, Any] = {}
     conditions: List[Dict[str, Any]] = []
 
@@ -842,42 +844,102 @@ async def get_semantic_matches(
     if final_ids_cond:
         conditions.append({"_id": {"$in": final_ids_cond}})
 
-    # DB prefilter by experience if selected
-    if _selected("experience") and (min_years is not None):
-        conditions.append({
-            "$or": [
-                {"total_experience_years": {"$gte": min_years}},
-                {"years_of_experience": {"$gte": min_years}},
-                {"experience_years": {"$gte": min_years}},
-                {"yoe": {"$gte": min_years}},
-                {"experience": {"$gte": min_years}},
-            ]
-        })
+    # ✅ CRITICAL: ROLE FILTER FIRST (highest priority, strict matching)
+    # If role filter exists → ONLY fetch candidates matching role
+    # If role doesn't match → candidate is excluded (no other filters applied)
+    if _selected("role") and requested_role:
+        role_clean = clean_text(requested_role)
+        if role_clean:
+            # Strict role matching: check predicted_role, category, role_norm, currentRole
+            role_conditions = []
+            # Exact match on normalized role fields
+            role_conditions.append({"role_norm": {"$regex": re.escape(role_clean), "$options": "i"}})
+            role_conditions.append({"predicted_role": {"$regex": re.escape(role_clean), "$options": "i"}})
+            role_conditions.append({"category": {"$regex": re.escape(role_clean), "$options": "i"}})
+            role_conditions.append({"currentRole": {"$regex": re.escape(role_clean), "$options": "i"}})
+            # Also check if role is contained in these fields
+            role_conditions.append({"predicted_role": {"$regex": role_clean, "$options": "i"}})
+            conditions.append({"$or": role_conditions})
+            # ✅ Early termination: If role filter is set, we MUST have a match condition
+            # This ensures MongoDB only returns candidates with matching roles
 
-    # Optional DB prefilter by role/category when dropdown includes "role"
-    if _selected("role") and requested_role and options.get("prefilter_role_regex", True):
-        try:
-            role_regex = re.escape(requested_role)
-            conditions.append({
-                "$or": [
-                    {"predicted_role": {"$regex": role_regex, "$options": "i"}},
-                    {"category": {"$regex": role_regex, "$options": "i"}},
+    # ✅ SECOND: Experience filter (only applied if role passed or role filter not selected)
+    if _selected("experience") and (min_years is not None or max_years is not None):
+        exp_conditions = []
+        if min_years is not None:
+            exp_conditions.append({"experience": {"$gte": min_years}})
+            exp_conditions.append({"total_experience_years": {"$gte": min_years}})
+            exp_conditions.append({"years_of_experience": {"$gte": min_years}})
+            exp_conditions.append({"experience_years": {"$gte": min_years}})
+            exp_conditions.append({"yoe": {"$gte": min_years}})
+        if max_years is not None:
+            if exp_conditions:
+                # Combine min and max
+                exp_conditions = [
+                    {"$and": [
+                        {"$or": exp_conditions},
+                        {"$or": [
+                            {"experience": {"$lte": max_years}},
+                            {"total_experience_years": {"$lte": max_years}},
+                            {"years_of_experience": {"$lte": max_years}},
+                            {"experience_years": {"$lte": max_years}},
+                            {"yoe": {"$lte": max_years}},
+                        ]}
+                    ]}
                 ]
-            })
-        except Exception:
-            pass
+            else:
+                exp_conditions = [
+                    {"experience": {"$lte": max_years}},
+                    {"total_experience_years": {"$lte": max_years}},
+                    {"years_of_experience": {"$lte": max_years}},
+                    {"experience_years": {"$lte": max_years}},
+                    {"yoe": {"$lte": max_years}},
+                ]
+        if exp_conditions:
+            conditions.append({"$or": exp_conditions})
 
-    # Optional DB prefilter by location when selected
-    if _selected("location") and location_filter:
-        try:
-            conditions.append({"location": {"$regex": re.escape(location_filter), "$options": "i"}})
-        except Exception:
-            pass
-
-    # Optional DB prefilter by must include skills (exact containment) when selected
+    # ✅ THIRD: Skills filter (only applied if role+experience passed)
     if _selected("skills") and must_include_skills:
         # skills are stored as lower-cased strings in most pipelines; normalize requirements
-        conditions.append({"skills": {"$all": [clean_text(s) for s in must_include_skills]}})
+        skills_normalized = [clean_text(s) for s in must_include_skills if s]
+        if skills_normalized:
+            conditions.append({"skills": {"$all": skills_normalized}})
+
+    # ✅ FOURTH: Location filter (only applied if previous filters passed)
+    if _selected("location") and location_filter:
+        location_clean = clean_text(location_filter)
+        if location_clean:
+            # Match location field (normalized)
+            conditions.append({
+                "$or": [
+                    {"location": {"$regex": re.escape(location_clean), "$options": "i"}},
+                    {"location_norm": {"$regex": re.escape(location_clean), "$options": "i"}},
+                ]
+            })
+
+    # ✅ FIFTH: Education filter (schools/degrees)
+    if _selected("education") and (schools_required or degrees_required):
+        edu_conditions = []
+        if schools_required:
+            # Check in education field or schools_detected
+            for school in schools_required:
+                edu_conditions.append({"schools_detected": {"$regex": re.escape(school.lower()), "$options": "i"}})
+                edu_conditions.append({"resume.education": {"$regex": re.escape(school.lower()), "$options": "i"}})
+        if degrees_required:
+            for degree in degrees_required:
+                edu_conditions.append({"degrees_detected": {"$regex": re.escape(degree.lower()), "$options": "i"}})
+                edu_conditions.append({"resume.education": {"$regex": re.escape(degree.lower()), "$options": "i"}})
+        if edu_conditions:
+            conditions.append({"$or": edu_conditions})
+
+    # ✅ SIXTH: Projects filter (only check if projects field exists and has content)
+    if _selected("projects") and projects_required:
+        conditions.append({
+            "$and": [
+                {"projects": {"$exists": True, "$ne": None}},
+                {"projects": {"$not": {"$size": 0}}},
+            ]
+        })
 
     if conditions:
         if "$and" in query:
@@ -885,27 +947,31 @@ async def get_semantic_matches(
         else:
             query["$and"] = conditions
 
-    # Minimal projection to reduce network/load
+    # ✅ Optimized projection: Only fetch fields needed for filtering/scoring (reduce network/load)
     projection = {
         "_id": 1,
         "raw_text": 1,
         "predicted_role": 1,
         "category": 1,
-        "ml_predicted_role": 1,   # ✅ include ML role for fallback
-        "currentRole": 1,         # ✅ include alias
+        "role_norm": 1,           # ✅ for role filtering
+        "ml_predicted_role": 1,
+        "currentRole": 1,
         "name": 1,
         "location": 1,
+        "location_norm": 1,       # ✅ for location filtering
         "email": 1,
         "skills": 1,
         "projects": 1,
         "resume_url": 1,
-        "confidence": 1,
+        "role_confidence": 1,     # ✅ prefer role_confidence
         "ml_confidence": 1,
-        "total_experience_years": 1,
-        "years_of_experience": 1,
-        "experience_years": 1,
-        "yoe": 1,
-        "experience": 1,
+        "confidence": 1,
+        "experience": 1,         # ✅ single canonical field (others are redundant)
+        "experience_display": 1,
+        "experience_rounded": 1,
+        "schools_detected": 1,    # ✅ for education filtering
+        "degrees_detected": 1,   # ✅ for education filtering
+        "resume": 1,              # ✅ for education/projects nested access
     }
 
     cursor = db.parsed_resumes.find(query, projection=projection)
@@ -931,12 +997,39 @@ async def get_semantic_matches(
         ).strip()
         predicted_role_lc = (original_predicted_role or "").lower().strip()
 
-        # Prefer ml_confidence if present; fall back to legacy 'confidence'
-        conf_val = cv.get("ml_confidence", cv.get("confidence", 0))
+        # ✅ Fix: Role Prediction Confidence - check multiple fields and ensure proper extraction
+        # Priority: role_confidence (0-1) > ml_confidence (0-1) > confidence (0-1 or 0-100) > role_confidence_pct/100
+        role_pred_confidence = 0.0
         try:
-            role_pred_confidence = round(float(conf_val or 0), 2)
+            # Try role_confidence first (most reliable, 0-1 scale)
+            if isinstance(cv.get("role_confidence"), (int, float)) and float(cv.get("role_confidence", 0)) > 0:
+                role_pred_confidence = float(cv.get("role_confidence"))
+            # Try ml_confidence (0-1 scale)
+            elif isinstance(cv.get("ml_confidence"), (int, float)) and float(cv.get("ml_confidence", 0)) > 0:
+                conf_val = float(cv.get("ml_confidence"))
+                # Normalize if it's in 0-100 range
+                role_pred_confidence = conf_val / 100.0 if conf_val > 1.0 else conf_val
+            # Try confidence field (could be 0-1 or 0-100)
+            elif isinstance(cv.get("confidence"), (int, float)) and float(cv.get("confidence", 0)) > 0:
+                conf_val = float(cv.get("confidence"))
+                # Normalize if it's in 0-100 range
+                role_pred_confidence = conf_val / 100.0 if conf_val > 1.0 else conf_val
+            # Try role_confidence_pct (0-100 scale)
+            elif isinstance(cv.get("role_confidence_pct"), (int, float)) and float(cv.get("role_confidence_pct", 0)) > 0:
+                role_pred_confidence = float(cv.get("role_confidence_pct")) / 100.0
+            # If all are missing/0, compute a fallback confidence based on predicted_role presence
+            elif original_predicted_role and original_predicted_role.strip().lower() not in _BAD:
+                # If we have a predicted role but no confidence, assign a reasonable default (0.7 = 70%)
+                role_pred_confidence = 0.7
         except Exception:
-            role_pred_confidence = 0.0
+            # If we have a predicted role but confidence extraction failed, use default
+            if original_predicted_role and original_predicted_role.strip().lower() not in _BAD:
+                role_pred_confidence = 0.7
+            else:
+                role_pred_confidence = 0.0
+        
+        # Ensure confidence is in 0-1 range
+        role_pred_confidence = max(0.0, min(1.0, round(role_pred_confidence, 3)))
 
         cleaned_resume_text = clean_text(raw_text)
         skills = cv.get("skills", []) or []
@@ -1099,73 +1192,107 @@ async def get_semantic_matches(
         weighted_final = (W_ROLE * role_score) + (W_SKILLS * skills_score) + (W_EXP * exp_score) + (W_PROJ * proj_score)
         final_score = round(weighted_final * 100.0, 2)
 
-        # STRICT FILTERS (respect selected fields)
+        # ✅ STRICT CATEGORY-FIRST FILTERS with early termination
+        # If role filter exists and fails → skip candidate immediately (no other checks)
         failed_filters: List[str] = []
 
-        # 1) Role
+        # ✅ 1) ROLE FILTER (HIGHEST PRIORITY - early termination)
         role_ok = True
         if _selected("role") and requested_role:
-            role_ok = (role_score >= ROLE_SIM_STRICT)
+            role_clean = clean_text(requested_role)
+            pred_role_clean = clean_text(original_predicted_role or "")
+            # Strict matching: must match role in category-specific fields
+            role_match_fields = [
+                cv.get("role_norm", ""),
+                original_predicted_role or "",
+                cv.get("category", ""),
+                cv.get("currentRole", ""),
+            ]
+            role_match_text = " ".join([str(f) for f in role_match_fields if f]).lower()
+            # Check if requested role appears in any role-related field
+            role_ok = (
+                role_clean in role_match_text or
+                any(role_clean in clean_text(str(f)) for f in role_match_fields if f) or
+                (role_score >= ROLE_SIM_STRICT)
+            )
             if not role_ok:
                 failed_filters.append("role")
+                # ✅ EARLY TERMINATION: If role doesn't match, skip candidate entirely
+                continue  # Skip to next candidate - no need to check other filters
 
-        # 2) Experience
+        # ✅ 2) EXPERIENCE (only checked if role passed or role filter not selected)
         exp_ok = True
         if _selected("experience") and (min_years is not None or max_years is not None):
             exp_ok = _experience_satisfies(experience, min_years, max_years, strict_ge, strict_le)
             if not exp_ok:
                 failed_filters.append("experience")
+                # ✅ Early termination: if experience required and doesn't match, skip
+                continue
 
-        # 3) Skills must-include (ALL)
+        # ✅ 3) SKILLS (only checked if role+experience passed)
         skills_ok = True
         missing_must_skills: List[str] = []
         if _selected("skills") and must_include_skills:
             skills_ok, missing_must_skills = _skills_contain_all(skills, must_include_skills)
             if not skills_ok:
                 failed_filters.append("skills")
+                # ✅ Early termination: if skills required and don't match, skip
+                continue
 
-        # 4) Projects
+        # ✅ 4) LOCATION (only checked if previous filters passed)
+        loc_ok = True
+        if _selected("location") and location_filter:
+            location_clean = clean_text(location_filter)
+            loc_match_text = clean_text(location_text or "")
+            loc_ok = location_clean in loc_match_text
+            if not loc_ok:
+                failed_filters.append("location")
+                continue
+
+        # ✅ 5) EDUCATION (only checked if previous filters passed)
+        edu_ok = True
+        rt_lc = (raw_text or "").lower()
+        if _selected("education") and schools_required:
+            schools_detected = cv.get("schools_detected", []) or []
+            schools_text = " ".join([str(s) for s in schools_detected]).lower()
+            edu_ok = all(s.lower() in (schools_text + " " + rt_lc) for s in schools_required)
+            if not edu_ok:
+                failed_filters.append("education_schools")
+                continue
+        if _selected("education") and edu_ok and degrees_required:
+            degrees_detected = cv.get("degrees_detected", []) or []
+            degrees_text = " ".join([str(d) for d in degrees_detected]).lower()
+            norm_rt = re.sub(r"[.\- ]", "", rt_lc)
+            def _deg_match(d: str) -> bool:
+                d1 = d.lower()
+                d2 = re.sub(r"[.\- ]", "", d1)
+                return (d1 in (degrees_text + " " + rt_lc)) or (d2 in norm_rt)
+            deg_ok = all(_deg_match(d) for d in degrees_required)
+            if not deg_ok:
+                failed_filters.append("education_degrees")
+                edu_ok = False
+                continue
+
+        # ✅ 6) PROJECTS (only checked if previous filters passed)
         proj_ok = True
         if _selected("projects") and projects_required:
             proj_ok = _has_projects(projects_field, projects_text)
             if not proj_ok:
                 failed_filters.append("projects")
+                continue
 
-        # 5) Location
-        loc_ok = True
-        if _selected("location") and location_filter:
-            loc_ok = location_filter in location_text
-            if not loc_ok:
-                failed_filters.append("location")
-
-        # 6) Education (schools & degrees)
-        edu_ok = True
-        rt_lc = (raw_text or "").lower()
-        if _selected("education") and schools_required:
-            edu_ok = all(s in rt_lc for s in schools_required)
-            if not edu_ok:
-                failed_filters.append("education_schools")
-        if _selected("education") and edu_ok and degrees_required:
-            norm_rt = re.sub(r"[.\- ]", "", rt_lc)
-            def _deg_match(d: str) -> bool:
-                d1 = d.lower()
-                d2 = re.sub(r"[.\- ]", "", d1)
-                return (d1 in rt_lc) or (d2 in norm_rt)
-            deg_ok = all(_deg_match(d) for d in degrees_required)
-            if not deg_ok:
-                failed_filters.append("education_degrees")
-                edu_ok = False
-
-        # 7) Phrases include/exclude
+        # ✅ 7) PHRASES (only checked if previous filters passed)
         phr_ok = True
         if _selected("phrases") and must_have_phrases:
             if not all(p.lower() in rt_lc for p in must_have_phrases):
                 failed_filters.append("phrases_required")
                 phr_ok = False
+                continue
         if _selected("phrases") and exclude_phrases and phr_ok:
             if any(p.lower() in rt_lc for p in exclude_phrases):
                 failed_filters.append("phrases_excluded")
                 phr_ok = False
+                continue
 
         is_strict_match = (len(failed_filters) == 0)
 

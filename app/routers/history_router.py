@@ -677,3 +677,70 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
             "query": prompt,
         },
     }
+
+
+@router.post("/save-selection")
+async def save_selection(payload: Dict[str, Any], current=Depends(get_current_user)):
+    """
+    Save a selection of candidates to history with a prompt.
+    Used for auto-saving filtered candidates from the chatbot.
+    """
+    selected_ids = payload.get("selectedIds", [])
+    prompt = payload.get("prompt", "")
+    
+    if not isinstance(selected_ids, list) or len(selected_ids) == 0:
+        raise HTTPException(status_code=400, detail="selectedIds array is required and must not be empty")
+    
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required")
+    
+    owner_id = str(getattr(current, "id", None) or getattr(current, "_id", None) or "")
+    
+    # Fetch candidates by IDs
+    candidates: List[Dict[str, Any]] = []
+    for cid_str in selected_ids:
+        try:
+            oid = ObjectId(cid_str) if isinstance(cid_str, str) and len(cid_str) in (12, 24) else cid_str
+            doc = await db.parsed_resumes.find_one({"_id": oid})
+            if doc:
+                # Convert ObjectId to string for JSON serialization
+                doc["_id"] = str(doc["_id"])
+                candidates.append(doc)
+        except Exception:
+            continue
+    
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No valid candidates found for the provided IDs")
+    
+    # Prepare metadata
+    ts_raw = datetime.utcnow()
+    ts_disp = _now_display()
+    
+    match_meta = {
+        "strictCount": sum(1 for x in candidates if x.get("is_strict_match")),
+        "closeCount": sum(1 for x in candidates if not x.get("is_strict_match")),
+        "total": len(candidates),
+        "hasExact": any(x.get("match_type") == "exact" for x in candidates),
+        "hasClose": any(x.get("match_type") == "close" for x in candidates),
+    }
+    
+    # Save to history
+    history_doc = {
+        "kind": "search_history",
+        "ownerUserId": owner_id,
+        "prompt": prompt.strip(),
+        "timestamp_raw": ts_raw,
+        "timestamp_display": ts_disp,
+        "totalMatches": len(candidates),
+        "candidates": candidates,
+        "matchMeta": match_meta,
+    }
+    
+    result = await db.search_history.insert_one(history_doc)
+    history_id = str(result.inserted_id)
+    
+    return {
+        "ok": True,
+        "savedId": history_id,
+        "message": f"Saved {len(candidates)} candidate(s) to history",
+    }

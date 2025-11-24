@@ -713,49 +713,114 @@ def extract_experience(text: str) -> float:
 
 def extract_projects(text: str) -> List[Dict[str, Any]]:
     """
-    Extract up to 5 projects from recognizable sections, tagging technologies
-    using the skills vocabulary.
+    ✅ Fixed: Extract projects ONLY from project-specific sections.
+    Avoids mixing with location, education, or other categories.
     """
-    try:
-        raw_sections = re.findall(
-            r'(?is)\b(projects?|responsibilities|description)\b[:\n\-–]*([\s\S]{0,800})',
-            text,
-        )
-    except Exception:
-        raw_sections = []
-
     projects: List[Dict[str, Any]] = []
     seen = set()
-
-    for _, section in raw_sections:
-        lines = [line.strip() for line in section.strip().split('\n') if len(line.strip()) > 10]
-        if not lines:
+    
+    # ✅ 1) Look for explicit "Projects" section first (most reliable)
+    project_section_patterns = [
+        r'(?is)\b(?:projects?|portfolio|key projects?|notable projects?)\b[:\n\-–]*([\s\S]{0,2000})',
+    ]
+    
+    for pattern in project_section_patterns:
+        try:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                section_text = match.group(1).strip()
+                if not section_text or len(section_text) < 20:
+                    continue
+                
+                # Split by bullet points or numbered items
+                items = re.split(r'\n\s*[-•*]\s+|\n\s*\d+[\.\)]\s+', section_text)
+                for item in items:
+                    item = item.strip()
+                    if len(item) < 20:  # Too short to be a project
+                        continue
+                    
+                    # Extract project name (first line or first sentence)
+                    lines = [l.strip() for l in item.split('\n') if l.strip()]
+                    if not lines:
+                        continue
+                    
+                    # First line is usually project name
+                    name = lines[0][:100].strip()
+                    # Rest is description
+                    description = " ".join(lines[1:]).strip() or lines[0][100:].strip()
+                    
+                    # ✅ Validate: exclude location-like patterns
+                    name_lower = name.lower()
+                    if any(word in name_lower for word in ["city", "country", "state", "province", "region"]):
+                        continue
+                    
+                    # ✅ Validate: must contain project-like keywords or tech terms
+                    if not re.search(r'\b(?:project|application|system|platform|website|app|software|tool|framework|api|service)\b', item, re.I):
+                        # If no project keywords, check for tech skills (indicates it's a tech project)
+                        if not KNOWN_SKILLS or not any(skill in item.lower() for skill in KNOWN_SKILLS[:20]):
+                            continue
+                    
+                    if name and name not in seen:
+                        seen.add(name)
+                        
+                        # Extract technologies
+                        tech: List[str] = []
+                        item_lower = item.lower()
+                        if KNOWN_SKILLS:
+                            for skill in sorted(KNOWN_SKILLS, key=len, reverse=True):
+                                if skill and skill in item_lower:
+                                    tech.append(skill)
+                        
+                        projects.append({
+                            "name": name,
+                            "description": description[:500],  # Limit description length
+                            "tech": sorted(list(set(tech)))
+                        })
+                        
+                        if len(projects) >= 5:
+                            break
+                if len(projects) >= 5:
+                    break
+        except Exception:
             continue
+    
+    # ✅ 2) Fallback: Look for work history entries that mention projects
+    if len(projects) < 3:
+        try:
+            work_pattern = r'(?is)\b(?:experience|work history|employment)\b[:\n\-–]*([\s\S]{0,3000})'
+            work_match = re.search(work_pattern, text)
+            if work_match:
+                work_text = work_match.group(1)
+                # Look for project mentions within work history
+                project_mentions = re.finditer(
+                    r'(?i)\b(?:project|developed|built|created|designed|implemented)\b[:\s]+([^\n]{20,200})',
+                    work_text
+                )
+                for mention in project_mentions:
+                    desc = mention.group(1).strip()
+                    if len(desc) < 20:
+                        continue
+                    # Extract as project name
+                    name = desc[:80]
+                    if name not in seen:
+                        seen.add(name)
+                        tech: List[str] = []
+                        desc_lower = desc.lower()
+                        if KNOWN_SKILLS:
+                            for skill in sorted(KNOWN_SKILLS, key=len, reverse=True):
+                                if skill and skill in desc_lower:
+                                    tech.append(skill)
+                        projects.append({
+                            "name": name,
+                            "description": desc,
+                            "tech": sorted(list(set(tech)))
+                        })
+                        if len(projects) >= 5:
+                            break
+        except Exception:
+            pass
 
-        # Heuristic: the first non-empty line is a project name (trim)
-        name = lines[0][:80]
-        description = " ".join(lines[1:]).strip() or lines[0]
-        if not name or name in seen:
-            continue
-        seen.add(name)
-
-        tech: List[str] = []
-        low_desc = description.lower()
-        if KNOWN_SKILLS:
-            for skill in sorted(KNOWN_SKILLS, key=len, reverse=True):
-                if skill and skill in low_desc:
-                    tech.append(skill)
-
-        projects.append({
-            "name": name,
-            "description": description,
-            "tech": sorted(list({t for t in tech}))
-        })
-
-        if len(projects) >= 5:
-            break
-
-    return projects
+    return projects[:5]  # Return max 5 projects
 
 
 def extract_summary(text: str) -> str:
@@ -962,27 +1027,77 @@ def _split_city_country(loc: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def extract_location(text: str) -> str:
-    # 1) spaCy NER (GPE)
+    """
+    ✅ Fixed: Extract location ONLY from location-specific fields.
+    Avoids mixing with projects, roles, or other categories.
+    """
+    # Common location patterns to exclude (not actual locations)
+    non_location_patterns = [
+        r"curriculum", r"classroom", r"design", r"development", r"project",
+        r"teaching", r"education", r"training", r"course", r"lesson"
+    ]
+    
+    # 1) spaCy NER (GPE) - most reliable
     if _HAS_NER:
         try:
             doc = nlp(text)
-            locations = [ent.text.strip() for ent in doc.ents if getattr(ent, "label_", "") == "GPE"]
+            locations = []
+            for ent in doc.ents:
+                label = getattr(ent, "label_", "")
+                if label == "GPE":  # Geopolitical entity (countries, cities, states)
+                    loc_text = ent.text.strip()
+                    # ✅ Filter out non-location patterns
+                    loc_lower = loc_text.lower()
+                    if not any(re.search(pat, loc_lower) for pat in non_location_patterns):
+                        locations.append(loc_text)
             if locations:
-                return normalize_location(locations[0]) or locations[0]
+                # Prefer longer location strings (more specific)
+                best = max(locations, key=len)
+                normalized = normalize_location(best)
+                if normalized and normalized != "N/A":
+                    return normalized
+                return best
         except Exception:
             pass
 
-    # 2) common explicit patterns (Address/Location/Based in)
-    m = re.search(r"(?im)\b(?:location|address|based in|located in|from)\b[: ]+\s*([A-Z][a-zA-Z]+(?:[, ]+[A-Z][a-zA-Z]+)?)", text)
-    if m:
-        cand = m.group(1).strip()
-        return normalize_location(cand) or cand
+    # 2) Explicit location section patterns (more reliable)
+    location_section_patterns = [
+        r"(?im)\b(?:location|address|based in|located in|residing in|current location)\b[: ]+\s*([A-Z][a-zA-Z\s,]+?)(?:\n|$|,|;|\.)",
+        r"(?im)\b(?:city|country)\b[: ]+\s*([A-Z][a-zA-Z\s,]+?)(?:\n|$|,|;|\.)",
+    ]
+    for pattern in location_section_patterns:
+        m = re.search(pattern, text)
+        if m:
+            cand = m.group(1).strip()
+            # ✅ Validate: must look like a location (city/country names, not project names)
+            cand_lower = cand.lower()
+            if not any(re.search(pat, cand_lower) for pat in non_location_patterns):
+                # Check if it contains common location indicators
+                if re.search(r"\b(city|country|state|province|region|area)\b", cand_lower, re.I):
+                    normalized = normalize_location(cand)
+                    if normalized and normalized != "N/A":
+                        return normalized
+                # Or if it's a known city/country pattern
+                elif re.match(r"^[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?(?:,\s*[A-Z][a-zA-Z]+)?$", cand):
+                    normalized = normalize_location(cand)
+                    if normalized and normalized != "N/A":
+                        return normalized
+                    return cand
 
-    # 3) email signature style "City, Country" near contact
-    m = re.search(r"\b([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?),\s*([A-Z][a-zA-Z]+)\b", text)
-    if m:
-        cand = f"{m.group(1)}, {m.group(2)}"
-        return normalize_location(cand) or cand
+    # 3) Email signature style "City, Country" near contact info
+    # Only match if near email/phone patterns
+    contact_context = re.search(r"(?:email|phone|contact|@)[\s\S]{0,200}([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?),\s*([A-Z][a-zA-Z]+)", text, re.IGNORECASE)
+    if contact_context:
+        city = contact_context.group(1).strip()
+        country = contact_context.group(2).strip()
+        cand = f"{city}, {country}"
+        # ✅ Validate: exclude non-location patterns
+        cand_lower = cand.lower()
+        if not any(re.search(pat, cand_lower) for pat in non_location_patterns):
+            normalized = normalize_location(cand)
+            if normalized and normalized != "N/A":
+                return normalized
+            return cand
 
     return "N/A"
 
@@ -1168,10 +1283,9 @@ def extract_info(text: str) -> dict:
         "experience_rounded": experience_rounded,  # float (1-decimal)
         "experience_display": experience_display,  # string ("2 years", "0.5 years", "1 year")
 
-        # Title/Role (multiple aliases)
-        "title": (current_title or "N/A"),
-        "job_title": (current_title or "N/A"),
-        "current_title": (current_title or "N/A"),
+        # ✅ Title/Role: Store only canonical fields
+        "currentRole": current_title or "N/A",     # Canonical field
+        "title": current_title or "N/A",           # Alias (for backward compatibility)
 
         # Projects
         "projects": projects,
@@ -1179,11 +1293,12 @@ def extract_info(text: str) -> dict:
         "project_details": project_summary_text,
         "portfolio": project_summary_text,
 
-        # Location
-        "location": location,
-        "location_norm": location_norm,
-        "city": city,
-        "country": country,
+        # ✅ Location: Store only canonical fields
+        "location": location,                      # Canonical field (full location string)
+        "location_norm": location_norm,           # Normalized for filtering
+        # city and country can be derived from location if needed, but store for performance
+        "city": city,                              # Extracted city (if available)
+        "country": country,                        # Extracted country (if available)
 
         # Raw/Index text
         "raw_text": text,

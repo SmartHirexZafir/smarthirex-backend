@@ -740,31 +740,59 @@ def _apply_selected_filters_in_order(
     keywords: List[str],
 ) -> List[Dict[str, Any]]:
     """
-    Sequentially apply the selected filters in the given order.
-    Each step reduces the working set → faster & stricter.
+    ✅ CATEGORY-FIRST FILTERING: Apply filters in strict priority order with early termination.
+    Priority: role → experience → skills → location → education → projects → phrases
+    
+    If role filter exists and fails → candidate is excluded immediately (no other checks).
+    This dramatically speeds up filtering by avoiding unnecessary field scans.
     """
     working = list(items)
     if not working or not selected:
         return working
 
-    for f in selected:
-        if f == "role":
-            working = _filter_by_role(working, prompt_like)
-        elif f == "experience":
-            working = _filter_by_experience(working, prompt_like)
-        elif f == "skills":
-            working = _filter_by_skills(working, keywords)
-        elif f == "location":
-            working = _filter_by_location(working, prompt_like, keywords)
-        elif f == "projects":
-            working = _filter_by_projects(working, keywords)
-        elif f == "cv":
-            working = _filter_by_cv_content(working, prompt_like, keywords)
-        elif f == "education":  # ✅ new
-            working = _filter_by_education(working, keywords)
-        # if list becomes empty early, break
+    # ✅ CRITICAL: Apply filters in priority order with early termination
+    # 1) ROLE (highest priority - if fails, skip candidate entirely)
+    if "role" in selected:
+        working = _filter_by_role(working, prompt_like)
         if not working:
-            break
+            return []  # Early termination: no candidates match role
+
+    # 2) EXPERIENCE (only applied if role passed or role not selected)
+    if "experience" in selected:
+        working = _filter_by_experience(working, prompt_like)
+        if not working:
+            return []  # Early termination
+
+    # 3) SKILLS (only applied if role+experience passed)
+    if "skills" in selected:
+        working = _filter_by_skills(working, keywords)
+        if not working:
+            return []  # Early termination
+
+    # 4) LOCATION (only applied if previous filters passed)
+    if "location" in selected:
+        working = _filter_by_location(working, prompt_like, keywords)
+        if not working:
+            return []  # Early termination
+
+    # 5) EDUCATION (only applied if previous filters passed)
+    if "education" in selected:
+        working = _filter_by_education(working, keywords)
+        if not working:
+            return []  # Early termination
+
+    # 6) PROJECTS (only applied if previous filters passed)
+    if "projects" in selected:
+        working = _filter_by_projects(working, keywords)
+        if not working:
+            return []  # Early termination
+
+    # 7) PHRASES/CV (only applied if previous filters passed)
+    if "cv" in selected or "phrases" in selected:
+        working = _filter_by_cv_content(working, prompt_like, keywords)
+        if not working:
+            return []  # Early termination
+
     return working
 
 
@@ -846,44 +874,104 @@ def _annotate_scores(preview: List[Dict[str, Any]], prompt_like: str, keywords: 
     To avoid '0% match' blanks, we set both synonyms if they're missing.
     """
     for c in preview or []:
-        # Compute a 0..100 score rounded to an INT for consistent chips
-        computed = int(round(_compute_prompt_match_score(c, prompt_like, keywords)))
+        # ✅ Fix: Compute prompt matching score - prefer existing semantic_score if available, otherwise compute
+        # If candidate already has a semantic_score from ML matching, use it as base
+        existing_semantic = c.get("semantic_score")
+        existing_final = c.get("final_score")
+        existing_prompt = c.get("prompt_matching_score")
+        
+        # If we have a semantic score from ML matching, prefer it (it's more accurate)
+        if existing_semantic is not None and isinstance(existing_semantic, (int, float)):
+            # Normalize semantic_score to 0-100 if needed
+            if existing_semantic <= 1.0:
+                semantic_pct = existing_semantic * 100.0
+            else:
+                semantic_pct = float(existing_semantic)
+            semantic_pct = max(0.0, min(100.0, semantic_pct))
+            
+            # Use semantic score if no existing final_score, or if semantic is higher
+            if not existing_final or semantic_pct > existing_final:
+                computed = int(round(semantic_pct))
+            else:
+                computed = int(round(_compute_prompt_match_score(c, prompt_like, keywords)))
+        else:
+            # Compute using keyword matching
+            computed = int(round(_compute_prompt_match_score(c, prompt_like, keywords)))
+        
         # Prefer existing values; only fill if missing/falsey
-        if not c.get("final_score"):
+        if not c.get("final_score") or c.get("final_score") == 0:
             c["final_score"] = computed
-        if not c.get("prompt_matching_score"):
+        if not c.get("prompt_matching_score") or c.get("prompt_matching_score") == 0:
             c["prompt_matching_score"] = computed
         # Keep the lightweight debug field too (harmless if unused)
         c["prompt_match_score"] = computed
 
-        # Role Prediction Confidence (prefer stable ML confidence if available)
-        role_conf = c.get("ml_confidence", c.get("confidence"))
-        c["role_prediction_confidence"] = _to_percent(role_conf)
+        # ✅ Fix: Role Prediction Confidence - check multiple fields with proper priority
+        role_conf = None
+        # Priority: role_confidence (0-1) > ml_confidence (0-1) > confidence (0-1 or 0-100) > role_confidence_pct/100
+        if isinstance(c.get("role_confidence"), (int, float)) and float(c.get("role_confidence", 0)) > 0:
+            role_conf = float(c.get("role_confidence"))
+        elif isinstance(c.get("ml_confidence"), (int, float)) and float(c.get("ml_confidence", 0)) > 0:
+            conf_val = float(c.get("ml_confidence"))
+            role_conf = conf_val / 100.0 if conf_val > 1.0 else conf_val
+        elif isinstance(c.get("confidence"), (int, float)) and float(c.get("confidence", 0)) > 0:
+            conf_val = float(c.get("confidence"))
+            role_conf = conf_val / 100.0 if conf_val > 1.0 else conf_val
+        elif isinstance(c.get("role_confidence_pct"), (int, float)) and float(c.get("role_confidence_pct", 0)) > 0:
+            role_conf = float(c.get("role_confidence_pct")) / 100.0
+        # Fallback: if we have a predicted_role but no confidence, assign reasonable default
+        elif c.get("predicted_role") or c.get("ml_predicted_role") or c.get("category"):
+            role_conf = 0.7  # 70% default confidence if role exists but confidence missing
+        
+        c["role_prediction_confidence"] = _to_percent(role_conf) if role_conf is not None else 0.0
 
 
 def _ensure_related_roles(preview: List[Dict[str, Any]]) -> None:
     """
     Ensure each candidate has a 'related_roles' array.
-    - If missing/empty, call infer_related_roles(candidate) to attach results.
+    - If missing/empty, compute related roles inline using semantic similarity.
     - Normalize scores to percent (0..100) and keys to {'role','match'}.
     - Provide 3–5 items from server side; client may clamp to 3.
     """
-    # Lazy import to avoid cyclic deps; fall back gracefully if unavailable
-    infer_fn = None
+    # Lazy import to avoid cyclic deps
     try:
-        from app.logic.ml_interface import infer_related_roles  # type: ignore
-        infer_fn = infer_related_roles
+        from app.logic.ml_interface import get_full_roles_for_suggestions, embedding_model, util
+        has_ml = True
     except Exception:
-        infer_fn = None
+        has_ml = False
 
     for c in preview or []:
         rr = c.get("related_roles") or c.get("relatedRoles")
         needs_infer = not isinstance(rr, list) or len(rr) == 0
-        if needs_infer and infer_fn:
-            try:
-                rr = infer_fn(c) or []
-            except Exception:
-                rr = rr or []
+        
+        # ✅ Fix: Compute related roles inline if missing
+        if needs_infer:
+            predicted_role = c.get("predicted_role") or c.get("ml_predicted_role") or c.get("category")
+            if predicted_role and has_ml:
+                try:
+                    # Compute related roles using semantic similarity
+                    pred_role_lc = str(predicted_role).strip().lower()
+                    if pred_role_lc and pred_role_lc not in {"n/a", "na", "none", "-", "unknown", "not specified"}:
+                        pred_embed = embedding_model.encode(predicted_role)
+                        scores = []
+                        full_roles = get_full_roles_for_suggestions()
+                        for role in full_roles:
+                            role_clean = str(role).strip().lower()
+                            if role_clean == pred_role_lc:
+                                continue
+                            role_embed = embedding_model.encode(role)
+                            rscore = util.cos_sim(pred_embed, role_embed)[0][0].item()
+                            # Only include roles with similarity > 0.3
+                            if rscore > 0.3:
+                                scores.append({"role": role, "match": round(rscore * 100, 2)})
+                        scores.sort(key=lambda x: x["match"], reverse=True)
+                        rr = scores[:5]  # Top 5 related roles
+                    else:
+                        rr = []
+                except Exception:
+                    rr = []
+            else:
+                rr = []
 
         # Normalize to list of dicts with 'role' and percent 'match'
         norm_list: List[Dict[str, Any]] = []
@@ -897,11 +985,13 @@ def _ensure_related_roles(preview: List[Dict[str, Any]]) -> None:
                 else:
                     role = str(it)
                     score = None
-                pct = _to_percent(score) if isinstance(score, (int, float)) else 0.0
-                norm_list.append({"role": role, "match": pct})
+                if role:  # Only add if role exists
+                    pct = _to_percent(score) if isinstance(score, (int, float)) else 0.0
+                    norm_list.append({"role": role, "match": pct})
 
-        # attach normalized
-        c["related_roles"] = norm_list
+        # attach normalized (ensure at least empty list)
+        c["related_roles"] = norm_list if norm_list else []
+        c["relatedRoles"] = [{"role": x["role"], "score": round(x["match"]/100.0, 4)} for x in norm_list]
 
 
 # ------------------------ per-candidate match flag helpers -------------------

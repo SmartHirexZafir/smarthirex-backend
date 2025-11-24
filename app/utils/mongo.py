@@ -255,10 +255,20 @@ async def ensure_parsed_resumes_indexes() -> None:
         await db.parsed_resumes.create_index([("ownerUserId", 1), ("embedding_status", 1)])
         await db.parsed_resumes.create_index([("ownerUserId", 1), ("embedding_model_version", 1)])
 
-        # ✅ New: composite indexes that match the most common filter pattern
-        # (owner + role + years) and (owner + role + skills)
+        # ✅ Optimized composite indexes for category-first filtering (priority order)
+        # Role-first indexes (most common filter)
         await db.parsed_resumes.create_index([("ownerUserId", 1), ("role_norm", 1), ("yoe_num", 1)])
         await db.parsed_resumes.create_index([("ownerUserId", 1), ("role_norm", 1), ("skills_norm", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("role_norm", 1), ("location_norm", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("predicted_role", 1), ("experience", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("category", 1), ("experience", 1)])
+        # Location index for location filtering
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("location_norm", 1)])
+        # Skills index for skills filtering
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("skills", 1)])  # multikey
+        # Education indexes
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("schools_detected", 1)])
+        await db.parsed_resumes.create_index([("ownerUserId", 1), ("degrees_detected", 1)])
 
     except Exception as e:
         print("⚠️ Failed to create parsed_resumes indexes:", e)
