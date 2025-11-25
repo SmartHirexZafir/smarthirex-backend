@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, Depends
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional, Dict, List, Iterable, Tuple
 from bson import ObjectId
 from app.logic.intent_parser import parse_prompt
@@ -1544,24 +1544,35 @@ async def handle_chatbot_query(
         }
     )
 
-    # Step 4: Save history for filter intents
+    # Step 4: Save history for filter intents (prevent duplicates)
     if (parsed.get("intent") == "filter_cv") and filtered_preview:
-        timestamp_raw = datetime.now(timezone.utc)
-        timestamp_display = datetime.now().strftime("%B  %d, %Y – %I:%M %p")
-        await db.search_history.insert_one(
-            {
-                "prompt": prompt,
-                "parsed": parsed,
-                "selectedFilters": selected_filters,
-                "options": options,
-                "timestamp_raw": timestamp_raw,
-                "timestamp_display": timestamp_display,
-                "totalMatches": len(filtered_preview),
-                "candidates": filtered_preview,  # ⬅ carries final_score & prompt_matching_score now
-                "ownerUserId": owner_id,
-                "matchMeta": match_meta,
-            }
-        )
+        # ✅ Prevent duplicate saves: Check if a history entry with the same prompt
+        # was saved within the last 5 seconds by the same user
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=5)
+        existing = await db.search_history.find_one({
+            "ownerUserId": owner_id,
+            "prompt": prompt,
+            "timestamp_raw": {"$gte": recent_cutoff},
+        })
+        
+        # Only save if no recent duplicate exists
+        if not existing:
+            timestamp_raw = datetime.now(timezone.utc)
+            timestamp_display = datetime.now().strftime("%B  %d, %Y – %I:%M %p")
+            await db.search_history.insert_one(
+                {
+                    "prompt": prompt,
+                    "parsed": parsed,
+                    "selectedFilters": selected_filters,
+                    "options": options,
+                    "timestamp_raw": timestamp_raw,
+                    "timestamp_display": timestamp_display,
+                    "totalMatches": len(filtered_preview),
+                    "candidates": filtered_preview,  # ⬅ carries final_score & prompt_matching_score now
+                    "ownerUserId": owner_id,
+                    "matchMeta": match_meta,
+                }
+            )
 
     # Step 5: Context-aware reply text for UI banners
     count = match_meta["total"]

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Query, HTTPException, Depends
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from app.utils.mongo import db
 from app.routers.auth_router import get_current_user
@@ -684,6 +684,7 @@ async def save_selection(payload: Dict[str, Any], current=Depends(get_current_us
     """
     Save a selection of candidates to history with a prompt.
     Used for auto-saving filtered candidates from the chatbot.
+    ✅ Prevents duplicate saves by checking for recent entries with the same prompt.
     """
     selected_ids = payload.get("selectedIds", [])
     prompt = payload.get("prompt", "")
@@ -695,6 +696,25 @@ async def save_selection(payload: Dict[str, Any], current=Depends(get_current_us
         raise HTTPException(status_code=400, detail="prompt is required")
     
     owner_id = str(getattr(current, "id", None) or getattr(current, "_id", None) or "")
+    
+    # ✅ Prevent duplicate saves: Check if a history entry with the same prompt
+    # was saved within the last 5 seconds by the same user
+    # Use UTC-aware datetime for comparison (consistent with chatbot_router.py)
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=5)
+    existing = await db.search_history.find_one({
+        "ownerUserId": owner_id,
+        "prompt": prompt.strip(),
+        "timestamp_raw": {"$gte": recent_cutoff},
+    })
+    
+    # If a recent duplicate exists, return the existing entry instead of creating a new one
+    if existing:
+        return {
+            "ok": True,
+            "savedId": str(existing["_id"]),
+            "message": f"History entry already exists (prevented duplicate)",
+            "duplicate": True,
+        }
     
     # Fetch candidates by IDs
     candidates: List[Dict[str, Any]] = []
