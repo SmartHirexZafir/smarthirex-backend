@@ -238,22 +238,8 @@ async def get_current_user(request: Request):
 
 @router.post("/signup")
 async def signup(data: SignupRequest):
-    # ✅ Input validation
-    if not data.firstName or not data.firstName.strip():
-        raise HTTPException(status_code=400, detail="First name is required")
-    if not data.lastName or not data.lastName.strip():
-        raise HTTPException(status_code=400, detail="Last name is required")
-    if not data.company or not data.company.strip():
-        raise HTTPException(status_code=400, detail="Company is required")
-    if not data.jobTitle or not data.jobTitle.strip():
-        raise HTTPException(status_code=400, detail="Job title is required")
-    if not data.password or len(data.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
-    
     # ✅ normalize email to lowercase to avoid case-variant duplicates
     email_lc = str(data.email).strip().lower()
-    if not email_lc or '@' not in email_lc:
-        raise HTTPException(status_code=400, detail="Valid email is required")
 
     existing = await db.users.find_one({"email": email_lc})
     if existing:
@@ -273,15 +259,11 @@ async def signup(data: SignupRequest):
     token = await _create_verify_token(user["_id"])
     verify_url = _verify_link(token)
     try:
-        # Use async version to avoid blocking the request
-        from app.utils.emailer import async_send_verification_email
-        await async_send_verification_email(to=email_lc, verify_url=verify_url)
-    except Exception as e:
-        # Log the error but don't fail signup - user can resend verification
-        import logging
-        logging.error(f"Failed to send verification email to {email_lc}: {e}")
+        send_verification_email(email_lc, verify_url)
+    except Exception:
         # if email sending fails, you may want to delete user or allow resend
         # here we keep user and allow "resend" from UI
+        pass
 
     return {
         "message": "Signup successful. Please check your email to verify your account."
@@ -330,13 +312,9 @@ async def resend_verification(payload: dict = Body(...)):
     token = await _create_verify_token(user["_id"])
     verify_url = _verify_link(token)
     try:
-        # Use async version to avoid blocking
-        from app.utils.emailer import async_send_verification_email
-        await async_send_verification_email(to=email_lc, verify_url=verify_url)
-    except Exception as e:
-        # Log error but still return success - user can try again
-        import logging
-        logging.error(f"Failed to resend verification email to {email_lc}: {e}")
+        send_verification_email(email_lc, verify_url)
+    except Exception:
+        pass
     return {"ok": True, "message": "Verification email sent"}
 
 # ----------- Login -----------
