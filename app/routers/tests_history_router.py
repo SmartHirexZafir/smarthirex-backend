@@ -83,16 +83,24 @@ async def list_attempts(
     # ✅ Normalize to numeric 0..100 for frontend consistency (no percent strings)
     raw_score = doc.get("score") if doc.get("score") is not None else doc.get("total_score")
     score = to_pct_number(raw_score)
-    attempts.append(
-      {
-        "id": attempt_id,
-        "submittedAt": doc.get("submittedAt"),
-        "score": score,
-        "type": doc.get("type", "smart"),
-        "needs_marking": bool(doc.get("needs_marking", False)),
-        "pdfUrl": f"/tests/history/{candidate_id}/{attempt_id}/report.pdf",
-      }
-    )
+    
+    # ✅ Return COMPLETE test data for History tab
+    attempt_data = {
+      "id": attempt_id,
+      "submittedAt": doc.get("submittedAt"),
+      "score": score,
+      "type": doc.get("type", "smart"),
+      "testType": doc.get("testType", doc.get("type", "smart")),  # Explicit test type
+      "needs_marking": bool(doc.get("needs_marking", False)),
+      "pdfUrl": f"/tests/history/{candidate_id}/{attempt_id}/report.pdf",
+      # ✅ Complete test data
+      "questions": doc.get("questions", []),  # All questions from the test
+      "answers": doc.get("answers", []),  # Candidate's submitted answers
+      "details": doc.get("details", []),  # Complete evaluation details (question, answer, is_correct, explanation, etc.)
+      "custom": doc.get("custom"),  # Custom test metadata (title, etc.)
+      "questionCount": doc.get("questionCount", len(doc.get("questions", []))),
+    }
+    attempts.append(attempt_data)
   return {"candidateId": candidate_id, "attempts": attempts}
 
 

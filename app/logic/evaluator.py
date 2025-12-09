@@ -84,7 +84,7 @@ def evaluate_mcq(submitted: str, correct: str) -> int:
     return 1 if _norm(submitted) == _norm(correct) else 0
 
 # --------------------------------------------------------------------
-# Free-form grading (scenario/coding) with rules + optional LLM
+# Free-form grading (scenario/coding) with GPT-based intelligent evaluation
 # --------------------------------------------------------------------
 def _grade_freeform(
     question: str,
@@ -97,17 +97,43 @@ def _grade_freeform(
       {
         "is_correct": bool,
         "confidence": float (0..1),
-        "explanation": str
+        "explanation": str,
+        "score": float (0..1)
       }
-    - Uses local rules first when available.
-    - Optionally refines with LLM if enabled/available.
+    - For scenario questions: Uses GPT-based evaluator with leniency (ALWAYS)
+    - For code questions: Uses LLM if available, else falls back to rules/heuristic
     - Never raises; always returns a safe structure.
     """
-    # 1) Rules (fast/offline) or heuristic fallback
+    # ✅ For scenario questions: ALWAYS use GPT evaluator with leniency
+    if q_type.lower().strip() == "scenario":
+        try:
+            from app.logic.scenario_evaluator import evaluate_scenario_with_leniency
+            gpt_result = evaluate_scenario_with_leniency(
+                question=question,
+                candidate_answer=submitted,
+                max_score=1.0,
+            )
+            return {
+                "is_correct": bool(gpt_result.get("is_correct", False)),
+                "confidence": float(gpt_result.get("confidence", 0.0) or 0.0),
+                "explanation": str(gpt_result.get("explanation", "Evaluated by AI.")),
+                "score": float(gpt_result.get("normalized_score", 0.0) or 0.0),
+            }
+        except Exception as e:
+            # Fallback if GPT evaluator fails
+            return {
+                "is_correct": False,
+                "confidence": 0.0,
+                "explanation": f"GPT evaluation failed: {str(e)[:100]}",
+                "score": 0.0,
+            }
+    
+    # For code questions: Use LLM if available, else rules/heuristic
     result = {
         "is_correct": False,
         "confidence": 0.0,
         "explanation": "Could not evaluate.",
+        "score": 0.0,
     }
 
     if _USE_RULES and _rules_fn:
@@ -123,6 +149,7 @@ def _grade_freeform(
                     "is_correct": bool(r.get("is_correct", False) or (r.get("points", 0) or 0) > 0),
                     "confidence": float(r.get("confidence", 0.0) or 0.0),
                     "explanation": str(r.get("feedback") or r.get("explanation") or "Evaluated by rules."),
+                    "score": float(r.get("points", 0) or 0) / float(r.get("max_points", 1) or 1) if r.get("max_points") else 0.0,
                 }
         except Exception:
             # fall through to heuristic
@@ -136,10 +163,11 @@ def _grade_freeform(
             "is_correct": word_count >= 6,
             "confidence": 0.5 if word_count >= 6 else 0.2,
             "explanation": "Heuristic check based on answer length and relevance.",
+            "score": 0.5 if word_count >= 6 else 0.2,
         }
 
-    # 2) LLM refinement — trust only when more confident than rules
-    if _USE_LLM and _llm_fn:
+    # 2) LLM refinement for code questions — trust only when more confident than rules
+    if _USE_LLM and _llm_fn and q_type.lower().strip() == "code":
         try:
             l = _llm_fn(
                 question=question,
@@ -155,6 +183,7 @@ def _grade_freeform(
                         "is_correct": bool(l.get("is_correct", False) or (l.get("points", 0) or 0) > 0),
                         "confidence": l_conf,
                         "explanation": str(l.get("explanation", "Evaluated by LLM.")),
+                        "score": float(l.get("points", 0) or 0) / float(l.get("max_points", 1) or 1) if l.get("max_points") else l_conf,
                     }
         except Exception:
             pass
@@ -218,12 +247,14 @@ def evaluate_test(answers: List[Dict[str, Any]], correct_answers: List[Dict[str,
             score += int(is_correct)
             explanation = (
                 "Correct answer matched." if is_correct
-                else f"Expected '{correct_norm}', got '{submitted_norm}'"
+                else f"Incorrect. The correct answer is: {correct_ans_raw or correct_norm}"
             )
             detailed_results.append({
                 "question": question_text,
-                "submitted": submitted_norm,
-                "correct": correct_norm,
+                "submitted": submitted_ans_raw,  # Keep original for display
+                "submitted_normalized": submitted_norm,
+                "correct": correct_ans_raw or correct_norm,  # Show original correct answer
+                "correct_normalized": correct_norm,
                 "is_correct": is_correct,
                 "explanation": explanation,
                 "type": "mcq",

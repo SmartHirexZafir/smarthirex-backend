@@ -280,3 +280,62 @@ async def end_proctoring(req: EndProctorRequest):
         raise HTTPException(status_code=404, detail="Session not found")
 
     return {"status": "ended", "time": now}
+
+
+# ✅ NEW: Get monitoring data for a candidate
+@router.get("/candidate/{candidate_id}")
+async def get_candidate_monitoring(candidate_id: str):
+    """
+    Get all monitoring data (sessions, snapshots, behavior) for a specific candidate.
+    Used by the Test Screening tab in Candidate Profile.
+    """
+    # Get all proctoring sessions for this candidate
+    sessions = []
+    async for session in db.proctor_sessions.find({"candidate_id": candidate_id}).sort("started_at", -1):
+        session_id = str(session.get("_id", ""))
+        
+        # Get snapshots for this session
+        snapshots = []
+        async for snap in db.proctor_snapshots.find({"session_id": session_id}).sort("captured_at", -1):
+            snapshots.append({
+                "id": str(snap.get("_id", "")),
+                "captured_at": snap.get("captured_at"),
+                "image_base64": snap.get("image_base64"),  # Base64 image data
+                "width": snap.get("width"),
+                "height": snap.get("height"),
+            })
+        
+        # Detect suspicious behavior
+        suspicious_actions = []
+        if session.get("last_visibility") is False:
+            suspicious_actions.append("Tab hidden/backgrounded")
+        if session.get("last_focus") is False:
+            suspicious_actions.append("Window lost focus")
+        if session.get("last_camera_status") in {"idle", "degraded", "error"}:
+            suspicious_actions.append(f"Camera issue: {session.get('last_camera_status')}")
+        if session.get("last_page_url") and "test" not in (session.get("last_page_url") or "").lower():
+            suspicious_actions.append("Navigated away from test page")
+        
+        sessions.append({
+            "session_id": session_id,
+            "test_id": session.get("test_id"),
+            "started_at": session.get("started_at"),
+            "ended_at": session.get("ended_at"),
+            "active": session.get("active", False),
+            "last_heartbeat_at": session.get("last_heartbeat_at"),
+            "last_visibility": session.get("last_visibility"),
+            "last_focus": session.get("last_focus"),
+            "last_camera_status": session.get("last_camera_status"),
+            "last_camera_meta": session.get("last_camera_meta"),
+            "last_page_url": session.get("last_page_url"),
+            "snapshots": snapshots,
+            "suspicious_actions": suspicious_actions,
+            "suspicious_count": len(suspicious_actions),
+        })
+    
+    return {
+        "candidate_id": candidate_id,
+        "sessions": sessions,
+        "total_sessions": len(sessions),
+        "total_snapshots": sum(len(s.get("snapshots", [])) for s in sessions),
+    }

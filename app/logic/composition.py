@@ -35,45 +35,15 @@ def composition_for_experience(
     question_count: int,
 ) -> List[Dict[str, str]]:
     """
-    Build a question-type composition sized to `question_count`, using your experience rules:
-
-      - <= 2 years  : MCQs only (easy→medium emphasis)
-      - 3–6 years   : Mix of MCQs + Coding (medium→hard)
-      - 7–9 years   : Balanced set (MCQ + Coding + Scenario)
-      - >= 10 years : Scenario-heavy (advanced)
-
-    The order of items is MCQs first (so the UI can ramp difficulty),
-    then Coding, then Scenario.
-
-    Returns:
-        A list like: [{"type":"mcq"}, {"type":"mcq"}, {"type":"code"}, {"type":"scenario"}]
+    DEPRECATED: This function is kept for backward compatibility only.
+    Experience-based logic has been removed. The sender now decides question composition.
+    
+    This function now returns all MCQs as a fallback for backward compatibility.
+    New code should use explicit composition parameters instead.
     """
     question_count = max(1, int(question_count))
-
-    # Choose weighting by band
-    if years <= 2:
-        weights = {"mcq": 1.0, "code": 0.0, "scenario": 0.0}
-        mins    = {"mcq": 1,   "code": 0,   "scenario": 0}
-    elif 3 <= years <= 6:
-        # MCQ-heavy with some coding; ensure at least one code if count >= 3
-        weights = {"mcq": 0.7, "code": 0.3, "scenario": 0.0}
-        mins    = {"mcq": 1,   "code": 1 if question_count >= 3 else 0, "scenario": 0}
-    elif years >= 10:
-        # Scenario-heavy; still include some MCQs
-        weights = {"mcq": 0.3, "code": 0.0, "scenario": 0.7}
-        mins    = {"mcq": 1,   "code": 0,   "scenario": 1}
-    else:
-        # 7–9 years: balanced
-        weights = {"mcq": 0.5, "code": 0.25, "scenario": 0.25}
-        mins    = {"mcq": 1,   "code": 1 if question_count >= 3 else 0, "scenario": 1 if question_count >= 4 else 0}
-
-    allocation = _distribute(question_count, weights, mins)
-
-    comp: List[Dict[str, str]] = []
-    comp += [{"type": "mcq"}] * allocation["mcq"]
-    comp += [{"type": "code"}] * allocation["code"]
-    comp += [{"type": "scenario"}] * allocation["scenario"]
-    return comp
+    # Return all MCQs as fallback (no experience-based logic)
+    return [{"type": "mcq"}] * question_count
 
 
 # ------------------------------------------------------------

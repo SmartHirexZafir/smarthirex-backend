@@ -221,16 +221,47 @@ async def async_send_email(**kwargs) -> None:
     await loop.run_in_executor(None, lambda: send_email(**kwargs))
 
 
-def render_invite_html(*, candidate_name: str, role: str, test_link: str) -> str:
+def render_invite_html(
+    *,
+    candidate_name: str,
+    role: str,
+    test_link: str,
+    scheduled_datetime: Optional[Any] = None,
+    duration_minutes: int = 60,
+) -> str:
+    scheduled_info = ""
+    if scheduled_datetime:
+        if isinstance(scheduled_datetime, str):
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(scheduled_datetime.replace('Z', '+00:00'))
+                scheduled_info = f"""
+      <p><strong>Scheduled Time:</strong> {dt.strftime('%A, %B %d, %Y at %I:%M %p UTC')}</p>
+      <p style="color:#dc2626;font-weight:500;">⚠️ The test will only be available at the scheduled time. Please wait until then to access it.</p>
+      """
+            except Exception:
+                scheduled_info = f"<p><strong>Scheduled Time:</strong> {scheduled_datetime}</p>"
+        else:
+            scheduled_info = f"""
+      <p><strong>Scheduled Time:</strong> {scheduled_datetime.strftime('%A, %B %d, %Y at %I:%M %p UTC')}</p>
+      <p style="color:#dc2626;font-weight:500;">⚠️ The test will only be available at the scheduled time. Please wait until then to access it.</p>
+      """
+    
+    duration_info = f"<p><strong>Test Duration:</strong> {duration_minutes} minutes</p>"
+    if duration_minutes < 60:
+        duration_info += f'<p style="color:#dc2626;">⚠️ The test will automatically submit after {duration_minutes} minutes.</p>'
+    
     return f"""
     <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; font-size:14px; line-height:1.6;">
       <p>Hi <strong>{candidate_name}</strong>,</p>
-      <p>You’re invited to take a short <strong>{role}</strong> assessment on SmartHirex.</p>
+      <p>You're invited to take a short <strong>{role}</strong> assessment on SmartHirex.</p>
+      {scheduled_info}
+      {duration_info}
       <p>
-        When you’re ready, click the link below to begin:<br/>
-        <a href="{test_link}" style="display:inline-block;padding:10px 16px;text-decoration:none;border-radius:6px;border:1px solid #e5e7eb;">Start your assessment</a>
+        When you're ready, click the link below to begin:<br/>
+        <a href="{test_link}" style="display:inline-block;padding:10px 16px;text-decoration:none;border-radius:6px;border:1px solid #e5e7eb;background:#f9fafb;">Start your assessment</a>
       </p>
-      <p>If the button doesn’t work, copy and paste this URL into your browser:<br/>
+      <p>If the button doesn't work, copy and paste this URL into your browser:<br/>
         <span style="color:#6b7280;">{test_link}</span>
       </p>
       <p style="color:#6b7280;">Best of luck!<br/>SmartHirex Team</p>

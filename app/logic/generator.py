@@ -63,55 +63,43 @@ def _years_from_string(expr: Optional[str]) -> int:
     return _extract_years(expr or "")
 
 
-def _composition_for_experience_internal(years: int, question_count: int) -> List[Dict[str, Any]]:
+def _build_composition_from_counts(
+    mcq_count: int = 0,
+    scenario_count: int = 0,
+    code_count: int = 0,
+) -> List[Dict[str, Any]]:
     """
-    Internal, minimal composition builder (used only if composition.py isn't available).
-    Mirrors the rules you requested:
-
-      - <= 2 years  : MCQs only (easy→medium)
-      - 3–6 years   : Mix of MCQs + Coding (medium→hard)
-      - 7–9 years   : Balanced (MCQ + Code + Scenario)
-      - >= 10 years : Scenario-heavy (advanced)
-
-    MCQs listed first so the UI can ramp difficulty.
+    Build composition from explicit counts provided by the sender.
+    No experience-based logic - the sender decides everything.
     """
-    qn = max(1, int(question_count))
-
-    if years <= 2:
-        mcq = qn
-        code = 0
-        scenario = 0
-    elif 3 <= years <= 6:
-        # ~70% MCQ, ~30% code, at least 1 code if qn >= 3
-        code = max(1 if qn >= 3 else 0, round(qn * 0.3))
-        mcq = qn - code
-        scenario = 0
-    elif years >= 10:
-        # scenario heavy; ensure at least 1 MCQ
-        scenario = max(1, round(qn * 0.7))
-        mcq = max(1, qn - scenario)
-        code = 0
-    else:
-        # 7–9 yrs balanced
-        mcq = max(1, round(qn * 0.5))
-        code = 1 if qn >= 3 else 0
-        scenario = max(1 if qn >= 4 else 0, qn - (mcq + code))
-
     comp: List[Dict[str, Any]] = []
-    comp += [{"type": "mcq"}] * mcq
-    comp += [{"type": "code"}] * code
-    comp += [{"type": "scenario"}] * scenario
-    # Trim/pad (safety)
-    return comp[:qn] if len(comp) >= qn else (comp + [{"type": "mcq"}] * (qn - len(comp)))
+    comp += [{"type": "mcq"}] * max(0, int(mcq_count))
+    comp += [{"type": "code"}] * max(0, int(code_count))
+    comp += [{"type": "scenario"}] * max(0, int(scenario_count))
+    return comp
 
 
-def _composition_for_experience(years: int, question_count: int) -> List[Dict[str, Any]]:
-    if _COMPOSITION_HELPERS:
-        try:
-            return _composition_for_experience_helper(years=years, question_count=question_count)  # type: ignore[misc]
-        except Exception:
-            pass
-    return _composition_for_experience_internal(years, question_count)
+def _build_composition(
+    mcq_count: int = 0,
+    scenario_count: int = 0,
+    code_count: int = 0,
+    question_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build composition from explicit counts (preferred) or fallback to question_count.
+    If composition counts are provided, use them. Otherwise, use question_count for backward compatibility.
+    """
+    if mcq_count > 0 or scenario_count > 0 or code_count > 0:
+        # Use explicit composition
+        return _build_composition_from_counts(mcq_count, scenario_count, code_count)
+    
+    # Fallback: backward compatibility with question_count
+    if question_count and question_count > 0:
+        # Default: all MCQs for backward compatibility
+        return [{"type": "mcq"}] * question_count
+    
+    # Default fallback
+    return [{"type": "mcq"}] * 4
 
 
 def _level_from_years(years: int) -> str:
@@ -119,25 +107,16 @@ def _level_from_years(years: int) -> str:
     return "junior" if years < 3 else "senior"
 
 
-def _difficulty_sequence(n: int, years: int) -> List[str]:
+def _difficulty_sequence(n: int) -> List[str]:
     """
-    Returns n difficulty labels. We bias by experience:
-      - <=2y: mostly easy→medium
-      - 3–6y: medium→hard
-      - >=10y: hard→expert
+    Returns n difficulty labels in a progressive sequence.
+    No experience-based logic - uses a balanced progression.
     """
-    if years <= 2:
-        seq = ["easy", "easy", "medium", "medium", "hard", "hard", "expert"]
-    elif 3 <= years <= 6:
-        seq = ["medium", "medium", "hard", "hard", "expert"]
-    elif years >= 10:
-        seq = ["hard", "hard", "expert", "expert"]
-    else:
-        seq = ["easy", "medium", "hard", "expert"]
+    seq = ["easy", "medium", "hard", "expert"]
     out: List[str] = []
     i = 0
     while len(out) < n:
-        out.append(seq[min(i, len(seq) - 1)])
+        out.append(seq[min(i % len(seq), len(seq) - 1)])
         i += 1
     return out[:n]
 
@@ -146,12 +125,13 @@ def _difficulty_sequence(n: int, years: int) -> List[str]:
 # Prompt & normalization
 # ------------------------
 
-def _build_prompt(candidate: Candidate, comp: List[Dict[str, Any]]) -> str:
+def _build_prompt(candidate: Candidate, comp: List[Dict[str, Any]], previous_questions: Optional[List[str]] = None) -> str:
     """
     Builds a strict JSON generation prompt with explicit structure and counts.
+    Includes uniqueness enforcement to avoid duplicate questions.
     """
-    years = _years_from_string(candidate.experience)
-    level = _level_from_years(years)
+    # No experience-based level determination - use a neutral level
+    level = "appropriate"
 
     counts = {"mcq": 0, "code": 0, "scenario": 0}
     for c in comp:
@@ -169,24 +149,46 @@ def _build_prompt(candidate: Candidate, comp: List[Dict[str, Any]]) -> str:
     role = candidate.job_role or "General"
     skills = ", ".join(candidate.skills or []) or "general skills"
 
+    uniqueness_note = ""
+    if previous_questions:
+        uniqueness_note = f"""
+CRITICAL: The following questions have already been used for this candidate. DO NOT repeat or recycle them:
+{chr(10).join(f"- {q}" for q in previous_questions[:10])}  # Show max 10 to avoid prompt bloat
+
+You MUST generate completely NEW, UNIQUE questions that are different in content, structure, and focus.
+"""
+
     prompt = f"""
-You are an assessment generator. Create a {level}-level test tailored to the candidate.
+You are an assessment generator. Create a {level}-level test STRICTLY tailored to the candidate's job role.
 
 Candidate:
+- Job Role: {role}  ⚠️ THIS IS THE PRIMARY FOCUS - ALL QUESTIONS MUST BE ROLE-SPECIFIC
 - Experience: {candidate.experience or "N/A"}
 - Skills: {skills}
-- Job Role: {role}
+
+CRITICAL ROLE ENFORCEMENT:
+- The candidate's job role is: "{role}"
+- EVERY SINGLE QUESTION must be DIRECTLY related to this specific job role
+- If the role is "Doctor", generate ONLY medical, healthcare, clinical, diagnostic questions
+- If the role is "Software Engineer", generate ONLY programming, software development, technical questions
+- If the role is "Data Scientist", generate ONLY data analysis, machine learning, statistics questions
+- NO generic questions, NO irrelevant topics, NO mismatched content
+- Each question must test knowledge, skills, or scenarios specific to "{role}"
+- If you cannot create role-specific questions, DO NOT generate generic questions - focus on the role
 
 Composition:
 {chr(10).join(spec_lines)}
-
+{uniqueness_note}
 Rules:
-- Focus content on the candidate's role and skills.
+- ⚠️ MANDATORY: ALL questions must be SPECIFICALLY about "{role}" - no exceptions
+- Focus content EXCLUSIVELY on the candidate's job role: {role}
 - MCQs must include exactly 4 realistic option texts (not "A/B/C/D", not placeholders).
 - The correct option text must be in "correct_answer".
 - MCQs should include a "difficulty" field among: "easy", "medium", "hard", "expert";
-  order MCQs from easier to harder based on the candidate's experience.
+  order MCQs from easier to harder.
 - For "code" and "scenario" items, include "correct_answer": null (still include the key) and omit "options".
+- CRITICAL: Generate UNIQUE questions - no duplicates, no recycled content, no repeated questions.
+- CRITICAL: Every question must be role-specific to "{role}" - reject any generic or off-topic questions
 - Do NOT include any commentary outside the JSON.
 - Output must be a valid pure JSON array only.
 
@@ -272,7 +274,6 @@ def _normalize_items(
     items: List[Dict[str, Any]],
     comp: List[Dict[str, Any]],
     candidate: Candidate,
-    years: int,
 ) -> List[Dict[str, Any]]:
     """
     Ensures each item has required keys/types and matches the requested composition order/length.
@@ -314,7 +315,7 @@ def _normalize_items(
 
     # Prepare difficulty defaults for the number of MCQs requested
     mcq_count = sum(1 for c in comp if c.get("type") == "mcq")
-    mcq_difficulties = _difficulty_sequence(mcq_count, years)
+    mcq_difficulties = _difficulty_sequence(mcq_count)
     mcq_seen = 0
 
     role = candidate.job_role or "Role"
@@ -378,7 +379,7 @@ def _normalize_items(
     return normalized
 
 
-def _fallback_questions(candidate: Candidate, comp: List[Dict[str, Any]], years: int) -> List[Dict[str, Any]]:
+def _fallback_questions(candidate: Candidate, comp: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Deterministic fallback set in case the API response isn't valid JSON.
     Creates realistic option texts for MCQs (not A/B/C/D).
@@ -388,7 +389,7 @@ def _fallback_questions(candidate: Candidate, comp: List[Dict[str, Any]], years:
 
     out: List[Dict[str, Any]] = []
     mcq_seen = 0
-    mcq_difficulties = _difficulty_sequence(sum(1 for c in comp if c.get("type") == "mcq"), years)
+    mcq_difficulties = _difficulty_sequence(sum(1 for c in comp if c.get("type") == "mcq"))
 
     for spec in comp:
         t = spec["type"]
@@ -455,25 +456,37 @@ def _call_openai(prompt: str) -> str:
 # Public entry
 # ------------------------
 
-def generate_test(candidate: Candidate, question_count: int = 4) -> List[Dict[str, Any]]:
+def generate_test(
+    candidate: Candidate,
+    mcq_count: int = 0,
+    scenario_count: int = 0,
+    code_count: int = 0,
+    question_count: Optional[int] = None,
+    previous_questions: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """
-    Generates a role/experience-tailored test.
-
-    Enhancements:
-      - Experience-aware composition for ANY question_count.
-      - Ensures real MCQ options (no bare A/B/C/D).
-      - Compatible with both OpenAI SDKs; robust fallback.
+    Generates a test based on explicit composition parameters provided by the sender.
+    No experience-based logic - the sender decides everything.
+    Ensures uniqueness by avoiding previously generated questions.
 
     Args:
         candidate: Candidate model
-        question_count: desired number of questions (default 4 for backward compatibility)
+        mcq_count: Number of MCQ questions (default 0)
+        scenario_count: Number of scenario questions (default 0)
+        code_count: Number of coding questions (default 0)
+        question_count: Fallback total question count for backward compatibility (default None)
+        previous_questions: List of previously generated question texts to avoid duplicates (default None)
 
     Returns:
         List of normalized question dicts compatible with your evaluator/UI.
     """
-    years = _years_from_string((candidate.experience or "").strip())
-    comp = _composition_for_experience(years, question_count)
-    prompt = _build_prompt(candidate, comp)
+    comp = _build_composition(mcq_count, scenario_count, code_count, question_count)
+    
+    if len(comp) == 0:
+        # Fallback: at least one question
+        comp = [{"type": "mcq"}]
+    
+    prompt = _build_prompt(candidate, comp, previous_questions)
 
     try:
         content = _call_openai(prompt)
@@ -483,9 +496,9 @@ def generate_test(candidate: Candidate, question_count: int = 4) -> List[Dict[st
         if not isinstance(data, list):
             raise ValueError("Model did not return a list")
 
-        normalized = _normalize_items(data, comp, candidate, years)
+        normalized = _normalize_items(data, comp, candidate)
         return normalized
 
     except Exception:
         # Robust fallback that still respects the requested composition
-        return _fallback_questions(candidate, comp, years)
+        return _fallback_questions(candidate, comp)

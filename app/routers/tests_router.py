@@ -192,15 +192,36 @@ class CustomTest(BaseModel):
         return v
 
 
+class TestComposition(BaseModel):
+    """Composition parameters for Smart AI Test - sender decides question types"""
+    mcq_count: int = Field(default=0, ge=0, le=50, description="Number of MCQ questions")
+    scenario_count: int = Field(default=0, ge=0, le=50, description="Number of scenario questions")
+    code_count: Optional[int] = Field(default=0, ge=0, le=50, description="Number of coding questions (optional)")
+
+
 class InviteRequest(BaseModel):
     candidate_id: str = Field(..., description="Candidate _id from parsed_resumes")
     subject: Optional[str] = "Your SmartHirex Assessment"
     body_html: Optional[str] = None  # optional custom HTML; {TEST_LINK} will be replaced
-    # allow sender to choose number of questions
+    # allow sender to choose number of questions (for custom tests or backward compatibility)
     question_count: Optional[int] = Field(default=4, ge=1, le=50)
     # NEW: test type & optional custom
     test_type: Optional[TestType] = Field(default="smart")
     custom: Optional[CustomTest] = None
+    # NEW: composition for Smart AI Test (sender decides question types)
+    composition: Optional[TestComposition] = None
+    # ✅ NEW: Scheduled test timing
+    scheduled_date_time: Optional[str] = Field(
+        default=None,
+        description="ISO 8601 datetime string for when the test should become available (UTC). If not provided, test is available immediately."
+    )
+    # ✅ NEW: Test duration in minutes
+    test_duration_minutes: Optional[int] = Field(
+        default=60,
+        ge=5,
+        le=300,
+        description="Test duration in minutes (5-300). Test will auto-submit when duration expires."
+    )
 
 
 class InviteResponse(BaseModel):
@@ -220,6 +241,9 @@ class StartTestResponse(BaseModel):
     test_id: str
     candidate_id: str
     questions: List[Dict[str, Any]]  # raw dicts for full compatibility
+    scheduled_datetime: Optional[str] = None  # ✅ For countdown display
+    expires_at: Optional[str] = None  # ✅ Test expiration time
+    duration_minutes: Optional[int] = None  # ✅ Test duration
 
 
 class SubmitTestRequest(BaseModel):
@@ -250,6 +274,7 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     ENHANCEMENTS:
     - Supports test_type: "smart" (default) or "custom"
     - When custom, persist provided questions & title on the invite
+    - ENFORCES: A candidate can receive only ONE type of test (Smart AI OR Custom, not both)
     """
     candidate = await db.parsed_resumes.find_one({"_id": req.candidate_id})
     if not candidate:
@@ -258,6 +283,30 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     email = _email_from_candidate_doc(candidate)
     if not email:
         raise HTTPException(status_code=400, detail="Candidate email not found")
+
+    # ✅ ENFORCE: Check if candidate already has a test assigned (pending/active)
+    existing_invite = await db.test_invites.find_one({
+        "candidateId": req.candidate_id,
+        "status": {"$in": ["pending", "active"]}
+    })
+    if existing_invite:
+        existing_type = existing_invite.get("type", "smart")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Candidate already has a {existing_type} test assigned. Only one test type (Smart AI or Custom) is allowed per candidate."
+        )
+
+    # ✅ Also check if candidate has a completed test
+    existing_test = await db.tests.find_one({
+        "candidateId": req.candidate_id,
+        "status": {"$in": ["active", "submitted"]}
+    })
+    if existing_test:
+        existing_test_type = existing_test.get("type", "smart")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Candidate already has a {existing_test_type} test. Only one test type (Smart AI or Custom) is allowed per candidate."
+        )
 
     name = _name_from_candidate_doc(candidate)
     role = _role_from_candidate_doc(candidate)
@@ -271,6 +320,8 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
 
     # persist custom payload when applicable
     custom_payload: Optional[Dict[str, Any]] = None
+    composition_payload: Optional[Dict[str, Any]] = None
+    
     if test_type == "custom":
         if not req.custom:
             raise HTTPException(status_code=400, detail="custom test requires 'custom' payload")
@@ -284,6 +335,31 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
                 for q in req.custom.questions
             ],
         }
+    elif test_type == "smart" and req.composition:
+        # Store composition parameters for Smart AI Test
+        composition_payload = {
+            "mcq_count": req.composition.mcq_count,
+            "scenario_count": req.composition.scenario_count,
+            "code_count": req.composition.code_count or 0,
+        }
+        # Update question_count to match composition
+        question_count = composition_payload["mcq_count"] + composition_payload["scenario_count"] + composition_payload["code_count"]
+        if question_count == 0:
+            raise HTTPException(status_code=400, detail="Smart AI Test must have at least one question (MCQ, scenario, or code)")
+
+    # ✅ Parse scheduled_date_time from request
+    scheduled_datetime: Optional[datetime] = None
+    if req.scheduled_date_time:
+        try:
+            scheduled_datetime = datetime.fromisoformat(req.scheduled_date_time.replace('Z', '+00:00'))
+            if scheduled_datetime.tzinfo is None:
+                scheduled_datetime = scheduled_datetime.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            scheduled_datetime = scheduled_datetime.astimezone(datetime.now().astimezone().tzinfo).replace(tzinfo=None)
+        except (ValueError, AttributeError):
+            scheduled_datetime = None
+    
+    # ✅ Get test duration from request
+    test_duration_minutes = req.test_duration_minutes or 60
 
     invite_doc = {
         "_id": uuid.uuid4().hex,
@@ -299,11 +375,25 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
         "questionCount": question_count,
         "type": test_type,  # <-- NEW
         "custom": custom_payload,  # <-- NEW (optional)
+        "composition": composition_payload,  # <-- NEW (optional, for Smart AI Test)
+        # ✅ NEW: Scheduled timing and duration
+        "scheduledDateTime": scheduled_datetime.isoformat() if scheduled_datetime else None,
+        "testDurationMinutes": test_duration_minutes,
     }
     await db.test_invites.insert_one(invite_doc)
 
-    html = req.body_html or render_invite_html(candidate_name=name, role=role, test_link=test_link)
+    # ✅ Enhanced email template with scheduled time and duration
+    html = req.body_html or render_invite_html(
+        candidate_name=name,
+        role=role,
+        test_link=test_link,
+        scheduled_datetime=scheduled_datetime,
+        duration_minutes=test_duration_minutes,
+    )
     html = html.replace("{TEST_LINK}", test_link).replace("{{TEST_LINK}}", test_link)
+    if scheduled_datetime:
+        html = html.replace("{SCHEDULED_TIME}", scheduled_datetime.strftime("%Y-%m-%d %H:%M UTC"))
+    html = html.replace("{DURATION}", str(test_duration_minutes))
 
     send_email(to=email, subject=req.subject or "Your SmartHirex Assessment", html=html)
 
@@ -320,17 +410,90 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
 @router.post("/start", response_model=StartTestResponse)
 async def start_test(req: StartTestRequest):
     """
-    Validate token & expiry, then generate a tailored test by role/experience.
+    Validate token & expiry, then generate a test based on sender's composition choices.
 
     ENHANCEMENTS:
     - If invite.type == "custom", return the custom questions instead of generating.
+    - If invite.type == "smart", use composition parameters (mcq_count, scenario_count, code_count)
+      provided by the sender. No experience-based logic - sender decides everything.
+    - ✅ NEW: Validates scheduled time - test cannot start before scheduled time
+    - ✅ NEW: Validates 30-minute expiration after test starts
     """
     invite = await db.test_invites.find_one({"token": req.token})
     if not invite:
         raise HTTPException(status_code=404, detail="Invite not found")
     if invite.get("status") not in {"pending", "active"}:
         raise HTTPException(status_code=400, detail=f"Invite status is {invite.get('status')}")
-    if datetime.utcnow() > invite["expiresAt"]:
+    
+    now = datetime.utcnow()
+    
+    # ✅ Check scheduled time - test cannot start before scheduled time
+    scheduled_dt_str = invite.get("scheduledDateTime")
+    if scheduled_dt_str:
+        try:
+            from datetime import timezone
+            # Parse the scheduled datetime string - handle 'Z' suffix
+            scheduled_dt_str_clean = scheduled_dt_str.strip()
+            if scheduled_dt_str_clean.endswith('Z'):
+                scheduled_dt_str_clean = scheduled_dt_str_clean[:-1] + '+00:00'
+            
+            scheduled_dt = datetime.fromisoformat(scheduled_dt_str_clean)
+            
+            # Convert to UTC-naive for comparison with datetime.utcnow()
+            if scheduled_dt.tzinfo is not None:
+                # If timezone-aware, convert to UTC then remove timezone info
+                scheduled_dt_utc = scheduled_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            else:
+                # If already naive, assume it's UTC (as stored)
+                scheduled_dt_utc = scheduled_dt
+            
+            # Compare UTC-naive datetimes - only block if current time is BEFORE scheduled time
+            if now < scheduled_dt_utc:
+                # Test not yet available - return scheduled time for countdown
+                scheduled_iso = scheduled_dt_utc.isoformat()
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Test is scheduled for {scheduled_iso}. Please wait until the scheduled time. SCHEDULED_DATETIME:{scheduled_iso}"
+                )
+            # If we reach here, now >= scheduled_dt_utc, so scheduled time has passed - allow test to proceed
+        except (ValueError, AttributeError, TypeError):
+            # Invalid date format, skip validation and allow test to proceed
+            pass
+    
+    # ✅ Check if test has already started - if so, check 30-minute window
+    existing_test = await db.tests.find_one({"token": req.token})
+    if existing_test:
+        started_at = existing_test.get("startedAt")
+        if started_at:
+            if isinstance(started_at, str):
+                started_at = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                if started_at.tzinfo:
+                    started_at = started_at.replace(tzinfo=None)
+            # Allow if started within last 30 minutes
+            if (now - started_at).total_seconds() > 1800:  # 30 minutes
+                raise HTTPException(
+                    status_code=410,
+                    detail="Test link expired. The test must be started within 30 minutes of availability."
+                )
+            # Test already started - return existing test
+            expires_at = existing_test.get("expiresAt")
+            if isinstance(expires_at, str):
+                expires_at_str = expires_at
+            elif expires_at:
+                expires_at_str = expires_at.isoformat()
+            else:
+                expires_at_str = None
+            return StartTestResponse(
+                test_id=existing_test["_id"],
+                candidate_id=existing_test["candidateId"],
+                questions=existing_test.get("questions", []),
+                scheduled_datetime=invite.get("scheduledDateTime"),
+                expires_at=expires_at_str,
+                duration_minutes=existing_test.get("testDurationMinutes"),
+            )
+    
+    # ✅ Check general expiration
+    if now > invite["expiresAt"]:
         raise HTTPException(status_code=410, detail="Invite link expired")
 
     candidate = await db.parsed_resumes.find_one({"_id": invite["candidateId"]})
@@ -339,6 +502,8 @@ async def start_test(req: StartTestRequest):
 
     # Compute questions based on type
     test_type: TestType = invite.get("type", "smart")
+    questions: List[Dict[str, Any]] = []
+    question_count: int = 4  # Initialize with default value
 
     if test_type == "custom":
         custom = invite.get("custom") or {}
@@ -346,6 +511,7 @@ async def start_test(req: StartTestRequest):
         if not isinstance(questions, list) or not questions:
             # Fallback gracefully to generator if custom is empty/malformed
             test_type = "smart"
+            questions = []  # Reset for smart path
 
     if test_type == "smart":
         candidate_model = Candidate(
@@ -358,13 +524,50 @@ async def start_test(req: StartTestRequest):
             resume_text=candidate.get("raw_text", ""),
             job_role=_role_from_candidate_doc(candidate),
         )
-        # honor the sender-selected question count (default 4)
-        question_count = _sanitize_question_count(invite.get("questionCount", 4))
-        questions = generate_test(candidate_model, question_count=question_count)
+        
+        # ✅ Fetch previous questions for this candidate to ensure uniqueness
+        previous_questions: List[str] = []
+        previous_tests = await db.tests.find({"candidateId": candidate["_id"]}).to_list(length=100)
+        for prev_test in previous_tests:
+            prev_questions = prev_test.get("questions", [])
+            if isinstance(prev_questions, list):
+                for q in prev_questions:
+                    q_text = q.get("question", "")
+                    if q_text and q_text not in previous_questions:
+                        previous_questions.append(q_text)
+        
+        # Use composition parameters if provided, otherwise fallback to question_count
+        composition = invite.get("composition")
+        if composition:
+            questions = generate_test(
+                candidate_model,
+                mcq_count=composition.get("mcq_count", 0),
+                scenario_count=composition.get("scenario_count", 0),
+                code_count=composition.get("code_count", 0),
+                previous_questions=previous_questions if previous_questions else None,
+            )
+            # Calculate question_count from composition
+            question_count = composition.get("mcq_count", 0) + composition.get("scenario_count", 0) + composition.get("code_count", 0)
+            # Fallback to actual questions length if calculation fails
+            if question_count == 0:
+                question_count = len(questions) if questions else 4
+        else:
+            # Fallback for backward compatibility
+            question_count = _sanitize_question_count(invite.get("questionCount", 4))
+            questions = generate_test(
+                candidate_model,
+                question_count=question_count,
+                previous_questions=previous_questions if previous_questions else None,
+            )
     else:
         # custom path already set questions; still capture a sensible count
-        question_count = len(questions)
+        question_count = len(questions) if questions else _sanitize_question_count(invite.get("questionCount", 4))
 
+    # ✅ Get test duration from invite
+    test_duration_minutes = invite.get("testDurationMinutes", 60)
+    started_at = datetime.utcnow()
+    expires_at = started_at + timedelta(minutes=test_duration_minutes)
+    
     test_doc = {
         "_id": uuid.uuid4().hex,
         "inviteId": invite["_id"],
@@ -372,9 +575,11 @@ async def start_test(req: StartTestRequest):
         "token": req.token,
         "questions": questions,
         "status": "active",
-        "startedAt": datetime.utcnow(),
+        "startedAt": started_at,
+        "expiresAt": expires_at,  # ✅ Auto-submit time
         "questionCount": question_count,
         "type": test_type,  # <-- NEW
+        "testDurationMinutes": test_duration_minutes,  # ✅ Store duration
     }
     await db.tests.insert_one(test_doc)
 
@@ -385,6 +590,9 @@ async def start_test(req: StartTestRequest):
         test_id=test_doc["_id"],
         candidate_id=candidate["_id"],
         questions=questions,
+        scheduled_datetime=invite.get("scheduledDateTime"),
+        expires_at=expires_at.isoformat(),
+        duration_minutes=test_duration_minutes,
     )
 
 
@@ -447,16 +655,22 @@ async def submit_test(req: SubmitTestRequest):
                 }
             )
 
+        # ✅ Save COMPLETE test data for custom tests
         submission_doc = {
             "_id": uuid.uuid4().hex,
             "testId": test["_id"],
             "candidateId": test["candidateId"],
-            "answers": req.answers,
+            "answers": req.answers,  # Candidate's submitted answers
+            "questions": questions,  # ✅ Complete questions from the custom test
             "score": 0.0,  # not graded yet
-            "details": details,
+            "details": details,  # ✅ Complete details (question, answer, type, etc.)
             "submittedAt": datetime.utcnow(),
             "needs_marking": True,
             "type": "custom",
+            # ✅ Include test metadata
+            "testType": "custom",
+            "custom": test.get("custom"),  # ✅ Include custom test title and metadata
+            "questionCount": len(questions),
         }
         await db.test_submissions.insert_one(submission_doc)
         await db.tests.update_one({"_id": test["_id"]}, {"$set": {"status": "submitted"}})
@@ -479,6 +693,8 @@ async def submit_test(req: SubmitTestRequest):
                 "question": q.get("question", ""),
                 "correct_answer": q.get("correct_answer", ""),
                 "type": q.get("type", "mcq"),
+                # Include options for MCQs so we can show them in results
+                "options": q.get("options", []) if q.get("type", "mcq").lower() == "mcq" else None,
             }
         )
 
@@ -516,69 +732,117 @@ async def submit_test(req: SubmitTestRequest):
         submitted_text = _norm_text(req.answers[i].get("answer", "")) if i < len(req.answers) else ""
 
         if qtype == "mcq":
-            # keep as-is
+            # ✅ For MCQs: Ensure correct answer is shown for wrong answers
+            correct_ans = correct_answers[i].get("correct_answer", "")
+            options = correct_answers[i].get("options")
+            
+            if not det.get("is_correct", False):
+                # Show the correct answer in the explanation
+                if correct_ans:
+                    det["explanation"] = f"Incorrect. The correct answer is: {correct_ans}"
+                    det["correct_answer"] = correct_ans  # Add correct answer field for UI
+            
+            # Include options for all MCQs (for UI display)
+            if options and isinstance(options, list):
+                det["options"] = options
             continue
 
-        # ---------------- Scenario / Free-form auto-grading ----------------
+        # ---------------- Scenario / Free-form auto-grading (GPT-based for scenarios) ---------------- 
         if qtype in {"scenario", "freeform", "free-form", "text"}:
-            auto_points = 0.0
-            auto_max = float(FREEFORM_MAX_POINTS)
-            auto_feedback_parts: List[str] = []
-
-            if USE_RULES and _rules_grader:
+            # ✅ ALWAYS use GPT evaluator for scenario questions (no keyword matching)
+            if qtype == "scenario":
                 try:
-                    r = _rules_grader(
+                    from app.logic.scenario_evaluator import evaluate_scenario_with_leniency
+                    gpt_result = evaluate_scenario_with_leniency(
                         question=question_text,
-                        answer=submitted_text,
-                        max_points=FREEFORM_MAX_POINTS,
+                        candidate_answer=submitted_text,
+                        max_score=float(FREEFORM_MAX_POINTS),
                     )
-                    rp = float(r.get("points", 0.0) or 0.0)
-                    rmax = float(r.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
-                    rfb = _norm_text(r.get("feedback", ""))
-                    auto_points = max(auto_points, rp)
-                    auto_max = max(auto_max, rmax)
-                    if rfb:
-                        auto_feedback_parts.append(f"[rules] {rfb}")
-                    # pass rubric if available
-                    if isinstance(r.get("rubric"), dict):
-                        det["rubric_breakdown"] = r["rubric"]
-                except Exception:
-                    pass
+                    
+                    auto_points = float(gpt_result.get("score", 0.0) or 0.0)
+                    auto_max = float(FREEFORM_MAX_POINTS)
+                    auto_feedback = str(gpt_result.get("explanation", "Evaluated by AI."))
+                    gpt_score_normalized = float(gpt_result.get("normalized_score", 0.0) or 0.0)
+                    
+                    # Update detail with GPT evaluation results
+                    det["auto_points"] = round(auto_points, 2)
+                    det["auto_max"] = int(auto_max)
+                    det["auto_feedback"] = auto_feedback
+                    det["score"] = round(auto_points, 2)
+                    det["max_score"] = int(auto_max)
+                    det["is_correct"] = bool(gpt_result.get("is_correct", False))
+                    det["explanation"] = auto_feedback
+                    det["confidence"] = float(gpt_result.get("confidence", 0.0) or 0.0)
+                    
+                    # Update aggregates
+                    ff_points_sum += max(0.0, min(auto_points, auto_max))
+                    ff_max_sum += auto_max
+                    
+                except Exception as e:
+                    # Fallback if GPT evaluation fails
+                    det["auto_points"] = 0.0
+                    det["auto_max"] = int(FREEFORM_MAX_POINTS)
+                    det["auto_feedback"] = f"Evaluation error: {str(e)[:100]}"
+                    det["score"] = 0.0
+                    det["max_score"] = int(FREEFORM_MAX_POINTS)
+                    det["is_correct"] = False
+                    det["explanation"] = det["auto_feedback"]
+            else:
+                # For other free-form types (not scenario), use existing logic
+                auto_points = 0.0
+                auto_max = float(FREEFORM_MAX_POINTS)
+                auto_feedback_parts: List[str] = []
 
-            if USE_LLM and _llm_grader:
-                try:
-                    l = _llm_grader(
-                        question=question_text,
-                        answer=submitted_text,
-                        max_points=FREEFORM_MAX_POINTS,
-                    )
-                    lp = float(l.get("points", 0.0) or 0.0)
-                    lmax = float(l.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
-                    lfb = _norm_text(l.get("feedback", ""))
-                    if lp > auto_points:
-                        auto_points = lp
-                    auto_max = max(auto_max, lmax)
-                    if lfb:
-                        auto_feedback_parts.append(f"[llm] {lfb}")
-                    if isinstance(l.get("rubric"), dict):
-                        det["rubric_breakdown"] = l["rubric"]
-                except Exception:
-                    pass
+                if USE_RULES and _rules_grader:
+                    try:
+                        r = _rules_grader(
+                            question=question_text,
+                            answer=submitted_text,
+                            max_points=FREEFORM_MAX_POINTS,
+                        )
+                        rp = float(r.get("points", 0.0) or 0.0)
+                        rmax = float(r.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
+                        rfb = _norm_text(r.get("feedback", ""))
+                        auto_points = max(auto_points, rp)
+                        auto_max = max(auto_max, rmax)
+                        if rfb:
+                            auto_feedback_parts.append(f"[rules] {rfb}")
+                        if isinstance(r.get("rubric"), dict):
+                            det["rubric_breakdown"] = r["rubric"]
+                    except Exception:
+                        pass
 
-            # update aggregates if any free-form grading was active
-            if (USE_RULES and _rules_grader) or (USE_LLM and _llm_grader):
-                ff_points_sum += max(0.0, min(auto_points, auto_max))
-                ff_max_sum += auto_max
+                if USE_LLM and _llm_grader:
+                    try:
+                        l = _llm_grader(
+                            question=question_text,
+                            answer=submitted_text,
+                            max_points=FREEFORM_MAX_POINTS,
+                        )
+                        lp = float(l.get("points", 0.0) or 0.0)
+                        lmax = float(l.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
+                        lfb = _norm_text(l.get("feedback", ""))
+                        if lp > auto_points:
+                            auto_points = lp
+                        auto_max = max(auto_max, lmax)
+                        if lfb:
+                            auto_feedback_parts.append(f"[llm] {lfb}")
+                        if isinstance(l.get("rubric"), dict):
+                            det["rubric_breakdown"] = l["rubric"]
+                    except Exception:
+                        pass
 
-            # attach non-breaking extras to detail (+ UI-friendly aliases)
-            det["auto_points"] = round(float(auto_points), 2)
-            det["auto_max"] = int(auto_max)
-            det["auto_feedback"] = " ".join(auto_feedback_parts).strip()
-            det["score"] = det["auto_points"]
-            det["max_score"] = det["auto_max"]
-            # Set pass/fail only if graders were enabled; else leave as-is
-            if ff_max_sum > 0:
-                det["is_correct"] = det.get("is_correct", False) or (float(auto_points) >= (0.6 * auto_max))
+                if (USE_RULES and _rules_grader) or (USE_LLM and _llm_grader):
+                    ff_points_sum += max(0.0, min(auto_points, auto_max))
+                    ff_max_sum += auto_max
+
+                det["auto_points"] = round(float(auto_points), 2)
+                det["auto_max"] = int(auto_max)
+                det["auto_feedback"] = " ".join(auto_feedback_parts).strip()
+                det["score"] = det["auto_points"]
+                det["max_score"] = det["auto_max"]
+                if ff_max_sum > 0:
+                    det["is_correct"] = det.get("is_correct", False) or (float(auto_points) >= (0.6 * auto_max))
 
         # ---------------- Code runner (optional) ----------------
         if qtype == "code" and CODE_RUNNER_ENABLED and _runner_run and submitted_text:
@@ -656,17 +920,21 @@ async def submit_test(req: SubmitTestRequest):
     percent = float((raw_mcq / mcq_total) * 100) if mcq_total > 0 else 0.0
     percent = round(percent, 2)
 
-    # 4) Persist submission
+    # 4) Persist submission with COMPLETE test data
     submission_doc = {
         "_id": uuid.uuid4().hex,
         "testId": test["_id"],
         "candidateId": test["candidateId"],
-        "answers": req.answers,
+        "answers": req.answers,  # Candidate's submitted answers
+        "questions": questions,  # ✅ Complete questions from the test
         "score": percent,  # store MCQ percent (unchanged for UI compatibility)
-        "details": details,
+        "details": details,  # ✅ Complete evaluation details (question, answer, is_correct, explanation, etc.)
         "submittedAt": datetime.utcnow(),
         "needs_marking": False,  # SMART tests are auto-graded
         "type": "smart",
+        # ✅ Include test metadata
+        "testType": "smart",
+        "questionCount": len(questions),
     }
 
     # Include free-form grading summary for reporting (non-breaking)
@@ -710,8 +978,18 @@ async def submit_test(req: SubmitTestRequest):
 # =======================
 
 
+class QuestionGrade(BaseModel):
+    question_index: int = Field(..., ge=0, description="Index of the question (0-based)")
+    score: float = Field(..., ge=0, description="Score for this question (0-100)")
+    feedback: Optional[str] = Field(default=None, description="Optional feedback for this answer")
+
+
 class GradeRequest(BaseModel):
     score: float = Field(..., ge=0, le=100, description="Final percent score to record for this attempt")
+    question_grades: Optional[List[QuestionGrade]] = Field(
+        default=None,
+        description="Optional per-question scores for detailed marking"
+    )
 
 
 class GradeResponse(BaseModel):
@@ -739,20 +1017,37 @@ async def grade_attempt(
         raise HTTPException(status_code=400, detail="Only custom test attempts can be manually graded")
 
     score = float(body.score)
+    
+    # ✅ Update details with per-question grades if provided
+    details = list(attempt.get("details", []))
+    if body.question_grades:
+        for q_grade in body.question_grades:
+            idx = q_grade.question_index
+            if 0 <= idx < len(details):
+                details[idx]["score"] = float(q_grade.score)
+                details[idx]["max_score"] = 100.0  # Normalize to 100
+                details[idx]["is_correct"] = q_grade.score >= 60.0  # Consider >= 60% as correct
+                if q_grade.feedback:
+                    details[idx]["feedback"] = q_grade.feedback
+                    details[idx]["explanation"] = q_grade.feedback
+    
+    # ✅ Update submission with score and detailed grades
+    update_data = {
+        "score": score,
+        "needs_marking": False,
+        "gradedAt": datetime.utcnow(),
+        "details": details,  # ✅ Save updated details with per-question scores
+    }
+    
     await db.test_submissions.update_one(
         {"_id": attempt_id},
-        {
-            "$set": {
-                "score": score,
-                "needs_marking": False,
-                "gradedAt": datetime.utcnow(),
-            }
-        },
+        {"$set": update_data},
     )
 
     candidate_id = attempt.get("candidateId")
     if candidate_id:
         try:
+            # ✅ Update candidate profile with final score
             await db.parsed_resumes.update_one({"_id": candidate_id}, {"$set": {"test_score": score}})
         except Exception:
             pass
