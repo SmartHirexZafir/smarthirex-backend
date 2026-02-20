@@ -11,6 +11,7 @@ from app.routers.upload_router import router as upload_router
 from app.routers import auth_router
 from app.routers import history_router
 from app.routers import candidate_router
+from app.routers import dashboard_router
 from app.utils.mongo import verify_mongo_connection  # ✅ DB check
 
 # NEW: tests router (email invites + test lifecycle)
@@ -89,6 +90,7 @@ app.include_router(upload_router, prefix="/upload")
 app.include_router(auth_router.router, prefix="/auth")
 app.include_router(history_router.router, prefix="/history")
 app.include_router(candidate_router.router, prefix="/candidate")
+app.include_router(dashboard_router.router)
 
 # Register tests router (authoritative for /tests/history/* and test lifecycle)
 app.include_router(tests_router, prefix="/tests")
