@@ -17,7 +17,7 @@ from app.utils.mongo import verify_mongo_connection  # ✅ DB check
 from app.routers.tests_router import router as tests_router, sweep_expired_active_tests
 
 # ✅ NEW: interviews router (schedule interview + listings)
-from app.routers.interviews_router import router as interviews_router
+from app.routers.interviews_router_stable import router as interviews_router
 
 # ✅ NEW: tests history (attempts list + PDF reports)
 

@@ -536,7 +536,7 @@ def _parse_when_to_utc_iso(when: str) -> datetime:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid 'when' datetime: {e}")
 
-@router.post("/interviews/schedule")
+@router.post("/interviews/schedule-legacy")
 async def schedule_interview_unified(
     body: UnifiedScheduleBody,
     current_user: Any = Depends(get_current_user),
