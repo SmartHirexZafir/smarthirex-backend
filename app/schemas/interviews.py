@@ -92,14 +92,14 @@ class MeetingOut(BaseModel):
     id: str = Field(alias="_id")
     candidate_id: str
     email: EmailStr
-    starts_at: datetime  # stored as aware UTC datetime in DB
+    starts_at: str
     timezone: str
     duration_mins: int
     title: str
     notes: Optional[str] = None
     status: str
     meeting_url: Optional[str] = None
-    created_at: datetime
+    created_at: str
 
     model_config = {"populate_by_name": True}
 

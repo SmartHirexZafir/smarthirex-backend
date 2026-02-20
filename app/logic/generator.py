@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import random
+import hashlib
 from typing import List, Dict, Any, Optional
 
 # --- OpenAI: support both old and new SDKs without breaking existing envs ---
@@ -46,8 +48,13 @@ def _extract_years(text: str) -> int:
     """
     if not text:
         return 0
-    m = re.search(r"(\d+)", text)
-    return int(m.group(1)) if m else 0
+    m = re.search(r"(\d+(?:\.\d+)?)", text)
+    if not m:
+        return 0
+    try:
+        return max(0, int(float(m.group(1))))
+    except Exception:
+        return 0
 
 
 def _years_from_string(expr: Optional[str]) -> int:
@@ -70,7 +77,7 @@ def _build_composition_from_counts(
 ) -> List[Dict[str, Any]]:
     """
     Build composition from explicit counts provided by the sender.
-    No experience-based logic - the sender decides everything.
+    Difficulty is handled separately from candidate experience.
     """
     comp: List[Dict[str, Any]] = []
     comp += [{"type": "mcq"}] * max(0, int(mcq_count))
@@ -103,16 +110,29 @@ def _build_composition(
 
 
 def _level_from_years(years: int) -> str:
-    # tone hint for prompt
-    return "junior" if years < 3 else "senior"
+    """
+    Difficulty bands required by product policy.
+    0-2 years -> Beginner, 2-5 -> Intermediate, 5+ -> Advanced.
+    """
+    if years < 2:
+        return "beginner"
+    if years < 5:
+        return "intermediate"
+    return "advanced"
 
 
-def _difficulty_sequence(n: int) -> List[str]:
+def _difficulty_sequence(n: int, level: str = "intermediate") -> List[str]:
     """
-    Returns n difficulty labels in a progressive sequence.
-    No experience-based logic - uses a balanced progression.
+    Returns n difficulty labels in a progressive sequence,
+    adapted to the candidate experience band.
     """
-    seq = ["easy", "medium", "hard", "expert"]
+    level = (level or "intermediate").strip().lower()
+    if level == "beginner":
+        seq = ["easy", "easy", "medium", "medium"]
+    elif level == "advanced":
+        seq = ["hard", "hard", "expert", "expert"]
+    else:
+        seq = ["medium", "medium", "hard", "expert"]
     out: List[str] = []
     i = 0
     while len(out) < n:
@@ -121,17 +141,51 @@ def _difficulty_sequence(n: int) -> List[str]:
     return out[:n]
 
 
+def _seed_to_int(seed: Optional[Any]) -> int:
+    """
+    Convert any seed-like value into a stable integer.
+    """
+    if seed is None:
+        return int.from_bytes(os.urandom(8), "big", signed=False)
+    if isinstance(seed, int):
+        return abs(seed)
+    raw = str(seed).strip()
+    if not raw:
+        return int.from_bytes(os.urandom(8), "big", signed=False)
+    return int(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16], 16)
+
+
+def _prompt_variation(seed_int: int) -> str:
+    """
+    Deterministic prompt variation so repeated attempts get different structures.
+    """
+    variants = [
+        "Prioritize real-world troubleshooting and applied reasoning.",
+        "Prioritize architecture trade-offs and decision-making clarity.",
+        "Prioritize debugging, failure analysis, and recovery strategies.",
+        "Prioritize optimization, performance, and scalability thinking.",
+        "Prioritize practical implementation details and production constraints.",
+        "Prioritize security, reliability, and edge-case handling.",
+    ]
+    return variants[seed_int % len(variants)]
+
+
 # ------------------------
 # Prompt & normalization
 # ------------------------
 
-def _build_prompt(candidate: Candidate, comp: List[Dict[str, Any]], previous_questions: Optional[List[str]] = None) -> str:
+def _build_prompt(
+    candidate: Candidate,
+    comp: List[Dict[str, Any]],
+    previous_questions: Optional[List[str]] = None,
+    variation_hint: Optional[str] = None,
+) -> str:
     """
     Builds a strict JSON generation prompt with explicit structure and counts.
     Includes uniqueness enforcement to avoid duplicate questions.
     """
-    # No experience-based level determination - use a neutral level
-    level = "appropriate"
+    years = _years_from_string(candidate.experience)
+    level = _level_from_years(years)
 
     counts = {"mcq": 0, "code": 0, "scenario": 0}
     for c in comp:
@@ -165,6 +219,7 @@ Candidate:
 - Job Role: {role}  ⚠️ THIS IS THE PRIMARY FOCUS - ALL QUESTIONS MUST BE ROLE-SPECIFIC
 - Experience: {candidate.experience or "N/A"}
 - Skills: {skills}
+- Target Difficulty Band: {level}
 
 CRITICAL ROLE ENFORCEMENT:
 - The candidate's job role is: "{role}"
@@ -182,11 +237,15 @@ Composition:
 Rules:
 - ⚠️ MANDATORY: ALL questions must be SPECIFICALLY about "{role}" - no exceptions
 - Focus content EXCLUSIVELY on the candidate's job role: {role}
+- Variation directive: {variation_hint or "Use diverse angles and avoid prior framing patterns."}
 - MCQs must include exactly 4 realistic option texts (not "A/B/C/D", not placeholders).
 - The correct option text must be in "correct_answer".
 - MCQs should include a "difficulty" field among: "easy", "medium", "hard", "expert";
-  order MCQs from easier to harder.
+  align MCQ difficulty with the target band "{level}" and order from easier to harder.
 - For "code" and "scenario" items, include "correct_answer": null (still include the key) and omit "options".
+- For "scenario" items, include:
+  - "ideal_answer": concise model answer (3-6 bullets or short paragraph),
+  - "rubric": object with 3-5 criteria and weights that sum to 1.0.
 - CRITICAL: Generate UNIQUE questions - no duplicates, no recycled content, no repeated questions.
 - CRITICAL: Every question must be role-specific to "{role}" - reject any generic or off-topic questions
 - Do NOT include any commentary outside the JSON.
@@ -216,7 +275,7 @@ def _strip_code_fences(s: str) -> str:
 
 
 # Simple role-aware option synthesizer to replace "A/B/C/D" if needed
-def _synthesize_options(role: str, skills: List[str], question: str) -> List[str]:
+def _synthesize_options(role: str, skills: List[str], question: str, seed_int: int = 0) -> List[str]:
     role_l = (role or "").lower()
     skill_blob = " ".join((skills or [])).lower()
 
@@ -258,9 +317,10 @@ def _synthesize_options(role: str, skills: List[str], question: str) -> List[str
             "Conducting user interviews and surveys",
         ])
 
-    # pick a group deterministically by question hash to avoid random flicker
-    seed = abs(hash(question)) % len(bank)
-    opts = bank[seed].copy()
+    # Pick deterministically using stable hash + seed.
+    base = hashlib.sha256(f"{question}|{seed_int}".encode("utf-8")).hexdigest()
+    bucket = int(base[:8], 16) % len(bank)
+    opts = bank[bucket].copy()
 
     # Ensure four unique strings
     opts = [str(x) for x in opts][:4]
@@ -274,6 +334,7 @@ def _normalize_items(
     items: List[Dict[str, Any]],
     comp: List[Dict[str, Any]],
     candidate: Candidate,
+    seed_int: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Ensures each item has required keys/types and matches the requested composition order/length.
@@ -282,7 +343,7 @@ def _normalize_items(
     normalized: List[Dict[str, Any]] = []
 
     def _mk_mcq_stub(q: str = "Which option is most appropriate?") -> Dict[str, Any]:
-        opts = _synthesize_options(candidate.job_role or "Role", candidate.skills or [], q)
+        opts = _synthesize_options(candidate.job_role or "Role", candidate.skills or [], q, seed_int=seed_int)
         return {
             "type": "mcq",
             "question": q,
@@ -315,7 +376,8 @@ def _normalize_items(
 
     # Prepare difficulty defaults for the number of MCQs requested
     mcq_count = sum(1 for c in comp if c.get("type") == "mcq")
-    mcq_difficulties = _difficulty_sequence(mcq_count)
+    candidate_level = _level_from_years(_years_from_string(candidate.experience))
+    mcq_difficulties = _difficulty_sequence(mcq_count, candidate_level)
     mcq_seen = 0
 
     role = candidate.job_role or "Role"
@@ -348,7 +410,7 @@ def _normalize_items(
                     return False
 
             if not isinstance(options, list) or len(options) != 4 or looks_like_letters(options):
-                options = _synthesize_options(role, skills, qtext)
+                options = _synthesize_options(role, skills, qtext, seed_int=seed_int)
 
             # correct answer must be a string and belong to options
             correct = candidate_item.get("correct_answer")
@@ -375,27 +437,51 @@ def _normalize_items(
                 "options": [],
                 "correct_answer": None,
             })
+            if item_type == "scenario":
+                ideal = candidate_item.get("ideal_answer")
+                rubric = candidate_item.get("rubric")
+                if isinstance(ideal, str) and ideal.strip():
+                    normalized[-1]["ideal_answer"] = ideal.strip()
+                if isinstance(rubric, dict) and rubric:
+                    normalized[-1]["rubric"] = rubric
 
     return normalized
 
 
-def _fallback_questions(candidate: Candidate, comp: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _fallback_questions(
+    candidate: Candidate,
+    comp: List[Dict[str, Any]],
+    seed_int: int = 0,
+) -> List[Dict[str, Any]]:
     """
     Deterministic fallback set in case the API response isn't valid JSON.
     Creates realistic option texts for MCQs (not A/B/C/D).
     """
     role = candidate.job_role or "the role"
     skills = candidate.skills or []
+    rng = random.Random(seed_int)
 
     out: List[Dict[str, Any]] = []
     mcq_seen = 0
-    mcq_difficulties = _difficulty_sequence(sum(1 for c in comp if c.get("type") == "mcq"))
+    candidate_level = _level_from_years(_years_from_string(candidate.experience))
+    mcq_difficulties = _difficulty_sequence(sum(1 for c in comp if c.get("type") == "mcq"), candidate_level)
+    type_seen = {"mcq": 0, "code": 0, "scenario": 0}
 
     for spec in comp:
         t = spec["type"]
+        type_seen[t] = type_seen.get(t, 0) + 1
         if t == "mcq":
-            qtext = f"In {role}, which of the following is MOST relevant to {', '.join(skills) or 'core skills'}?"
-            opts = _synthesize_options(role, skills, qtext)
+            topic = rng.choice(skills) if skills else "core responsibilities"
+            q_templates = [
+                f"As a {role}, which approach is most effective for {topic}?",
+                f"In {role} work, which option best improves outcomes related to {topic}?",
+                f"Which decision is most appropriate for a {role} handling {topic}?",
+                f"Given limited time and resources, what is the best {role} action for {topic}?",
+                f"Which trade-off is most defensible for a {role} optimizing {topic}?",
+                f"What is the strongest first step for a {role} dealing with {topic} under pressure?",
+            ]
+            qtext = f"{rng.choice(q_templates)} (Q{type_seen[t]})"
+            opts = _synthesize_options(role, skills, qtext, seed_int=seed_int + type_seen[t])
             out.append({
                 "type": "mcq",
                 "question": qtext,
@@ -405,19 +491,126 @@ def _fallback_questions(candidate: Candidate, comp: List[Dict[str, Any]]) -> Lis
             })
             mcq_seen += 1
         elif t == "code":
+            focus = rng.choice(skills) if skills else "core logic"
+            code_templates = [
+                f"Write a function for a {role} workflow that validates and processes {focus}.",
+                f"Implement a robust utility related to {role} tasks focusing on {focus}.",
+                f"Create a production-ready function for {role} use cases involving {focus}.",
+                f"Design an idempotent helper for {role} operations around {focus}.",
+                f"Implement a safe parser + validator for {role} inputs tied to {focus}.",
+                f"Build a fault-tolerant routine for {role} handling of {focus}.",
+            ]
             out.append({
                 "type": "code",
-                "question": f"Write a function related to {role} that demonstrates a key {', '.join(skills) or 'technique'}.",
+                "question": f"{rng.choice(code_templates)} (Q{type_seen[t]})",
                 "options": [],
                 "correct_answer": None,
             })
         else:
+            focus = rng.choice(skills) if skills else "critical responsibilities"
+            scenario_templates = [
+                f"You are a {role}. A high-impact issue appears around {focus}. Describe your response plan.",
+                f"As a {role}, outline how you would handle a complex incident involving {focus}.",
+                f"Describe a step-by-step strategy a {role} should take for a risky situation related to {focus}.",
+                f"You must brief leadership on a {focus} failure. What concrete recovery plan would you execute as a {role}?",
+                f"A cross-team conflict blocks delivery for {focus}. How should a {role} resolve it and reduce recurrence?",
+                f"An urgent customer-impacting problem emerges in {focus}. Explain your first-hour and first-day actions as a {role}.",
+            ]
+            rubric_variants = [
+                [
+                    {"name": "Problem understanding", "weight": 0.25},
+                    {"name": "Actionable plan", "weight": 0.30},
+                    {"name": "Risk management", "weight": 0.25},
+                    {"name": "Communication clarity", "weight": 0.20},
+                ],
+                [
+                    {"name": "Root cause analysis", "weight": 0.30},
+                    {"name": "Execution quality", "weight": 0.30},
+                    {"name": "Stakeholder alignment", "weight": 0.20},
+                    {"name": "Post-incident learning", "weight": 0.20},
+                ],
+                [
+                    {"name": "Prioritization", "weight": 0.25},
+                    {"name": "Technical correctness", "weight": 0.30},
+                    {"name": "Reliability safeguards", "weight": 0.25},
+                    {"name": "Communication and ownership", "weight": 0.20},
+                ],
+            ]
             out.append({
                 "type": "scenario",
-                "question": f"You are a {role}. Describe how you would handle a complex situation involving {', '.join(skills) or 'your core responsibilities'}.",
+                "question": f"{rng.choice(scenario_templates)} (Q{type_seen[t]})",
                 "options": [],
                 "correct_answer": None,
+                "ideal_answer": (
+                    rng.choice([
+                        f"Identify risk drivers for {focus}, prioritize impact, communicate stakeholders, execute mitigation steps, validate outcomes, and document lessons learned.",
+                        f"Clarify scope and severity for {focus}, define immediate containment, assign owners, communicate timeline, and confirm recovery criteria.",
+                        f"Balance short-term stabilization of {focus} with long-term remediation, while documenting decisions, risks, and follow-up controls.",
+                    ])
+                ),
+                "rubric": {
+                    "criteria": rng.choice(rubric_variants)
+                },
             })
+    return out
+
+
+def _question_fingerprint(text: str) -> str:
+    clean = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return hashlib.sha256(clean.encode("utf-8")).hexdigest() if clean else ""
+
+
+def _shuffle_mcq_options(items: List[Dict[str, Any]], rng: Optional[random.Random] = None) -> List[Dict[str, Any]]:
+    rng = rng or random.SystemRandom()
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if str(item.get("type", "")).lower() == "mcq":
+            options = list(item.get("options") or [])
+            if len(options) == 4:
+                rng.shuffle(options)
+                item = dict(item)
+                item["options"] = options
+                # correct_answer stays as text (not index), so shuffling is safe.
+                if item.get("correct_answer") not in options:
+                    item["correct_answer"] = options[0]
+        out.append(item)
+    return out
+
+
+def _ensure_unique_questions(
+    items: List[Dict[str, Any]],
+    comp: List[Dict[str, Any]],
+    candidate: Candidate,
+    previous_questions: Optional[List[str]],
+    seed_int: int = 0,
+) -> List[Dict[str, Any]]:
+    seen = {_question_fingerprint(q) for q in (previous_questions or []) if q}
+    fallback = _fallback_questions(candidate, comp, seed_int=seed_int)
+    out: List[Dict[str, Any]] = []
+
+    for i, spec in enumerate(comp):
+        desired_type = spec.get("type", "mcq")
+        candidate_item = items[i] if i < len(items) and isinstance(items[i], dict) else {}
+        if str(candidate_item.get("type", "")).lower() != desired_type:
+            candidate_item = fallback[i]
+
+        qtext = str(candidate_item.get("question") or "").strip()
+        fp = _question_fingerprint(qtext)
+        if (not fp) or (fp in seen):
+            candidate_item = fallback[i]
+            qtext = str(candidate_item.get("question") or "").strip()
+            fp = _question_fingerprint(qtext)
+            # As a final guard, force uniqueness deterministically.
+            suffix = 2
+            while fp and fp in seen:
+                candidate_item = dict(candidate_item)
+                candidate_item["question"] = f"{qtext} (Variant {suffix})"
+                fp = _question_fingerprint(candidate_item["question"])
+                suffix += 1
+
+        if fp:
+            seen.add(fp)
+        out.append(candidate_item)
     return out
 
 
@@ -463,10 +656,11 @@ def generate_test(
     code_count: int = 0,
     question_count: Optional[int] = None,
     previous_questions: Optional[List[str]] = None,
+    seed: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generates a test based on explicit composition parameters provided by the sender.
-    No experience-based logic - the sender decides everything.
+    Uses candidate experience to tune difficulty band.
     Ensures uniqueness by avoiding previously generated questions.
 
     Args:
@@ -486,7 +680,14 @@ def generate_test(
         # Fallback: at least one question
         comp = [{"type": "mcq"}]
     
-    prompt = _build_prompt(candidate, comp, previous_questions)
+    seed_int = _seed_to_int(seed)
+    prompt = _build_prompt(
+        candidate,
+        comp,
+        previous_questions=previous_questions,
+        variation_hint=_prompt_variation(seed_int),
+    )
+    rng = random.Random(seed_int)
 
     try:
         content = _call_openai(prompt)
@@ -496,9 +697,14 @@ def generate_test(
         if not isinstance(data, list):
             raise ValueError("Model did not return a list")
 
-        normalized = _normalize_items(data, comp, candidate)
-        return normalized
+        normalized = _normalize_items(data, comp, candidate, seed_int=seed_int)
+        unique = _ensure_unique_questions(normalized, comp, candidate, previous_questions, seed_int=seed_int)
+        shuffled = _shuffle_mcq_options(unique, rng=rng)
+        return shuffled
 
     except Exception:
         # Robust fallback that still respects the requested composition
-        return _fallback_questions(candidate, comp)
+        fallback = _fallback_questions(candidate, comp, seed_int=seed_int)
+        unique = _ensure_unique_questions(fallback, comp, candidate, previous_questions, seed_int=seed_int)
+        shuffled = _shuffle_mcq_options(unique, rng=rng)
+        return shuffled

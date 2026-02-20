@@ -4,12 +4,16 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import hashlib
+import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Any, Dict, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Depends
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from app.utils.mongo import db  # AsyncIOMotorDatabase
 from app.utils.emailer import send_email, render_invite_html
@@ -17,6 +21,7 @@ from app.models.auto_test_models import Candidate
 from app.logic.generator import generate_test
 from app.logic.evaluator import evaluate_test  # returns {"total_score": int, "details": [...]}
 from app.routers.auth_router import get_current_user  # ✅ auth dependency
+from app.utils.datetime_serialization import serialize_utc
 
 # --- Optional graders (robust import; fully optional) ------------------------
 USE_RULES = os.getenv("FREEFORM_RULES_GRADING", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -65,11 +70,50 @@ if CODE_RUNNER_ENABLED:
 # ---------------------------------------------------------------------------
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
 TEST_TOKEN_EXPIRY_MINUTES = int(os.getenv("TEST_TOKEN_EXPIRY_MINUTES", "60"))
 
 # ---------- helpers ----------
+
+# ✅ Helper: Safe UTC datetime parsing from strings or objects
+def _parse_utc_datetime(dt_input: Optional[str | datetime]) -> Optional[datetime]:
+    """
+    Parse a datetime string or object to UTC-naive datetime.
+    Handles ISO strings, ISO with Z suffix, and datetime objects.
+    Always returns UTC-naive datetime (or None if invalid).
+    """
+    if not dt_input:
+        return None
+    
+    if isinstance(dt_input, datetime):
+        # Already a datetime object
+        if dt_input.tzinfo is not None:
+            from datetime import timezone
+            # Convert to UTC and remove tzinfo
+            return dt_input.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt_input
+    
+    # String parsing
+    try:
+        from datetime import timezone
+        dt_str = str(dt_input).strip()
+        
+        # Handle 'Z' suffix (UTC)
+        if dt_str.endswith('Z'):
+            dt_str = dt_str[:-1] + '+00:00'
+        
+        # Try parsing
+        dt = datetime.fromisoformat(dt_str)
+        
+        # Convert to UTC-naive if timezone-aware
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        
+        return dt
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _extract_int_years(value: Optional[str]) -> int:
@@ -77,6 +121,55 @@ def _extract_int_years(value: Optional[str]) -> int:
         return 0
     m = re.search(r"(\d+)", str(value))
     return int(m.group(1)) if m else 0
+
+
+def _safe_experience_years(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return max(0.0, float(value))
+        except Exception:
+            return 0.0
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return 0.0
+    try:
+        return max(0.0, float(m.group(1)))
+    except Exception:
+        return 0.0
+
+
+def _experience_years_from_doc(doc: dict) -> float:
+    for key in ("total_experience_years", "years_of_experience", "experience_years", "yoe", "experience"):
+        years = _safe_experience_years(doc.get(key))
+        if years > 0:
+            return years
+    resume = doc.get("resume", {}) if isinstance(doc.get("resume"), dict) else {}
+    for key in ("experience", "totalExperience"):
+        years = _safe_experience_years(resume.get(key))
+        if years > 0:
+            return years
+    return 0.0
+
+
+def _best_recruiter_name(user_doc: Optional[Dict[str, Any]], fallback_email: str = "") -> str:
+    if not isinstance(user_doc, dict):
+        return fallback_email or "Recruiter"
+    for k in ("name", "full_name", "display_name"):
+        v = _norm_text(user_doc.get(k))
+        if v:
+            return v
+    first = _norm_text(user_doc.get("first_name") or user_doc.get("firstName"))
+    last = _norm_text(user_doc.get("last_name") or user_doc.get("lastName"))
+    full = f"{first} {last}".strip()
+    if full:
+        return full
+    email = _norm_text(user_doc.get("email")) or fallback_email
+    return email or "Recruiter"
 
 
 def _role_from_candidate_doc(doc: dict) -> str:
@@ -110,15 +203,8 @@ def _skills_from_candidate_doc(doc: dict) -> List[str]:
 
 
 def _experience_string_from_doc(doc: dict) -> str:
-    exp = (
-        doc.get("experience")
-        or doc.get("total_experience")
-        or doc.get("resume", {}).get("experience")
-        or doc.get("resume", {}).get("totalExperience")
-        or ""
-    )
-    years = _extract_int_years(str(exp))
-    return f"{years} years"
+    years = _experience_years_from_doc(doc)
+    return f"{years:g} years"
 
 
 def _sanitize_question_count(n: Optional[int]) -> int:
@@ -138,6 +224,92 @@ def _norm_text(v: Any) -> str:
         return str(v or "").strip()
     except Exception:
         return ""
+
+
+def _to_utc_iso_z(dt_input: Optional[str | datetime]) -> Optional[str]:
+    dt = _parse_utc_datetime(dt_input)
+    if not dt:
+        return None
+    return serialize_utc(dt)
+
+
+def _one_test_conflict(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"error": "conflict", "message": message, "code": "ONE_TEST_CONFLICT"},
+    )
+
+
+def _question_fingerprint(text: Any) -> str:
+    t = _norm_text(text).lower()
+    t = re.sub(r"\s+", " ", t)
+    if not t:
+        return ""
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+def _question_set_fingerprint(questions: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for q in questions or []:
+        if not isinstance(q, dict):
+            continue
+        parts.append(_question_fingerprint(q.get("question", "")))
+    payload = "|".join([p for p in parts if p])
+    if not payload:
+        return ""
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _profile_signature(role: Any, experience_years: Any) -> str:
+    role_norm = _norm_text(role).lower() or "general"
+    try:
+        years = float(experience_years or 0.0)
+    except Exception:
+        years = 0.0
+    # Bucket to reduce fragile precision mismatches while keeping "same experience" intent.
+    years_bucket = int(round(max(0.0, years)))
+    return f"{role_norm}|{years_bucket}"
+
+
+async def _candidate_has_any_attempt(candidate_id: str) -> bool:
+    """
+    True if candidate already has a submitted test attempt.
+    """
+    existing_submission = await db.test_submissions.find_one({"candidateId": candidate_id}, {"_id": 1})
+    return bool(existing_submission)
+
+
+def _answer_has_content(ans: Dict[str, Any]) -> bool:
+    return bool(_norm_text(ans.get("answer", "")))
+
+
+def _normalize_answers(raw_answers: Any, total_questions: int) -> List[Dict[str, Any]]:
+    safe: List[Dict[str, Any]] = []
+    src = raw_answers if isinstance(raw_answers, list) else []
+    for i in range(max(0, int(total_questions))):
+        item = src[i] if i < len(src) and isinstance(src[i], dict) else {}
+        safe.append(
+            {
+                "answer": _norm_text(item.get("answer", "")),
+                "type": item.get("type"),
+                "language": item.get("language"),
+                "question_id": item.get("question_id"),
+            }
+        )
+    return safe
+
+
+def _merge_answers(
+    preferred: List[Dict[str, Any]],
+    fallback: List[Dict[str, Any]],
+    total_questions: int,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for i in range(max(0, int(total_questions))):
+        a = preferred[i] if i < len(preferred) else {"answer": ""}
+        b = fallback[i] if i < len(fallback) else {"answer": ""}
+        out.append(a if _answer_has_content(a) else b)
+    return out
 
 
 def _code_tests_from_question(q: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -230,7 +402,7 @@ class InviteResponse(BaseModel):
     test_link: str
     email: str
     sent: bool
-    expires_at: datetime
+    expires_at: str
 
 
 class StartTestRequest(BaseModel):
@@ -259,8 +431,27 @@ class SubmitTestRequest(BaseModel):
 class SubmitTestResponse(BaseModel):
     test_id: str
     candidate_id: str
-    score: float  # percent (MCQs only – unchanged; 0.0 for ungraded custom)
+    score: float  # unified percent (0.0 for ungraded custom)
     details: List[Dict[str, Any]]
+
+
+class AutosaveRequest(BaseModel):
+    token: str
+    answers: List[Dict[str, Any]]
+
+
+class AutosaveResponse(BaseModel):
+    ok: bool
+    status: str
+    saved_at: str
+    auto_submitted: bool = False
+
+
+class InviteEligibilityResponse(BaseModel):
+    candidate_id: str
+    can_invite: bool
+    reason: Optional[str] = None
+    source: Optional[str] = None
 
 
 # ---------- routes ----------
@@ -284,6 +475,10 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     if not email:
         raise HTTPException(status_code=400, detail="Candidate email not found")
 
+    # Strict single-attempt policy: if already attempted, block new test creation.
+    if await _candidate_has_any_attempt(req.candidate_id):
+        raise _one_test_conflict("Candidate already has an attempted test. Only one test attempt is allowed (Smart AI or Custom).")
+
     # ✅ ENFORCE: Check if candidate already has a test assigned (pending/active)
     existing_invite = await db.test_invites.find_one({
         "candidateId": req.candidate_id,
@@ -291,9 +486,8 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     })
     if existing_invite:
         existing_type = existing_invite.get("type", "smart")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Candidate already has a {existing_type} test assigned. Only one test type (Smart AI or Custom) is allowed per candidate."
+        raise _one_test_conflict(
+            f"Candidate already has a {existing_type} test assigned. Only one test type (Smart AI or Custom) is allowed per candidate."
         )
 
     # ✅ Also check if candidate has a completed test
@@ -303,13 +497,16 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     })
     if existing_test:
         existing_test_type = existing_test.get("type", "smart")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Candidate already has a {existing_test_type} test. Only one test type (Smart AI or Custom) is allowed per candidate."
+        raise _one_test_conflict(
+            f"Candidate already has a {existing_test_type} test. Only one test type (Smart AI or Custom) is allowed per candidate."
         )
 
     name = _name_from_candidate_doc(candidate)
     role = _role_from_candidate_doc(candidate)
+    owner_user_id = str(getattr(current, "id", "") or "")
+    recruiter_email = str(getattr(current, "email", "") or "")
+    recruiter_doc = await db.users.find_one({"_id": owner_user_id}) if owner_user_id else None
+    recruiter_name = _best_recruiter_name(recruiter_doc, recruiter_email)
 
     token = uuid.uuid4().hex
     expires_at = datetime.utcnow() + timedelta(minutes=TEST_TOKEN_EXPIRY_MINUTES)
@@ -347,16 +544,10 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
         if question_count == 0:
             raise HTTPException(status_code=400, detail="Smart AI Test must have at least one question (MCQ, scenario, or code)")
 
-    # ✅ Parse scheduled_date_time from request
+    # ✅ Parse scheduled_date_time from request using safe UTC parsing
     scheduled_datetime: Optional[datetime] = None
     if req.scheduled_date_time:
-        try:
-            scheduled_datetime = datetime.fromisoformat(req.scheduled_date_time.replace('Z', '+00:00'))
-            if scheduled_datetime.tzinfo is None:
-                scheduled_datetime = scheduled_datetime.replace(tzinfo=datetime.now().astimezone().tzinfo)
-            scheduled_datetime = scheduled_datetime.astimezone(datetime.now().astimezone().tzinfo).replace(tzinfo=None)
-        except (ValueError, AttributeError):
-            scheduled_datetime = None
+        scheduled_datetime = _parse_utc_datetime(req.scheduled_date_time)
     
     # ✅ Get test duration from request
     test_duration_minutes = req.test_duration_minutes or 60
@@ -367,7 +558,7 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
         "email": email,
         "name": name,
         "role": role,
-        "experienceYears": _extract_int_years(_experience_string_from_doc(candidate)),
+        "experienceYears": int(_experience_years_from_doc(candidate)),
         "status": "pending",
         "token": token,
         "expiresAt": expires_at,
@@ -376,11 +567,18 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
         "type": test_type,  # <-- NEW
         "custom": custom_payload,  # <-- NEW (optional)
         "composition": composition_payload,  # <-- NEW (optional, for Smart AI Test)
+        "ownerUserId": owner_user_id or None,
+        "invitedByUserId": owner_user_id or None,
+        "recruiterName": recruiter_name,
+        "recruiterEmail": recruiter_email or None,
         # ✅ NEW: Scheduled timing and duration
-        "scheduledDateTime": scheduled_datetime.isoformat() if scheduled_datetime else None,
+        "scheduledDateTime": _to_utc_iso_z(scheduled_datetime) if scheduled_datetime else None,
         "testDurationMinutes": test_duration_minutes,
     }
-    await db.test_invites.insert_one(invite_doc)
+    try:
+        await db.test_invites.insert_one(invite_doc)
+    except DuplicateKeyError:
+        raise _one_test_conflict("Candidate already has an active or completed test attempt. Cannot create another invite.")
 
     # ✅ Enhanced email template with scheduled time and duration
     html = req.body_html or render_invite_html(
@@ -403,8 +601,46 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
         test_link=test_link,
         email=email,
         sent=True,
-        expires_at=expires_at,
+        expires_at=_to_utc_iso_z(expires_at) or serialize_utc(expires_at),
     )
+
+
+@router.get("/eligibility/{candidate_id}", response_model=InviteEligibilityResponse)
+async def get_invite_eligibility(candidate_id: str, current=Depends(get_current_user)):
+    owner_id = str(getattr(current, "id", None) or "")
+    cand = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id}, {"_id": 1})
+    if not cand:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if await _candidate_has_any_attempt(candidate_id):
+        return InviteEligibilityResponse(
+            candidate_id=candidate_id,
+            can_invite=False,
+            reason="Candidate already has an attempted test.",
+            source="test_submissions",
+        )
+    existing_invite = await db.test_invites.find_one(
+        {"candidateId": candidate_id, "status": {"$in": ["pending", "active"]}},
+        {"_id": 1},
+    )
+    if existing_invite:
+        return InviteEligibilityResponse(
+            candidate_id=candidate_id,
+            can_invite=False,
+            reason="Candidate already has an active invite.",
+            source="test_invites",
+        )
+    existing_test = await db.tests.find_one(
+        {"candidateId": candidate_id, "status": {"$in": ["active", "submitted"]}},
+        {"_id": 1},
+    )
+    if existing_test:
+        return InviteEligibilityResponse(
+            candidate_id=candidate_id,
+            can_invite=False,
+            reason="Candidate already has an active/submitted test.",
+            source="tests",
+        )
+    return InviteEligibilityResponse(candidate_id=candidate_id, can_invite=True, reason=None, source=None)
 
 
 @router.post("/start", response_model=StartTestResponse)
@@ -415,7 +651,7 @@ async def start_test(req: StartTestRequest):
     ENHANCEMENTS:
     - If invite.type == "custom", return the custom questions instead of generating.
     - If invite.type == "smart", use composition parameters (mcq_count, scenario_count, code_count)
-      provided by the sender. No experience-based logic - sender decides everything.
+      provided by the sender. Difficulty is still adapted from candidate experience.
     - ✅ NEW: Validates scheduled time - test cannot start before scheduled time
     - ✅ NEW: Validates 30-minute expiration after test starts
     """
@@ -430,75 +666,79 @@ async def start_test(req: StartTestRequest):
     # ✅ Check scheduled time - test cannot start before scheduled time
     scheduled_dt_str = invite.get("scheduledDateTime")
     if scheduled_dt_str:
-        try:
-            from datetime import timezone
-            # Parse the scheduled datetime string - handle 'Z' suffix
-            scheduled_dt_str_clean = scheduled_dt_str.strip()
-            if scheduled_dt_str_clean.endswith('Z'):
-                scheduled_dt_str_clean = scheduled_dt_str_clean[:-1] + '+00:00'
-            
-            scheduled_dt = datetime.fromisoformat(scheduled_dt_str_clean)
-            
-            # Convert to UTC-naive for comparison with datetime.utcnow()
-            if scheduled_dt.tzinfo is not None:
-                # If timezone-aware, convert to UTC then remove timezone info
-                scheduled_dt_utc = scheduled_dt.astimezone(timezone.utc).replace(tzinfo=None)
-            else:
-                # If already naive, assume it's UTC (as stored)
-                scheduled_dt_utc = scheduled_dt
-            
-            # Compare UTC-naive datetimes - only block if current time is BEFORE scheduled time
-            if now < scheduled_dt_utc:
-                # Test not yet available - return scheduled time for countdown
-                scheduled_iso = scheduled_dt_utc.isoformat()
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Test is scheduled for {scheduled_iso}. Please wait until the scheduled time. SCHEDULED_DATETIME:{scheduled_iso}"
-                )
-            # If we reach here, now >= scheduled_dt_utc, so scheduled time has passed - allow test to proceed
-        except (ValueError, AttributeError, TypeError):
-            # Invalid date format, skip validation and allow test to proceed
-            pass
-    
-    # ✅ Check if test has already started - if so, check 30-minute window
-    existing_test = await db.tests.find_one({"token": req.token})
-    if existing_test:
-        started_at = existing_test.get("startedAt")
-        if started_at:
-            if isinstance(started_at, str):
-                started_at = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
-                if started_at.tzinfo:
-                    started_at = started_at.replace(tzinfo=None)
-            # Allow if started within last 30 minutes
-            if (now - started_at).total_seconds() > 1800:  # 30 minutes
-                raise HTTPException(
-                    status_code=410,
-                    detail="Test link expired. The test must be started within 30 minutes of availability."
-                )
-            # Test already started - return existing test
-            expires_at = existing_test.get("expiresAt")
-            if isinstance(expires_at, str):
-                expires_at_str = expires_at
-            elif expires_at:
-                expires_at_str = expires_at.isoformat()
-            else:
-                expires_at_str = None
-            return StartTestResponse(
-                test_id=existing_test["_id"],
-                candidate_id=existing_test["candidateId"],
-                questions=existing_test.get("questions", []),
-                scheduled_datetime=invite.get("scheduledDateTime"),
-                expires_at=expires_at_str,
-                duration_minutes=existing_test.get("testDurationMinutes"),
+        scheduled_dt = _parse_utc_datetime(scheduled_dt_str)
+        if scheduled_dt and now < scheduled_dt:
+            # Test not yet available - return scheduled time for countdown
+            scheduled_iso = _to_utc_iso_z(scheduled_dt) or serialize_utc(scheduled_dt)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Test is scheduled for {scheduled_iso}. Please wait until the scheduled time. SCHEDULED_DATETIME:{scheduled_iso}"
             )
     
-    # ✅ Check general expiration
-    if now > invite["expiresAt"]:
+    # ✅ Check if test has already started - if so, enforce actual test expiry
+    existing_test = await db.tests.find_one({"token": req.token})
+    if existing_test:
+        expires_dt = _parse_utc_datetime(existing_test.get("expiresAt"))
+        if expires_dt and now > expires_dt:
+            if existing_test.get("status") != "submitted":
+                try:
+                    await submit_test(SubmitTestRequest(token=req.token, answers=[]), forced_by_expiry=True)
+                except Exception as e:
+                    logger.exception("forced-submit from /tests/start failed token=%s err=%s", req.token, e)
+            raise HTTPException(
+                status_code=410,
+                detail=f"Test time expired at {_to_utc_iso_z(expires_dt) or serialize_utc(expires_dt)}. If not already submitted, it will be auto-submitted.",
+            )
+        # Test already started and still active - return existing persisted test
+        expires_at = existing_test.get("expiresAt")
+        if isinstance(expires_at, datetime):
+            expires_at_str = _to_utc_iso_z(expires_at) or serialize_utc(expires_at)
+        elif isinstance(expires_at, str):
+            expires_at_str = _to_utc_iso_z(expires_at) or expires_at
+        else:
+            expires_at_str = None
+        return StartTestResponse(
+            test_id=existing_test["_id"],
+            candidate_id=existing_test["candidateId"],
+            questions=existing_test.get("questions", []),
+            scheduled_datetime=_to_utc_iso_z(invite.get("scheduledDateTime")) or invite.get("scheduledDateTime"),
+            expires_at=expires_at_str,
+            duration_minutes=existing_test.get("testDurationMinutes"),
+        )
+    
+    # ✅ Check general invite expiration
+    invite_expires = invite.get("expiresAt")
+    if isinstance(invite_expires, str):
+        invite_expires = _parse_utc_datetime(invite_expires)
+    
+    if invite_expires and now > invite_expires:
         raise HTTPException(status_code=410, detail="Invite link expired")
 
     candidate = await db.parsed_resumes.find_one({"_id": invite["candidateId"]})
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # Prevent parallel/alternate-token starts for same candidate.
+    other_test = await db.tests.find_one(
+        {
+            "candidateId": invite["candidateId"],
+            "token": {"$ne": req.token},
+            "status": {"$in": ["active", "submitted"]},
+        },
+        {"_id": 1, "type": 1, "status": 1},
+    )
+    if other_test:
+        raise _one_test_conflict("Candidate already has a test in progress or submitted. Multiple tests are not allowed.")
+
+    # API-level bypass guard: block starting a new test if candidate already attempted one.
+    existing_submission = await db.test_submissions.find_one({"candidateId": invite["candidateId"]}, {"_id": 1, "testId": 1})
+    if existing_submission:
+        # Allow idempotent continuation only if submission belongs to this token's test.
+        current_test = await db.tests.find_one({"token": req.token}, {"_id": 1})
+        current_test_id = str((current_test or {}).get("_id") or "")
+        submitted_test_id = str(existing_submission.get("testId") or "")
+        if not current_test_id or submitted_test_id != current_test_id:
+            raise _one_test_conflict("Candidate has already attempted a test. Multiple attempts are not allowed.")
 
     # Compute questions based on type
     test_type: TestType = invite.get("type", "smart")
@@ -514,38 +754,80 @@ async def start_test(req: StartTestRequest):
             questions = []  # Reset for smart path
 
     if test_type == "smart":
+        role_value = _role_from_candidate_doc(candidate)
+        experience_years = _experience_years_from_doc(candidate)
+        profile_sig = _profile_signature(role_value, experience_years)
         candidate_model = Candidate(
             _id=candidate["_id"],
             name=_name_from_candidate_doc(candidate),
             email=_email_from_candidate_doc(candidate) or "",
             phone=None,
             skills=_skills_from_candidate_doc(candidate),
-            experience=_experience_string_from_doc(candidate),
+            experience=f"{experience_years:g} years",
             resume_text=candidate.get("raw_text", ""),
-            job_role=_role_from_candidate_doc(candidate),
+            job_role=role_value,
         )
         
-        # ✅ Fetch previous questions for this candidate to ensure uniqueness
+        # Fetch historical question sets scoped to same role+experience profile.
         previous_questions: List[str] = []
-        previous_tests = await db.tests.find({"candidateId": candidate["_id"]}).to_list(length=100)
+        previous_q_fingerprints: set[str] = set()
+        previous_set_fingerprints: set[str] = set()
+
+        previous_tests = await db.tests.find(
+            {"candidateId": candidate["_id"]},
+            {"questions.question": 1, "questionSetFingerprint": 1, "profileSignature": 1},
+        ).sort("startedAt", -1).limit(40).to_list(length=40)
         for prev_test in previous_tests:
+            if prev_test.get("profileSignature") and prev_test.get("profileSignature") != profile_sig:
+                continue
             prev_questions = prev_test.get("questions", [])
             if isinstance(prev_questions, list):
                 for q in prev_questions:
-                    q_text = q.get("question", "")
-                    if q_text and q_text not in previous_questions:
+                    q_text = _norm_text((q or {}).get("question", ""))
+                    q_fp = _question_fingerprint(q_text)
+                    if q_fp and q_fp not in previous_q_fingerprints:
+                        previous_q_fingerprints.add(q_fp)
                         previous_questions.append(q_text)
+                set_fp = prev_test.get("questionSetFingerprint") or _question_set_fingerprint(prev_questions)
+                if set_fp:
+                    previous_set_fingerprints.add(str(set_fp))
+        previous_subs = await db.test_submissions.find(
+            {"candidateId": candidate["_id"]},
+            {"questions.question": 1, "questionSetFingerprint": 1, "profileSignature": 1},
+        ).sort("submittedAt", -1).limit(40).to_list(length=40)
+        for prev_sub in previous_subs:
+            if prev_sub.get("profileSignature") and prev_sub.get("profileSignature") != profile_sig:
+                continue
+            prev_questions = prev_sub.get("questions", [])
+            if isinstance(prev_questions, list):
+                for q in prev_questions:
+                    q_text = _norm_text((q or {}).get("question", ""))
+                    q_fp = _question_fingerprint(q_text)
+                    if q_fp and q_fp not in previous_q_fingerprints:
+                        previous_q_fingerprints.add(q_fp)
+                        previous_questions.append(q_text)
+                set_fp = prev_sub.get("questionSetFingerprint") or _question_set_fingerprint(prev_questions)
+                if set_fp:
+                    previous_set_fingerprints.add(str(set_fp))
         
         # Use composition parameters if provided, otherwise fallback to question_count
         composition = invite.get("composition")
+        seed_base = uuid.uuid4().hex
+        selected_seed = f"{seed_base}:0"
         if composition:
-            questions = generate_test(
-                candidate_model,
-                mcq_count=composition.get("mcq_count", 0),
-                scenario_count=composition.get("scenario_count", 0),
-                code_count=composition.get("code_count", 0),
-                previous_questions=previous_questions if previous_questions else None,
-            )
+            for retry in range(12):
+                selected_seed = f"{seed_base}:{retry}"
+                questions = generate_test(
+                    candidate_model,
+                    mcq_count=composition.get("mcq_count", 0),
+                    scenario_count=composition.get("scenario_count", 0),
+                    code_count=composition.get("code_count", 0),
+                    previous_questions=previous_questions if previous_questions else None,
+                    seed=selected_seed,
+                )
+                current_set_fp = _question_set_fingerprint(questions)
+                if not current_set_fp or current_set_fp not in previous_set_fingerprints:
+                    break
             # Calculate question_count from composition
             question_count = composition.get("mcq_count", 0) + composition.get("scenario_count", 0) + composition.get("code_count", 0)
             # Fallback to actual questions length if calculation fails
@@ -554,14 +836,29 @@ async def start_test(req: StartTestRequest):
         else:
             # Fallback for backward compatibility
             question_count = _sanitize_question_count(invite.get("questionCount", 4))
-            questions = generate_test(
-                candidate_model,
-                question_count=question_count,
-                previous_questions=previous_questions if previous_questions else None,
-            )
+            for retry in range(12):
+                selected_seed = f"{seed_base}:{retry}"
+                questions = generate_test(
+                    candidate_model,
+                    question_count=question_count,
+                    previous_questions=previous_questions if previous_questions else None,
+                    seed=selected_seed,
+                )
+                current_set_fp = _question_set_fingerprint(questions)
+                if not current_set_fp or current_set_fp not in previous_set_fingerprints:
+                    break
     else:
         # custom path already set questions; still capture a sensible count
         question_count = len(questions) if questions else _sanitize_question_count(invite.get("questionCount", 4))
+        profile_sig = _profile_signature(invite.get("role"), invite.get("experienceYears"))
+        selected_seed = None
+
+    if not isinstance(questions, list) or len(questions) == 0:
+        # Never send an empty test attempt to candidate.
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to generate test questions at this time. Please try again shortly.",
+        )
 
     # ✅ Get test duration from invite
     test_duration_minutes = invite.get("testDurationMinutes", 60)
@@ -579,28 +876,54 @@ async def start_test(req: StartTestRequest):
         "expiresAt": expires_at,  # ✅ Auto-submit time
         "questionCount": question_count,
         "type": test_type,  # <-- NEW
+        "custom": invite.get("custom"),
+        "composition": invite.get("composition"),
+        "profileSignature": profile_sig,
+        "questionSeed": selected_seed,
+        "questionSetFingerprint": _question_set_fingerprint(questions),
         "testDurationMinutes": test_duration_minutes,  # ✅ Store duration
+        "ownerUserId": invite.get("ownerUserId"),
+        "invitedByUserId": invite.get("invitedByUserId"),
+        "recruiterName": invite.get("recruiterName"),
+        "recruiterEmail": invite.get("recruiterEmail"),
     }
-    await db.tests.insert_one(test_doc)
+    # Atomic upsert: prevents duplicate test documents on concurrent /start calls.
+    persisted = await db.tests.find_one_and_update(
+        {"token": req.token},
+        {"$setOnInsert": test_doc},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    if not persisted:
+        raise HTTPException(status_code=500, detail="Failed to initialize test")
 
     if invite.get("status") == "pending":
         await db.test_invites.update_one({"_id": invite["_id"]}, {"$set": {"status": "active"}})
 
     return StartTestResponse(
-        test_id=test_doc["_id"],
-        candidate_id=candidate["_id"],
-        questions=questions,
-        scheduled_datetime=invite.get("scheduledDateTime"),
-        expires_at=expires_at.isoformat(),
-        duration_minutes=test_duration_minutes,
+        test_id=persisted["_id"],
+        candidate_id=persisted["candidateId"],
+        questions=persisted.get("questions", questions),
+        scheduled_datetime=_to_utc_iso_z(invite.get("scheduledDateTime")) or invite.get("scheduledDateTime"),
+        expires_at=(
+            _to_utc_iso_z(persisted.get("expiresAt"))
+            or (
+                serialize_utc(persisted.get("expiresAt"))
+                if isinstance(persisted.get("expiresAt"), datetime)
+                else (_to_utc_iso_z(str(persisted.get("expiresAt") or "")) or str(persisted.get("expiresAt") or (_to_utc_iso_z(expires_at) or serialize_utc(expires_at))))
+            )
+        ),
+        duration_minutes=persisted.get("testDurationMinutes", test_duration_minutes),
     )
 
 
 @router.post("/submit", response_model=SubmitTestResponse)
-async def submit_test(req: SubmitTestRequest):
+async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
     """
     Persist answers, grade with evaluator, return score + details.
     Also updates the candidate's 'test_score' (%) in parsed_resumes.
+
+    ✅ ENFORCES: Test must not be expired (server-side validation using UTC time)
 
     Unchanged behavior for SMART tests:
     - MCQ percent is calculated exactly as before.
@@ -615,7 +938,7 @@ async def submit_test(req: SubmitTestRequest):
     test = await db.tests.find_one({"token": req.token})
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
-
+    
     # Inspect invite for type
     invite = await db.test_invites.find_one({"token": req.token}) or {}
     test_type: TestType = test.get("type") or invite.get("type") or "smart"
@@ -639,18 +962,45 @@ async def submit_test(req: SubmitTestRequest):
                 score=float(existing.get("score", 0.0)),
                 details=existing.get("details", []),
             )
+        # Defensive guard: once status is submitted, never re-finalize.
+        if forced_by_expiry:
+            logger.info("forced-submit skipped: already submitted token=%s testId=%s", req.token, test.get("_id"))
+        raise _one_test_conflict("Test already submitted")
+
+    questions: List[Dict[str, Any]] = test.get("questions", [])
+    total_questions = len(questions)
+    incoming_answers = _normalize_answers(req.answers, total_questions)
+    saved_draft_answers = _normalize_answers(test.get("draftAnswers", []), total_questions)
+
+    # Normal path: merge current payload with server draft to avoid answer loss.
+    effective_answers = _merge_answers(incoming_answers, saved_draft_answers, total_questions)
+
+    # Server-enforced timer validation (anti-devtools/API-time manipulation).
+    now = datetime.utcnow()
+    expires_dt = _parse_utc_datetime(test.get("expiresAt"))
+    effective_forced_by_expiry = bool(forced_by_expiry or (expires_dt and now > expires_dt))
+    if effective_forced_by_expiry:
+        # After deadline, ignore new payload edits and lock to last server-saved draft.
+        # If no draft exists, we fallback to merged answers to avoid empty-loss edge cases.
+        effective_answers = saved_draft_answers if any(_answer_has_content(a) for a in saved_draft_answers) else effective_answers
+        logger.info(
+            "forced-submit executing token=%s testId=%s candidateId=%s draftCount=%s",
+            req.token,
+            test.get("_id"),
+            test.get("candidateId"),
+            len(saved_draft_answers),
+        )
 
     # ---------- CUSTOM TEST PATH (manual marking) ----------
     if test_type == "custom":
         # Build lightweight details pairing question/answer for UI preview
-        questions: List[Dict[str, Any]] = test.get("questions", [])
         details: List[Dict[str, Any]] = []
         for i, q in enumerate(questions):
             details.append(
                 {
                     "question": q.get("question", ""),
                     "type": q.get("type", "text"),
-                    "answer": (req.answers[i].get("answer") if i < len(req.answers) else None),
+                    "answer": (effective_answers[i].get("answer") if i < len(effective_answers) else None),
                     "is_correct": None,
                 }
             )
@@ -660,7 +1010,7 @@ async def submit_test(req: SubmitTestRequest):
             "_id": uuid.uuid4().hex,
             "testId": test["_id"],
             "candidateId": test["candidateId"],
-            "answers": req.answers,  # Candidate's submitted answers
+            "answers": effective_answers,  # Candidate's submitted answers
             "questions": questions,  # ✅ Complete questions from the custom test
             "score": 0.0,  # not graded yet
             "details": details,  # ✅ Complete details (question, answer, type, etc.)
@@ -671,8 +1021,21 @@ async def submit_test(req: SubmitTestRequest):
             "testType": "custom",
             "custom": test.get("custom"),  # ✅ Include custom test title and metadata
             "questionCount": len(questions),
+            "questionSeed": test.get("questionSeed"),
+            "profileSignature": test.get("profileSignature"),
+            "questionSetFingerprint": test.get("questionSetFingerprint") or _question_set_fingerprint(questions),
+            "auto_submitted": effective_forced_by_expiry,
+            "submit_reason": "expired_force_submit" if effective_forced_by_expiry else "manual_submit",
+            "durationMinutes": test.get("testDurationMinutes") or invite.get("testDurationMinutes"),
+            "ownerUserId": test.get("ownerUserId") or invite.get("ownerUserId"),
+            "invitedByUserId": test.get("invitedByUserId") or invite.get("invitedByUserId"),
+            "recruiterName": test.get("recruiterName") or invite.get("recruiterName"),
+            "recruiterEmail": test.get("recruiterEmail") or invite.get("recruiterEmail"),
         }
-        await db.test_submissions.insert_one(submission_doc)
+        try:
+            await db.test_submissions.insert_one(submission_doc)
+        except DuplicateKeyError:
+            raise _one_test_conflict("Duplicate submission detected for this test.")
         await db.tests.update_one({"_id": test["_id"]}, {"$set": {"status": "submitted"}})
         await db.test_invites.update_one({"token": req.token}, {"$set": {"status": "completed"}})
 
@@ -685,7 +1048,6 @@ async def submit_test(req: SubmitTestRequest):
         )
 
     # ---------- SMART TEST PATH (original logic + optional enhancers) ----------
-    questions: List[Dict[str, Any]] = test.get("questions", [])
     correct_answers: List[Dict[str, Any]] = []
     for q in questions:
         correct_answers.append(
@@ -699,7 +1061,7 @@ async def submit_test(req: SubmitTestRequest):
         )
 
     # 1) Base evaluation: MCQs scored; free-form preserved (is_correct=False)
-    base_result = evaluate_test(req.answers, correct_answers)
+    base_result = evaluate_test(effective_answers, correct_answers)
     details: List[Dict[str, Any]] = list(base_result.get("details", []))
 
     # 2) Optional free-form & code grading (rules/LLM + runner), non-disruptive
@@ -708,6 +1070,8 @@ async def submit_test(req: SubmitTestRequest):
 
     code_summary_total = 0
     code_summary_passed = 0
+    total_points_sum = 0.0
+    total_points_max = 0.0
 
     for i, det in enumerate(details):
         # Ensure type is visible to the UI
@@ -729,12 +1093,14 @@ async def submit_test(req: SubmitTestRequest):
 
         # Preserve original fields
         question_text = _norm_text(correct_answers[i].get("question", "")) if i < len(correct_answers) else ""
-        submitted_text = _norm_text(req.answers[i].get("answer", "")) if i < len(req.answers) else ""
+        submitted_text = _norm_text(effective_answers[i].get("answer", "")) if i < len(effective_answers) else ""
 
         if qtype == "mcq":
             # ✅ For MCQs: Ensure correct answer is shown for wrong answers
             correct_ans = correct_answers[i].get("correct_answer", "")
             options = correct_answers[i].get("options")
+            det["score"] = 1.0 if det.get("is_correct", False) else 0.0
+            det["max_score"] = 1.0
             
             if not det.get("is_correct", False):
                 # Show the correct answer in the explanation
@@ -745,6 +1111,8 @@ async def submit_test(req: SubmitTestRequest):
             # Include options for all MCQs (for UI display)
             if options and isinstance(options, list):
                 det["options"] = options
+            total_points_sum += float(det["score"])
+            total_points_max += float(det["max_score"])
             continue
 
         # ---------------- Scenario / Free-form auto-grading (GPT-based for scenarios) ---------------- 
@@ -757,12 +1125,13 @@ async def submit_test(req: SubmitTestRequest):
                         question=question_text,
                         candidate_answer=submitted_text,
                         max_score=float(FREEFORM_MAX_POINTS),
+                        ideal_answer=_norm_text((questions[i] if i < len(questions) else {}).get("ideal_answer", "")),
+                        rubric=(questions[i] if i < len(questions) else {}).get("rubric"),
                     )
                     
                     auto_points = float(gpt_result.get("score", 0.0) or 0.0)
                     auto_max = float(FREEFORM_MAX_POINTS)
                     auto_feedback = str(gpt_result.get("explanation", "Evaluated by AI."))
-                    gpt_score_normalized = float(gpt_result.get("normalized_score", 0.0) or 0.0)
                     
                     # Update detail with GPT evaluation results
                     det["auto_points"] = round(auto_points, 2)
@@ -773,6 +1142,7 @@ async def submit_test(req: SubmitTestRequest):
                     det["is_correct"] = bool(gpt_result.get("is_correct", False))
                     det["explanation"] = auto_feedback
                     det["confidence"] = float(gpt_result.get("confidence", 0.0) or 0.0)
+                    det["ai_reasoning"] = auto_feedback
                     
                     # Update aggregates
                     ff_points_sum += max(0.0, min(auto_points, auto_max))
@@ -848,7 +1218,7 @@ async def submit_test(req: SubmitTestRequest):
         if qtype == "code" and CODE_RUNNER_ENABLED and _runner_run and submitted_text:
             # Figure out language preference: payload > question default > env default
             lang = _norm_text(
-                req.answers[i].get("language") or questions[i].get("language") or "python"
+                effective_answers[i].get("language") or questions[i].get("language") or "python"
             )
 
             # Normalize tests (if present on the question)
@@ -914,20 +1284,38 @@ async def submit_test(req: SubmitTestRequest):
                 )
                 det["is_correct"] = det.get("is_correct", False)
 
-    # 3) MCQ percent (unchanged)
+        if qtype == "code" and "score" not in det:
+            det["score"] = 1.0 if det.get("is_correct", False) else 0.0
+            det["max_score"] = 1.0
+
+        try:
+            det_score = float(det.get("score", 0.0) or 0.0)
+            det_max = float(det.get("max_score", 0.0) or 0.0)
+        except Exception:
+            det_score = 0.0
+            det_max = 0.0
+        if det_max > 0:
+            total_points_sum += max(0.0, min(det_score, det_max))
+            total_points_max += det_max
+
+    # 3) Score model:
+    # - unified_total_percent includes ALL graded question types.
+    # - mcq_percent is kept for backward compatibility/analytics.
     mcq_total = sum(1 for c in correct_answers if str(c.get("type", "mcq")).lower() == "mcq")
     raw_mcq = int(base_result.get("total_score", 0))
-    percent = float((raw_mcq / mcq_total) * 100) if mcq_total > 0 else 0.0
-    percent = round(percent, 2)
+    mcq_percent = round(float((raw_mcq / mcq_total) * 100) if mcq_total > 0 else 0.0, 2)
+    unified_total_percent = round((total_points_sum / total_points_max) * 100.0, 2) if total_points_max > 0 else 0.0
 
     # 4) Persist submission with COMPLETE test data
     submission_doc = {
         "_id": uuid.uuid4().hex,
         "testId": test["_id"],
         "candidateId": test["candidateId"],
-        "answers": req.answers,  # Candidate's submitted answers
+        "answers": effective_answers,  # Candidate's submitted answers
         "questions": questions,  # ✅ Complete questions from the test
-        "score": percent,  # store MCQ percent (unchanged for UI compatibility)
+        "score": unified_total_percent,
+        "total_score": unified_total_percent,
+        "mcq_score": mcq_percent,
         "details": details,  # ✅ Complete evaluation details (question, answer, is_correct, explanation, etc.)
         "submittedAt": datetime.utcnow(),
         "needs_marking": False,  # SMART tests are auto-graded
@@ -935,6 +1323,16 @@ async def submit_test(req: SubmitTestRequest):
         # ✅ Include test metadata
         "testType": "smart",
         "questionCount": len(questions),
+        "questionSeed": test.get("questionSeed"),
+        "profileSignature": test.get("profileSignature"),
+        "questionSetFingerprint": test.get("questionSetFingerprint") or _question_set_fingerprint(questions),
+        "auto_submitted": effective_forced_by_expiry,
+        "submit_reason": "expired_force_submit" if effective_forced_by_expiry else "manual_submit",
+        "durationMinutes": test.get("testDurationMinutes") or invite.get("testDurationMinutes"),
+        "ownerUserId": test.get("ownerUserId") or invite.get("ownerUserId"),
+        "invitedByUserId": test.get("invitedByUserId") or invite.get("invitedByUserId"),
+        "recruiterName": test.get("recruiterName") or invite.get("recruiterName"),
+        "recruiterEmail": test.get("recruiterEmail") or invite.get("recruiterEmail"),
     }
 
     # Include free-form grading summary for reporting (non-breaking)
@@ -952,8 +1350,16 @@ async def submit_test(req: SubmitTestRequest):
             "total": code_summary_total,
             "percent": round((code_summary_passed / code_summary_total) * 100.0, 2),
         }
+    submission_doc["total_marks"] = {
+        "obtained": round(total_points_sum, 2),
+        "max": round(total_points_max, 2),
+        "percent": unified_total_percent,
+    }
 
-    await db.test_submissions.insert_one(submission_doc)
+    try:
+        await db.test_submissions.insert_one(submission_doc)
+    except DuplicateKeyError:
+        raise _one_test_conflict("Duplicate submission detected for this test.")
 
     # Mark test + invite
     await db.tests.update_one({"_id": test["_id"]}, {"$set": {"status": "submitted"}})
@@ -961,16 +1367,89 @@ async def submit_test(req: SubmitTestRequest):
 
     # Update candidate profile with latest test_score (%)
     try:
-        await db.parsed_resumes.update_one({"_id": test["candidateId"]}, {"$set": {"test_score": percent}})
+        await db.parsed_resumes.update_one({"_id": test["candidateId"]}, {"$set": {"test_score": unified_total_percent}})
     except Exception:
         pass  # not fatal
 
     return SubmitTestResponse(
         test_id=test["_id"],
         candidate_id=test["candidateId"],
-        score=percent,
+        score=unified_total_percent,
         details=submission_doc["details"],
     )
+
+
+@router.post("/autosave", response_model=AutosaveResponse)
+async def autosave_test(req: AutosaveRequest):
+    """
+    Save in-progress answers server-side to prevent answer loss.
+    If deadline already passed, immediately force-submit with server-saved answers.
+    """
+    test = await db.tests.find_one({"token": req.token})
+    if not test:
+        raise HTTPException(status_code=404, detail="Test not found")
+
+    if test.get("status") == "submitted":
+        return AutosaveResponse(
+            ok=True,
+            status="submitted",
+            saved_at=_to_utc_iso_z(datetime.utcnow()) or serialize_utc(datetime.utcnow()),
+            auto_submitted=False,
+        )
+
+    questions: List[Dict[str, Any]] = test.get("questions", [])
+    total_questions = len(questions)
+    incoming_answers = _normalize_answers(req.answers, total_questions)
+    existing_draft = _normalize_answers(test.get("draftAnswers", []), total_questions)
+    merged = _merge_answers(incoming_answers, existing_draft, total_questions)
+
+    now = datetime.utcnow()
+    await db.tests.update_one(
+        {"_id": test["_id"], "status": {"$ne": "submitted"}},
+        {"$set": {"draftAnswers": merged, "draftSavedAt": now}},
+    )
+
+    expires_dt = _parse_utc_datetime(test.get("expiresAt"))
+    if expires_dt and now > expires_dt:
+        # Force submit using server-draft answers to lock deadline.
+        await submit_test(SubmitTestRequest(token=req.token, answers=[]), forced_by_expiry=True)
+        return AutosaveResponse(
+            ok=True,
+            status="submitted",
+            saved_at=_to_utc_iso_z(now) or serialize_utc(now),
+            auto_submitted=True,
+        )
+
+    return AutosaveResponse(
+        ok=True,
+        status="active",
+        saved_at=_to_utc_iso_z(now) or serialize_utc(now),
+        auto_submitted=False,
+    )
+
+
+async def sweep_expired_active_tests(limit: int = 100) -> Dict[str, int]:
+    """
+    Server-authoritative expiry sweep.
+    Idempotent because submit path is protected by unique submission constraints.
+    """
+    now = datetime.utcnow()
+    query = {"status": "active", "expiresAt": {"$lte": now}}
+    docs = await db.tests.find(query).limit(max(1, int(limit))).to_list(length=max(1, int(limit)))
+    forced = 0
+    skipped = 0
+    for test in docs:
+        token = str(test.get("token") or "").strip()
+        if not token:
+            skipped += 1
+            continue
+        try:
+            await submit_test(SubmitTestRequest(token=token, answers=[]), forced_by_expiry=True)
+            forced += 1
+        except Exception as e:
+            logger.exception("expired test sweep force-submit failed token=%s err=%s", token, e)
+            skipped += 1
+    return {"checked": len(docs), "forced": forced, "skipped": skipped}
 
 
 # =======================
@@ -1016,43 +1495,74 @@ async def grade_attempt(
     if attempt.get("type") != "custom":
         raise HTTPException(status_code=400, detail="Only custom test attempts can be manually graded")
 
+    if body is None:
+        raise HTTPException(status_code=400, detail="Request body is required")
+
+    owner_id = str(getattr(current, "id", None) or "")
+    candidate_id = attempt.get("candidateId")
+    if candidate_id:
+        owned_candidate = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
+        if not owned_candidate:
+            raise HTTPException(status_code=403, detail="Not authorized to grade this attempt")
+
     score = float(body.score)
     
     # ✅ Update details with per-question grades if provided
     details = list(attempt.get("details", []))
+    computed_scores: List[float] = []
     if body.question_grades:
         for q_grade in body.question_grades:
             idx = q_grade.question_index
             if 0 <= idx < len(details):
-                details[idx]["score"] = float(q_grade.score)
+                q_score = max(0.0, min(100.0, float(q_grade.score)))
+                details[idx]["score"] = q_score
                 details[idx]["max_score"] = 100.0  # Normalize to 100
-                details[idx]["is_correct"] = q_grade.score >= 60.0  # Consider >= 60% as correct
+                details[idx]["is_correct"] = q_score >= 60.0  # Consider >= 60% as correct
                 if q_grade.feedback:
                     details[idx]["feedback"] = q_grade.feedback
                     details[idx]["explanation"] = q_grade.feedback
+                computed_scores.append(q_score)
+    fully_graded = bool(details) and len(computed_scores) == len(details)
+    if computed_scores and fully_graded:
+        score = round(sum(computed_scores) / len(computed_scores), 2)
     
     # ✅ Update submission with score and detailed grades
     update_data = {
-        "score": score,
-        "needs_marking": False,
-        "gradedAt": datetime.utcnow(),
         "details": details,  # ✅ Save updated details with per-question scores
+        "manual_marking": {
+            "question_count": len(computed_scores),
+            "computed_from_questions": bool(computed_scores),
+            "fully_graded": fully_graded,
+        },
     }
+    if fully_graded:
+        update_data["score"] = score
+        update_data["total_score"] = score
+        update_data["needs_marking"] = False
+        update_data["gradedAt"] = datetime.utcnow()
+    else:
+        # Keep the attempt pending until every question has a mark.
+        update_data["needs_marking"] = True
     
     await db.test_submissions.update_one(
         {"_id": attempt_id},
         {"$set": update_data},
     )
 
-    candidate_id = attempt.get("candidateId")
     if candidate_id:
         try:
             # ✅ Update candidate profile with final score
-            await db.parsed_resumes.update_one({"_id": candidate_id}, {"$set": {"test_score": score}})
+            if fully_graded:
+                await db.parsed_resumes.update_one({"_id": candidate_id}, {"$set": {"test_score": score}})
         except Exception:
             pass
 
-    return GradeResponse(ok=True, attempt_id=attempt_id, score=score, candidate_id=candidate_id or "")
+    return GradeResponse(
+        ok=True,
+        attempt_id=attempt_id,
+        score=score if fully_graded else float(attempt.get("score", 0.0) or 0.0),
+        candidate_id=candidate_id or "",
+    )
 
 
 # =========================================
@@ -1069,14 +1579,29 @@ def _attach_candidate_stub(doc: Dict[str, Any], cand: Optional[Dict[str, Any]]) 
             "email": _email_from_candidate_doc(cand),
             "resume": {"email": cand.get("resume", {}).get("email")} if isinstance(cand.get("resume"), dict) else {},
         }
+    needs_marking = bool(doc.get("needs_marking", False))
+    if needs_marking:
+        status = "pending_evaluation"
+    elif bool(doc.get("auto_submitted")):
+        status = "auto_submitted"
+    else:
+        status = "completed"
+
     out = {
         "_id": doc.get("_id"),
         "candidateId": doc.get("candidateId"),
         "type": doc.get("type", "smart"),
+        "testType": doc.get("testType", doc.get("type", "smart")),
         "score": doc.get("score"),
-        "submitted_at": doc.get("submittedAt"),
-        "created_at": doc.get("submittedAt"),  # for sorting in UI
+        "status": status,
+        "submitted_at": _to_utc_iso_z(doc.get("submittedAt")) or doc.get("submittedAt"),
+        "submittedAt": _to_utc_iso_z(doc.get("submittedAt")) or doc.get("submittedAt"),
+        "created_at": _to_utc_iso_z(doc.get("submittedAt")) or doc.get("submittedAt"),  # for sorting in UI
         "candidate": cstub,
+        "needs_marking": needs_marking,
+        "questions": doc.get("questions", []),
+        "answers": doc.get("answers", []),
+        "details": doc.get("details", []),
     }
     return out
 
@@ -1088,18 +1613,31 @@ async def get_history_all(current=Depends(get_current_user)):
     Shape aligns with UI expectations:
       { attempts: [...], needs_marking: [...] }
     """
-    # Pull recent submissions
-    cur = db.test_submissions.find({}).sort("submittedAt", -1).limit(100)
+    owner_id = str(getattr(current, "id", None))
+    # Scope to current owner's candidates to avoid data leakage.
+    owned_ids = await db.parsed_resumes.distinct("_id", {"ownerUserId": owner_id})
+    if not owned_ids:
+        return {"attempts": [], "needs_marking": []}
+
+    # Pull recent submissions for owned candidates only
+    cur = db.test_submissions.find({"candidateId": {"$in": owned_ids}}).sort("submittedAt", -1).limit(100)
     subs = [s async for s in cur]
 
     # Fetch candidates in one pass
     cand_ids = list({s.get("candidateId") for s in subs if s.get("candidateId")})
     cand_map: Dict[str, Dict[str, Any]] = {}
     if cand_ids:
-        async for c in db.parsed_resumes.find({"_id": {"$in": cand_ids}}):
+        async for c in db.parsed_resumes.find({"_id": {"$in": cand_ids}, "ownerUserId": owner_id}):
             cand_map[c["_id"]] = c
 
-    attempts = [_attach_candidate_stub(s, cand_map.get(s.get("candidateId"))) for s in subs]
+    attempts_raw = [_attach_candidate_stub(s, cand_map.get(s.get("candidateId"))) for s in subs]
+    # Defensive de-duplication by attempt id.
+    attempts_map: Dict[str, Dict[str, Any]] = {}
+    for a in attempts_raw:
+        aid = str(a.get("_id") or "")
+        if aid and aid not in attempts_map:
+            attempts_map[aid] = a
+    attempts = list(attempts_map.values())
     needs = [a for a in attempts if any(x for x in subs if x["_id"] == a["_id"] and x.get("needs_marking"))]
 
     return {
@@ -1113,8 +1651,12 @@ async def get_history_for_candidate(candidate_id: str, current=Depends(get_curre
     """
     Return attempts for a specific candidate, newest first.
     """
+    owner_id = str(getattr(current, "id", None))
+    cand = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
+    if not cand:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
     cur = db.test_submissions.find({"candidateId": candidate_id}).sort("submittedAt", -1).limit(50)
     subs = [s async for s in cur]
-    cand = await db.parsed_resumes.find_one({"_id": candidate_id})
     attempts = [_attach_candidate_stub(s, cand) for s in subs]
     return {"attempts": attempts}

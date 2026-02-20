@@ -6,6 +6,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from app.utils.mongo import db
 from app.utils.emailer import send_verification_email
+from app.utils.datetime_serialization import serialize_utc
 from dotenv import load_dotenv
 from types import SimpleNamespace
 from typing import Optional, Dict
@@ -20,7 +21,9 @@ router = APIRouter()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-SECRET_KEY = os.getenv("JWT_SECRET", "smarthirex-secret")
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET must be set in environment")
 ALGORITHM = "HS256"
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:10000").rstrip("/")
@@ -130,10 +133,7 @@ def _app_jwt_for_user(user: Dict) -> str:
 def _iso(dt: Optional[datetime]) -> str:
     if isinstance(dt, datetime):
         try:
-            # ensure timezone-aware in ISO
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.isoformat()
+            return serialize_utc(dt)
         except Exception:
             return ""
     return ""

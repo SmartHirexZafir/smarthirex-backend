@@ -43,6 +43,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Optional, Set
+from app.utils.datetime_serialization import serialize_utc
 
 
 # ---------------------------
@@ -64,9 +65,8 @@ def _json_default(o: Any) -> str:
         # Datetime-like objects
         import datetime as _dt  # local import to avoid hard dep at module import
         if isinstance(o, (_dt.datetime, _dt.date, _dt.time)):
-            # ISO with Z for UTC when tzinfo is UTC
-            if isinstance(o, _dt.datetime) and (o.tzinfo is not None and o.tzinfo.utcoffset(o) == _dt.timedelta(0)):
-                return o.isoformat().replace("+00:00", "Z")
+            if isinstance(o, _dt.datetime):
+                return serialize_utc(o)
             return o.isoformat()
     except Exception:
         pass

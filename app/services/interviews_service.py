@@ -5,6 +5,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+from app.utils.datetime_serialization import serialize_utc, serialize_utc_any
 
 # Schemas (unchanged)
 from app.schemas.interviews import (
@@ -197,7 +198,7 @@ class InterviewsService:
                 meta={
                     "candidate_id": req.candidate_id,
                     "meeting_id": meeting_id,
-                    "starts_at_utc": req.starts_at.isoformat(),
+                    "starts_at_utc": serialize_utc(req.starts_at),
                     "timezone": req.timezone,
                     "duration_mins": req.duration_mins,
                     "token": token,
@@ -234,14 +235,14 @@ class InterviewsService:
                     _id=m["_id"],
                     candidate_id=m.get("candidate_id"),
                     email=m.get("email"),
-                    starts_at=m.get("starts_at"),
+                    starts_at=serialize_utc_any(m.get("starts_at")) or str(m.get("starts_at") or ""),
                     timezone=m.get("timezone"),
                     duration_mins=m.get("duration_mins"),
                     title=m.get("title"),
                     notes=m.get("notes"),
                     status=m.get("status"),
                     meeting_url=m.get("meeting_url"),
-                    created_at=m.get("created_at"),
+                    created_at=serialize_utc_any(m.get("created_at")) or str(m.get("created_at") or ""),
                 )
             )
         return items
@@ -264,13 +265,7 @@ class InterviewsService:
         _id = str(doc.get("_id"))
         starts_at = doc.get("starts_at")
         # Prepare camel + snake friendly shape if router wants it
-        if isinstance(starts_at, datetime):
-            if starts_at.tzinfo is None:
-                starts_iso = starts_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-            else:
-                starts_iso = starts_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        else:
-            starts_iso = None
+        starts_iso = serialize_utc_any(starts_at)
 
         base = {
             "_id": _id,
@@ -292,6 +287,6 @@ class InterviewsService:
             "externalUrl": doc.get("external_url"),
             "notes": doc.get("notes"),
             "created_at": doc.get("created_at"),
-            "now": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "now": serialize_utc(datetime.utcnow()),
         }
         return base

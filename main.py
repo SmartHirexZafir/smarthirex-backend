@@ -14,13 +14,12 @@ from app.routers import candidate_router
 from app.utils.mongo import verify_mongo_connection  # ✅ DB check
 
 # NEW: tests router (email invites + test lifecycle)
-from app.routers.tests_router import router as tests_router
+from app.routers.tests_router import router as tests_router, sweep_expired_active_tests
 
 # ✅ NEW: interviews router (schedule interview + listings)
 from app.routers.interviews_router import router as interviews_router
 
 # ✅ NEW: tests history (attempts list + PDF reports)
-from app.routers.tests_history_router import router as tests_history_router
 
 # Optional: proctoring endpoints (start/heartbeat/snapshot/end)
 try:
@@ -35,7 +34,9 @@ except Exception:
     runner_router = None  # graceful if file not present
 
 import uvicorn
+import asyncio
 import os
+import logging
 import base64
 import json
 import secrets
@@ -50,6 +51,7 @@ app = FastAPI(
     description="AI-powered CV filtering, ML classification, and test automation.",
     version="2.0.0"
 )
+logger = logging.getLogger(__name__)
 
 # ✅ CORS for frontend (dynamic but backward-compatible)
 origins = [
@@ -88,14 +90,11 @@ app.include_router(auth_router.router, prefix="/auth")
 app.include_router(history_router.router, prefix="/history")
 app.include_router(candidate_router.router, prefix="/candidate")
 
-# ✅ Register NEW tests router
+# Register tests router (authoritative for /tests/history/* and test lifecycle)
 app.include_router(tests_router, prefix="/tests")
 
 # ✅ Register NEW interviews router (has internal prefix '/interviews')
 app.include_router(interviews_router)
-
-# ✅ Register NEW tests history router (internal prefix '/tests/history')
-app.include_router(tests_history_router)
 
 # ✅ (Optional) Proctor router
 # NOTE: The router itself has NO internal prefix now; we add it here only once.
@@ -336,7 +335,31 @@ async def save_filtered_results(body: ResultsSaveRequest, request: Request):
 # ✅ Confirm MongoDB connection at startup
 @app.on_event("startup")
 async def startup_db_check():
+    if not os.getenv("JWT_SECRET"):
+        raise RuntimeError("JWT_SECRET must be set before starting API")
     await verify_mongo_connection()
+    app.state.expiry_sweeper_task = asyncio.create_task(_expiry_sweeper_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_background_tasks():
+    task = getattr(app.state, "expiry_sweeper_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _expiry_sweeper_loop():
+    while True:
+        try:
+            await sweep_expired_active_tests(limit=200)
+        except Exception as e:
+            # Keep service alive, but do not fail silently.
+            logger.exception("expiry sweeper iteration failed: %s", e)
+        await asyncio.sleep(30)
 
 
 if __name__ == "__main__":

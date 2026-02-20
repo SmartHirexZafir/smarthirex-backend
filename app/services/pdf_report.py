@@ -18,6 +18,7 @@ from __future__ import annotations
 from io import BytesIO
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from app.utils.datetime_serialization import serialize_utc
 
 
 def _coalesce(*vals):
@@ -32,7 +33,7 @@ def _iso(dt: Any) -> str:
         try:
             return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         except Exception:
-            return dt.isoformat()
+            return serialize_utc(dt)
     return str(dt or "")
 
 

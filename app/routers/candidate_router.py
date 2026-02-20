@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Path, Body, Depends
 from typing import Literal, Optional, Any, Dict, TypedDict, List
 from app.utils.mongo import db
+from app.utils.datetime_serialization import serialize_utc
 
 # ✅ Auth (ownership scoping)
 from app.routers.auth_router import get_current_user
@@ -483,7 +484,7 @@ async def schedule_interview_for_candidate(
             meta={
                 "candidate_id": candidate_id,
                 "meeting_id": meeting_id,
-                "starts_at_utc": body.starts_at.isoformat(),
+                "starts_at_utc": serialize_utc(body.starts_at),
                 "timezone": body.timezone,
                 "duration_mins": body.duration_mins,
                 "token": token,
@@ -617,7 +618,7 @@ async def schedule_interview_unified(
             meta={
                 "candidate_id": body.candidateId,
                 "meeting_id": meeting_id,
-                "starts_at_utc": starts_at.isoformat(),
+                "starts_at_utc": serialize_utc(starts_at),
                 "timezone": tz,
                 "duration_mins": int(body.durationMins or 45),
                 "token": token,

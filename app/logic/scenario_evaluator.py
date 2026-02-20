@@ -83,6 +83,8 @@ def evaluate_scenario_with_leniency(
     question: str,
     candidate_answer: str,
     max_score: float = 1.0,
+    ideal_answer: Optional[str] = None,
+    rubric: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Evaluates a scenario question using GPT with intelligent leniency.
@@ -106,6 +108,20 @@ def evaluate_scenario_with_leniency(
             "confidence": float (0.0 to 1.0)
         }
     """
+    ideal_block = ""
+    if ideal_answer and ideal_answer.strip():
+        ideal_block = f"""
+REFERENCE IDEAL ANSWER:
+{ideal_answer.strip()}
+"""
+
+    rubric_block = ""
+    if isinstance(rubric, dict) and rubric:
+        rubric_block = f"""
+RUBRIC:
+{json.dumps(rubric, ensure_ascii=True)}
+"""
+
     prompt = f"""Evaluate this scenario question answer intelligently and fairly.
 
 QUESTION:
@@ -113,6 +129,8 @@ QUESTION:
 
 CANDIDATE'S ANSWER:
 {candidate_answer.strip()}
+{ideal_block}
+{rubric_block}
 
 EVALUATION CRITERIA:
 1. Conceptual Accuracy: Does the answer demonstrate understanding of the core concepts?
@@ -130,6 +148,7 @@ IMPORTANT:
 - Evaluate based on MEANING and CONCEPTUAL ACCURACY
 - Be flexible with wording - different phrasings of the same concept should score equally
 - Consider the context and intent, not just literal text matching
+- If ideal answer/rubric is provided, align scoring against that quality bar.
 
 Return STRICT JSON ONLY in this exact format:
 {{

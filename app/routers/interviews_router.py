@@ -10,6 +10,7 @@ from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, HTTPException, status, Depends, Query
 from pydantic import BaseModel, Field, EmailStr, field_validator
 from app.routers.auth_router import get_current_user  # ✅ require auth for Meetings endpoints
+from app.utils.datetime_serialization import serialize_utc, serialize_utc_any
 
 # --- Optional/soft imports from your existing utils ---
 try:
@@ -110,14 +111,14 @@ class MeetingOut(BaseModel):
     id: str = Field(alias="_id")
     candidate_id: str
     email: EmailStr
-    starts_at: datetime
+    starts_at: str
     timezone: str
     duration_mins: int
     title: str
     notes: Optional[str] = None
     status: str
     meeting_url: Optional[str] = None
-    created_at: datetime
+    created_at: str
 
     model_config = {"populate_by_name": True}
 
@@ -366,7 +367,7 @@ def schedule_interview(
                 metadata={
                     "candidate_id": req.candidate_id,
                     "meeting_id": meeting_id,
-                    "starts_at_utc": req.starts_at.isoformat(),
+                    "starts_at_utc": serialize_utc(req.starts_at),
                     "timezone": req.timezone,
                     "duration_mins": req.duration_mins,
                     "token": token,
@@ -414,14 +415,14 @@ def list_interviews_for_candidate(
                     "_id": mid,
                     "candidate_id": m.get("candidate_id"),
                     "email": m.get("email"),
-                    "starts_at": m.get("starts_at"),
+                    "starts_at": serialize_utc_any(m.get("starts_at")) or str(m.get("starts_at") or ""),
                     "timezone": m.get("timezone"),
                     "duration_mins": m.get("duration_mins"),
                     "title": m.get("title"),
                     "notes": m.get("notes"),
                     "status": m.get("status"),
                     "meeting_url": m.get("meeting_url"),
-                    "created_at": m.get("created_at"),
+                    "created_at": serialize_utc_any(m.get("created_at")) or str(m.get("created_at") or ""),
                 }
             )
         return items
@@ -443,13 +444,7 @@ def get_meeting_by_token(token: str, db=Depends(get_db)):
 
     # Normalize starts_at (stored as UTC naive) to ISO 'Z'
     starts_at = doc.get("starts_at")
-    if isinstance(starts_at, datetime):
-        if starts_at.tzinfo is None:
-            starts_iso = starts_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-        else:
-            starts_iso = starts_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    else:
-        starts_iso = None
+    starts_iso = serialize_utc_any(starts_at)
 
     # Prefer explicit google_meet_url, fallback to external_url
     external = doc.get("google_meet_url") or doc.get("external_url")
@@ -468,7 +463,7 @@ def get_meeting_by_token(token: str, db=Depends(get_db)):
         "external_url": external,
         "google_meet_url": doc.get("google_meet_url"),
         "notes": doc.get("notes"),
-        "now": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "now": serialize_utc(datetime.utcnow()),
     }
 
     # --- camelCase (kept for backward compatibility) ---

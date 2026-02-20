@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from app.utils.mongo import db  # AsyncIOMotorDatabase (Motor)
 from app.routers.auth_router import get_current_user
+from app.utils.datetime_serialization import serialize_utc_any
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -101,10 +102,10 @@ def _normalize_candidate(doc: Dict[str, Any]) -> CandidateOut:
         "rank": doc.get("rank"),
         # Normalize timestamps to ISO strings if present
         "updatedAt": (
-            doc.get("updatedAt").isoformat() if isinstance(doc.get("updatedAt"), datetime) else doc.get("updatedAt")
+            serialize_utc_any(doc.get("updatedAt")) or doc.get("updatedAt")
         ),
         "createdAt": (
-            doc.get("createdAt").isoformat() if isinstance(doc.get("createdAt"), datetime) else doc.get("createdAt")
+            serialize_utc_any(doc.get("createdAt")) or doc.get("createdAt")
         ),
     }
 

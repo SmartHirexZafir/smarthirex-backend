@@ -50,6 +50,7 @@ async def verify_mongo_connection():
         await ensure_chat_queries_indexes()
         await ensure_search_history_indexes()
         await ensure_token_blacklist_indexes()  # ✅ NEW: token blacklist indexes
+        await ensure_tests_indexes()  # ✅ NEW: tests/invites/submissions safety indexes
     except Exception as e:
         print("❌ MongoDB connection failed:", str(e))
         raise
@@ -312,6 +313,56 @@ async def ensure_token_blacklist_indexes() -> None:
         await db.token_blacklist.create_index([("user_id", 1), ("revoked_at", -1)])
     except Exception as e:
         print("⚠️ Failed to create token_blacklist indexes:", e)
+
+
+async def ensure_tests_indexes() -> None:
+    """
+    Indexes for Smart AI/custom test lifecycle collections.
+    Kept additive and backward-compatible.
+    """
+    await db.test_invites.create_index("token", unique=True)
+    await db.test_invites.create_index([("candidateId", 1), ("status", 1)])
+    await db.test_invites.create_index([("createdAt", -1)])
+    await db.test_invites.create_index([("expiresAt", 1)])
+    await db.test_invites.create_index(
+        [("candidateId", 1)],
+        unique=True,
+        name="uniq_candidate_active_invite",
+        partialFilterExpression={"status": {"$in": ["pending", "active"]}},
+    )
+
+    await db.tests.create_index("token", unique=True)
+    await db.tests.create_index([("candidateId", 1), ("status", 1)])
+    await db.tests.create_index([("startedAt", -1)])
+    await db.tests.create_index([("expiresAt", 1)])
+    await db.tests.create_index(
+        [("candidateId", 1)],
+        unique=True,
+        name="uniq_candidate_open_test",
+        partialFilterExpression={"status": {"$in": ["active", "submitted"]}},
+    )
+
+    await db.test_submissions.create_index("testId", unique=True)
+    await db.test_submissions.create_index([("candidateId", 1), ("submittedAt", -1)])
+    await db.test_submissions.create_index([("needs_marking", 1), ("submittedAt", -1)])
+    try:
+        await db.test_submissions.create_index("candidateId", unique=True, name="uniq_candidate_single_attempt")
+    except Exception as idx_err:
+        dupes = []
+        try:
+            cursor = db.test_submissions.aggregate([
+                {"$group": {"_id": "$candidateId", "count": {"$sum": 1}}},
+                {"$match": {"count": {"$gt": 1}}},
+                {"$limit": 10},
+            ])
+            dupes = [str(d.get("_id")) async for d in cursor]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Failed to enforce unique one-attempt-per-candidate index on test_submissions.candidateId. "
+            f"Resolve duplicate legacy data first. Sample duplicate candidateIds: {dupes}. "
+            f"Original error: {idx_err}"
+        ) from idx_err
 
 
 # -----------------------------------------------------------------------------
