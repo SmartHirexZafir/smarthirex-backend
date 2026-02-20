@@ -6,11 +6,12 @@ import re
 import uuid
 import hashlib
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Any, Dict, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Depends
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -22,6 +23,7 @@ from app.logic.generator import generate_test
 from app.logic.evaluator import evaluate_test  # returns {"total_score": int, "details": [...]}
 from app.routers.auth_router import get_current_user  # ✅ auth dependency
 from app.utils.datetime_serialization import serialize_utc
+from app.services.pdf_report import build_test_result_pdf
 
 # --- Optional graders (robust import; fully optional) ------------------------
 USE_RULES = os.getenv("FREEFORM_RULES_GRADING", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -467,9 +469,15 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
     - When custom, persist provided questions & title on the invite
     - ENFORCES: A candidate can receive only ONE type of test (Smart AI OR Custom, not both)
     """
-    candidate = await db.parsed_resumes.find_one({"_id": req.candidate_id})
+    owner_id = str(getattr(current, "id", "") or "")
+    candidate = await db.parsed_resumes.find_one(
+        {"_id": req.candidate_id, "ownerUserId": owner_id}
+    )
     if not candidate:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to invite this candidate.",
+        )
 
     email = _email_from_candidate_doc(candidate)
     if not email:
@@ -503,13 +511,13 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
 
     name = _name_from_candidate_doc(candidate)
     role = _role_from_candidate_doc(candidate)
-    owner_user_id = str(getattr(current, "id", "") or "")
+    owner_user_id = owner_id
     recruiter_email = str(getattr(current, "email", "") or "")
     recruiter_doc = await db.users.find_one({"_id": owner_user_id}) if owner_user_id else None
     recruiter_name = _best_recruiter_name(recruiter_doc, recruiter_email)
 
     token = uuid.uuid4().hex
-    expires_at = datetime.utcnow() + timedelta(minutes=TEST_TOKEN_EXPIRY_MINUTES)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=TEST_TOKEN_EXPIRY_MINUTES)
     test_link = f"{FRONTEND_BASE_URL.rstrip('/')}/test/{token}"
 
     question_count = _sanitize_question_count(req.question_count)
@@ -562,7 +570,7 @@ async def create_invite(req: InviteRequest, current=Depends(get_current_user)):
         "status": "pending",
         "token": token,
         "expiresAt": expires_at,
-        "createdAt": datetime.utcnow(),
+        "createdAt": datetime.now(timezone.utc),
         "questionCount": question_count,
         "type": test_type,  # <-- NEW
         "custom": custom_payload,  # <-- NEW (optional)
@@ -661,7 +669,7 @@ async def start_test(req: StartTestRequest):
     if invite.get("status") not in {"pending", "active"}:
         raise HTTPException(status_code=400, detail=f"Invite status is {invite.get('status')}")
     
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     
     # ✅ Check scheduled time - test cannot start before scheduled time
     scheduled_dt_str = invite.get("scheduledDateTime")
@@ -862,7 +870,7 @@ async def start_test(req: StartTestRequest):
 
     # ✅ Get test duration from invite
     test_duration_minutes = invite.get("testDurationMinutes", 60)
-    started_at = datetime.utcnow()
+    started_at = datetime.now(timezone.utc)
     expires_at = started_at + timedelta(minutes=test_duration_minutes)
     
     test_doc = {
@@ -976,7 +984,7 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
     effective_answers = _merge_answers(incoming_answers, saved_draft_answers, total_questions)
 
     # Server-enforced timer validation (anti-devtools/API-time manipulation).
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expires_dt = _parse_utc_datetime(test.get("expiresAt"))
     effective_forced_by_expiry = bool(forced_by_expiry or (expires_dt and now > expires_dt))
     if effective_forced_by_expiry:
@@ -1014,7 +1022,7 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
             "questions": questions,  # ✅ Complete questions from the custom test
             "score": 0.0,  # not graded yet
             "details": details,  # ✅ Complete details (question, answer, type, etc.)
-            "submittedAt": datetime.utcnow(),
+            "submittedAt": datetime.now(timezone.utc),
             "needs_marking": True,
             "type": "custom",
             # ✅ Include test metadata
@@ -1317,7 +1325,7 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
         "total_score": unified_total_percent,
         "mcq_score": mcq_percent,
         "details": details,  # ✅ Complete evaluation details (question, answer, is_correct, explanation, etc.)
-        "submittedAt": datetime.utcnow(),
+        "submittedAt": datetime.now(timezone.utc),
         "needs_marking": False,  # SMART tests are auto-graded
         "type": "smart",
         # ✅ Include test metadata
@@ -1390,10 +1398,11 @@ async def autosave_test(req: AutosaveRequest):
         raise HTTPException(status_code=404, detail="Test not found")
 
     if test.get("status") == "submitted":
+        _now = datetime.now(timezone.utc)
         return AutosaveResponse(
             ok=True,
             status="submitted",
-            saved_at=_to_utc_iso_z(datetime.utcnow()) or serialize_utc(datetime.utcnow()),
+            saved_at=_to_utc_iso_z(_now) or serialize_utc(_now),
             auto_submitted=False,
         )
 
@@ -1403,7 +1412,7 @@ async def autosave_test(req: AutosaveRequest):
     existing_draft = _normalize_answers(test.get("draftAnswers", []), total_questions)
     merged = _merge_answers(incoming_answers, existing_draft, total_questions)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await db.tests.update_one(
         {"_id": test["_id"], "status": {"$ne": "submitted"}},
         {"$set": {"draftAnswers": merged, "draftSavedAt": now}},
@@ -1433,7 +1442,7 @@ async def sweep_expired_active_tests(limit: int = 100) -> Dict[str, int]:
     Server-authoritative expiry sweep.
     Idempotent because submit path is protected by unique submission constraints.
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     query = {"status": "active", "expiresAt": {"$lte": now}}
     docs = await db.tests.find(query).limit(max(1, int(limit))).to_list(length=max(1, int(limit)))
     forced = 0
@@ -1446,6 +1455,7 @@ async def sweep_expired_active_tests(limit: int = 100) -> Dict[str, int]:
         try:
             await submit_test(SubmitTestRequest(token=token, answers=[]), forced_by_expiry=True)
             forced += 1
+            logger.info("forced_expiry_submit", extra={"event": "forced_expiry_submit", "token_prefix": token[:8] if len(token) >= 8 else "short"})
         except Exception as e:
             logger.exception("expired test sweep force-submit failed token=%s err=%s", token, e)
             skipped += 1
@@ -1539,7 +1549,7 @@ async def grade_attempt(
         update_data["score"] = score
         update_data["total_score"] = score
         update_data["needs_marking"] = False
-        update_data["gradedAt"] = datetime.utcnow()
+        update_data["gradedAt"] = datetime.now(timezone.utc)
     else:
         # Keep the attempt pending until every question has a mark.
         update_data["needs_marking"] = True
@@ -1644,6 +1654,41 @@ async def get_history_all(current=Depends(get_current_user)):
         "attempts": attempts,
         "needs_marking": needs,
     }
+
+
+@router.get("/history/{candidate_id}/{attempt_id}/report.pdf")
+async def get_attempt_report_pdf(
+    candidate_id: str,
+    attempt_id: str,
+    current=Depends(get_current_user),
+):
+    """
+    Serve PDF report for a test attempt. Requires auth and candidate ownership.
+    Returns 403 if user does not own the candidate; 404 if candidate or attempt not found.
+    """
+    owner_id = str(getattr(current, "id", None) or "")
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    cand = await db.parsed_resumes.find_one({"_id": candidate_id, "ownerUserId": owner_id})
+    if not cand:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    attempt = await db.test_submissions.find_one(
+        {"_id": attempt_id, "candidateId": candidate_id}
+    )
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    pdf_bytes = await build_test_result_pdf(cand, attempt)
+    filename = f"test_report_{attempt_id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+        },
+    )
 
 
 @router.get("/history/{candidate_id}")

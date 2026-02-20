@@ -16,7 +16,7 @@ Usage (from a router):
 from __future__ import annotations
 
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from app.utils.datetime_serialization import serialize_utc
 
@@ -29,12 +29,19 @@ def _coalesce(*vals):
 
 
 def _iso(dt: Any) -> str:
+    """Format datetime as UTC ISO with Z (no local timezone)."""
     if isinstance(dt, datetime):
         try:
-            return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S Z")
         except Exception:
             return serialize_utc(dt)
-    return str(dt or "")
+    if dt is None:
+        return ""
+    return str(dt).strip() or ""
 
 
 def _attempt_summary(candidate: Dict[str, Any], attempt: Dict[str, Any]) -> Dict[str, Any]:

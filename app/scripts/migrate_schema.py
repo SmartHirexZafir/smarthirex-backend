@@ -5,7 +5,7 @@ Process in batches to avoid memory issues
 import asyncio
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -110,8 +110,8 @@ def transform_document(old_doc: dict) -> dict:
         "ownerUserId": old_doc.get("ownerUserId", ""),
         "filename": old_doc.get("filename", ""),
         "contentHash": old_doc.get("content_hash", ""),
-        "uploadedAt": old_doc.get("created_at") or datetime.utcnow(),
-        "updatedAt": datetime.utcnow(),
+        "uploadedAt": old_doc.get("created_at") or datetime.now(timezone.utc),
+        "updatedAt": datetime.now(timezone.utc),
         
         "personal": {
             "name": old_doc.get("name", "No Name"),

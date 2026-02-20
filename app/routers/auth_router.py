@@ -243,7 +243,7 @@ async def signup(data: SignupRequest):
 
     existing = await db.users.find_one({"email": email_lc})
     if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
+        raise HTTPException(status_code=409, detail="User already exists")
 
     hashed = pwd_context.hash(data.password)
     user = data.dict()

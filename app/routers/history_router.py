@@ -554,8 +554,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid history id")
 
-    # Fetch history entry
-    h = await db.search_history.find_one({"_id": oid})
+    owner_id = str(getattr(current, "id", None) or getattr(current, "_id", None) or "")
+    # Fetch history entry — only own entries (do not reveal existence of others')
+    h = await db.search_history.find_one({"_id": oid, "ownerUserId": owner_id})
     if not h:
         raise HTTPException(status_code=404, detail="History entry not found")
 
@@ -639,7 +640,7 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
         pass
 
     # Prepare metadata & timestamps
-    ts_raw = datetime.utcnow()
+    ts_raw = datetime.now(timezone.utc)
     ts_disp = _now_display()
 
     match_meta = {
@@ -650,9 +651,9 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
         "hasClose": any(x.get("match_type") == "close" for x in matches),
     }
 
-    # Update the SAME history document in-place
+    # Update the SAME history document in-place (scoped by owner)
     await db.search_history.update_one(
-        {"_id": oid},
+        {"_id": oid, "ownerUserId": owner_id},
         {
             "$set": {
                 "prompt": prompt,
@@ -716,24 +717,23 @@ async def save_selection(payload: Dict[str, Any], current=Depends(get_current_us
             "duplicate": True,
         }
     
-    # Fetch candidates by IDs
-    candidates: List[Dict[str, Any]] = []
-    for cid_str in selected_ids:
-        try:
-            oid = ObjectId(cid_str) if isinstance(cid_str, str) and len(cid_str) in (12, 24) else cid_str
-            doc = await db.parsed_resumes.find_one({"_id": oid})
-            if doc:
-                # Convert ObjectId to string for JSON serialization
-                doc["_id"] = str(doc["_id"])
-                candidates.append(doc)
-        except Exception:
-            continue
-    
+    # Fetch candidates by IDs — only those owned by current user (no cross-user leakage)
+    id_list = [cid for cid in selected_ids if cid is not None and str(cid).strip()]
+    if not id_list:
+        raise HTTPException(status_code=400, detail="No valid candidate IDs provided")
+    cursor = db.parsed_resumes.find({"ownerUserId": owner_id, "_id": {"$in": id_list}})
+    candidates = [doc async for doc in cursor]
+    for doc in candidates:
+        doc["_id"] = str(doc.get("_id", ""))
+
     if not candidates:
-        raise HTTPException(status_code=404, detail="No valid candidates found for the provided IDs")
-    
+        raise HTTPException(
+            status_code=400,
+            detail="None of the selected candidates belong to you. Only your own candidates can be saved to history.",
+        )
+
     # Prepare metadata
-    ts_raw = datetime.utcnow()
+    ts_raw = datetime.now(timezone.utc)
     ts_disp = _now_display()
     
     match_meta = {

@@ -503,7 +503,7 @@ async def upload_resumes(
             "experience": resume_data["experience"],
             "location": resume_data["location"],
             # For cards: show Role Prediction Confidence as percent (stable)
-            "confidence": resume_data.get("role_confidence_pct", 0.0),
+            "confidence": round(float(resume_data.get("role_confidence") or 0) * 100, 2),
             "email": resume_data["email"],
             "phone": resume_data["phone"],
             "skills": resume_data["skills"],

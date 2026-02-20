@@ -287,6 +287,6 @@ class InterviewsService:
             "externalUrl": doc.get("external_url"),
             "notes": doc.get("notes"),
             "created_at": doc.get("created_at"),
-            "now": serialize_utc(datetime.utcnow()),
+            "now": serialize_utc(datetime.now(timezone.utc)),
         }
         return base

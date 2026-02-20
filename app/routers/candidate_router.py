@@ -198,7 +198,7 @@ async def get_candidate(
 @router.patch("/{candidate_id}/status")
 async def update_candidate_status(
     candidate_id: str = Path(...),
-    status: Literal["shortlisted", "rejected", "new", "interviewed", "accepted"] = Body(..., embed=True),
+    status: Literal["shortlisted", "rejected", "new", "interviewed", "accepted", "approved"] = Body(..., embed=True),
     current_user: Any = Depends(get_current_user),
 ):
     """
@@ -222,16 +222,18 @@ async def update_candidate_status(
     test_score = _num(cand.get("test_score")) or _num(cand.get("testScore")) or 0.0
     total_score = round(((float(match_score) + float(test_score)) / 2.0), 1)
 
+    # Normalize "approved" to "accepted" for storage consistency (dashboard treats both as approved)
+    status_to_set = "accepted" if status == "approved" else status
     result = await db.parsed_resumes.update_one(
         {"_id": candidate_id, "ownerUserId": owner_id},
-        {"$set": {"status": status, "total_score": total_score}},
+        {"$set": {"status": status_to_set, "total_score": total_score}},
     )
 
     # In Mongo, modified_count may be 0 if value was already the same.
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    return {"message": f"Candidate status set to '{status}'.", "total_score": total_score}
+    return {"message": f"Candidate status set to '{status_to_set}'.", "total_score": total_score}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

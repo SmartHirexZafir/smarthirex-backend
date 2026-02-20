@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import traceback
 import uuid
@@ -30,6 +31,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
+logger = logging.getLogger(__name__)
 
 
 class ScheduleInterviewRequest(BaseModel):
@@ -123,7 +125,10 @@ def _b64url_decode(value: str) -> bytes:
 
 
 def _meeting_secret() -> str:
-    return os.getenv("MEETING_ACCESS_SECRET") or os.getenv("JWT_SECRET") or "unsafe-dev-secret"
+    secret = os.getenv("MEETING_ACCESS_SECRET") or os.getenv("JWT_SECRET")
+    if not secret:
+        raise RuntimeError("MEETING_ACCESS_SECRET or JWT_SECRET must be set for meeting access tokens")
+    return secret
 
 
 def _make_candidate_access_token(meeting_token: str, candidate_id: str, email: str, expires_at: datetime) -> str:
@@ -143,16 +148,20 @@ def _verify_candidate_access_token(token: str, meeting_token: str) -> Dict[str, 
         payload_b64, sig_b64 = token.split(".", 1)
         expected = _b64url(hmac.new(_meeting_secret().encode(), payload_b64.encode(), hashlib.sha256).digest())
         if not hmac.compare_digest(expected, sig_b64):
+            logger.warning("meeting_token_verification_failed", extra={"reason": "invalid_signature", "path": "/interviews/access"})
             raise HTTPException(status_code=403, detail="Invalid meeting access token")
         payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
         if payload.get("mt") != meeting_token:
+            logger.warning("meeting_token_verification_failed", extra={"reason": "token_mismatch", "path": "/interviews/access"})
             raise HTTPException(status_code=403, detail="Meeting access token mismatch")
         if int(payload.get("exp") or 0) <= int(datetime.now(timezone.utc).timestamp()):
+            logger.warning("meeting_token_verification_failed", extra={"reason": "expired", "path": "/interviews/access"})
             raise HTTPException(status_code=403, detail="Meeting access token expired")
         return payload
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.warning("meeting_token_verification_failed", extra={"reason": "invalid_token", "path": "/interviews/access", "error": str(e)})
         raise HTTPException(status_code=403, detail="Invalid meeting access token")
 
 

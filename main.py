@@ -12,7 +12,9 @@ from app.routers import auth_router
 from app.routers import history_router
 from app.routers import candidate_router
 from app.routers import dashboard_router
-from app.utils.mongo import verify_mongo_connection  # ✅ DB check
+from app.utils.mongo import verify_mongo_connection, db  # ✅ DB check + blacklist
+from app.middleware.request_logging import RequestLoggingMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
 
 # NEW: tests router (email invites + test lifecycle)
 from app.routers.tests_router import router as tests_router, sweep_expired_active_tests
@@ -38,6 +40,7 @@ import uvicorn
 import asyncio
 import os
 import logging
+import json as _json
 import base64
 import json
 import secrets
@@ -45,6 +48,8 @@ import inspect
 from pathlib import Path
 from typing import Optional, List, Any
 from pydantic import BaseModel
+from datetime import datetime, timezone, timedelta
+import jwt
 
 
 app = FastAPI(
@@ -53,6 +58,39 @@ app = FastAPI(
     version="2.0.0"
 )
 logger = logging.getLogger(__name__)
+
+
+def _configure_structured_logging():
+    """When LOG_JSON=1, use JSON-formatted log lines for observability."""
+    if os.getenv("LOG_JSON", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        class JsonFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                obj = {
+                    "ts": self.formatTime(record, self.datefmt or "%Y-%m-%dT%H:%M:%S"),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                }
+                if hasattr(record, "__dict__"):
+                    for k, v in record.__dict__.items():
+                        if k not in ("name", "msg", "args", "created", "filename", "funcName", "levelname", "levelno", "lineno", "module", "msecs", "pathname", "process", "processName", "relativeCreated", "stack_info", "exc_info", "exc_text", "thread", "threadName", "message", "taskName"):
+                            if k == "extra" and isinstance(v, dict):
+                                obj.update(v)
+                            else:
+                                obj[k] = v
+                return _json.dumps(obj, default=str)
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonFormatter())
+        for name in ("smarthirex.request", "smarthirex.ratelimit", "uvicorn.error", "uvicorn.access"):
+            log = logging.getLogger(name)
+            log.handlers = []
+            log.addHandler(handler)
+            log.propagate = False
+    except Exception:
+        pass
+_configure_structured_logging()
 
 # ✅ CORS for frontend (dynamic but backward-compatible)
 origins = [
@@ -75,6 +113,8 @@ if _extra:
 _allow_all = os.getenv("CORS_ALLOW_ALL", "0").strip().lower() in {"1", "true", "yes", "on"}
 # Security: Cannot use allow_credentials=True with allow_origins=["*"]
 # If allow_all is enabled, disable credentials for security
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if _allow_all else origins,
@@ -244,7 +284,7 @@ async def create_candidate_session(body: CandidateSessionRequest, request: Reque
                 "test_token": supplied,
                 "candidate_id": body.candidate_id,
                 "email": body.email,
-                "created_at": __import__("datetime").datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
                 "user_agent": request.headers.get("user-agent"),
                 "ip": request.client.host if request.client else None,
             }
@@ -255,11 +295,12 @@ async def create_candidate_session(body: CandidateSessionRequest, request: Reque
             # non-fatal
             pass
 
-    # Set cookies commonly read by the frontend
+    # Set cookies commonly read by the frontend. In production (COOKIE_SECURE=1) use httponly for security.
     secure = _cookie_secure_default()
+    httponly = secure  # production: httponly=True; dev: False so frontend can read if needed
     resp = JSONResponse({"ok": True, "role": "candidate", "token": tok})
-    resp.set_cookie("access_token", tok, path="/", httponly=False, samesite="lax", secure=secure)
-    resp.set_cookie("AUTH_TOKEN", tok, path="/", httponly=False, samesite="lax", secure=secure)
+    resp.set_cookie("access_token", tok, path="/", httponly=httponly, samesite="lax", secure=secure)
+    resp.set_cookie("AUTH_TOKEN", tok, path="/", httponly=httponly, samesite="lax", secure=secure)
     resp.set_cookie("role", "candidate", path="/", httponly=False, samesite="lax", secure=secure)
     return resp
 
@@ -267,23 +308,57 @@ async def create_candidate_session(body: CandidateSessionRequest, request: Reque
 @app.post("/logout")
 async def logout(request: Request):
     """
-    Invalidate server session (if stored) and expire auth cookies.
+    Logout: revoke JWT (blacklist) when possible, clear sessions, and clear auth cookies.
+    Same security behavior as POST /auth/logout to avoid silent token reuse.
     """
     tok = _extract_bearer_or_cookie_token(request)
 
-    # Best-effort server invalidation (if sessions collection exists)
-    db = await _get_db_optional()
-    if db and tok:
+    # Revoke JWT if present (same logic as auth_router so no security confusion)
+    secret = os.getenv("JWT_SECRET")
+    if secret and tok:
         try:
-            res = db["sessions"].delete_many({"token": tok})
+            payload = jwt.decode(
+                tok,
+                secret,
+                algorithms=["HS256"],
+                options={"verify_exp": False},
+            )
+            jti = payload.get("jti")
+            uid = str(payload.get("id") or "")
+            exp_ts = payload.get("exp")
+            if jti:
+                now_utc = datetime.now(timezone.utc)
+                expires_at = (
+                    datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+                    if isinstance(exp_ts, (int, float))
+                    else now_utc + timedelta(hours=1)
+                )
+                await db.token_blacklist.update_one(
+                    {"jti": jti},
+                    {
+                        "$set": {
+                            "jti": jti,
+                            "user_id": uid,
+                            "expires_at": expires_at,
+                            "revoked_at": now_utc,
+                        }
+                    },
+                    upsert=True,
+                )
+        except Exception:
+            pass
+
+    # Best-effort session invalidation (if sessions collection exists)
+    db_optional = await _get_db_optional()
+    if db_optional and tok:
+        try:
+            res = db_optional["sessions"].delete_many({"token": tok})
             if inspect.isawaitable(res):
                 await res
         except Exception:
-            # ignore failures; client cookies will still be cleared
             pass
 
     resp = JSONResponse({"ok": True})
-    # Expire common auth cookies
     for c in ("access_token", "refresh_token", "AUTH_TOKEN", "Authorization", "session", "sessionid", "jwt", "authToken", "token", "role"):
         try:
             resp.delete_cookie(c, path="/")
@@ -319,7 +394,7 @@ async def save_filtered_results(body: ResultsSaveRequest, request: Request):
                 "metadata": body.metadata or {},
                 "source": body.source or "unknown",
                 "owner_token": owner_token,
-                "created_at": __import__("datetime").datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
                 "user_agent": request.headers.get("user-agent"),
                 "ip": request.client.host if request.client else None,
             }
@@ -335,10 +410,15 @@ async def save_filtered_results(body: ResultsSaveRequest, request: Request):
 
 
 # ✅ Confirm MongoDB connection at startup
+_INSECURE_SECRETS = frozenset({"", "secret", "change-me", "changeme", "jwt_secret", "your-256-bit-secret"})
+
 @app.on_event("startup")
 async def startup_db_check():
-    if not os.getenv("JWT_SECRET"):
+    secret = os.getenv("JWT_SECRET")
+    if not secret:
         raise RuntimeError("JWT_SECRET must be set before starting API")
+    if secret.strip().lower() in _INSECURE_SECRETS:
+        raise RuntimeError("JWT_SECRET must not be a default or placeholder value")
     await verify_mongo_connection()
     app.state.expiry_sweeper_task = asyncio.create_task(_expiry_sweeper_loop())
 
