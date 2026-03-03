@@ -132,16 +132,20 @@ def _strip_data_url_prefix(b64: str) -> str:
 
 async def _get_session_by_any_id(session_id: str):
     """
-    Try to fetch a session by either plain string _id or ObjectId.
+    Try to fetch a session by _id (string or ObjectId). Sessions use ObjectId _id by default.
     Returns the session doc or None.
     """
-    session = await db.proctor_sessions.find_one({"_id": session_id})
-    if session:
-        return session
+    q = _session_id_query(session_id) if session_id else None
+    if q:
+        session = await db.proctor_sessions.find_one(q)
+        if session:
+            return session
     try:
         from bson import ObjectId
-        oid = ObjectId(session_id)
-        session = await db.proctor_sessions.find_one({"_id": oid})
+        session = await db.proctor_sessions.find_one({"_id": ObjectId(session_id)})
+        if session:
+            return session
+        session = await db.proctor_sessions.find_one({"_id": session_id})
         return session
     except Exception:
         return None
@@ -195,17 +199,32 @@ async def _validate_candidate_test_token(candidate_token: str, test_id: str, can
         raise HTTPException(status_code=403, detail="Candidate token does not match this session")
 
 
+def _session_id_query(session_id: str):
+    """Return a query dict that matches session by _id. Sessions use ObjectId _id by default."""
+    from bson import ObjectId
+    if not session_id:
+        return None
+    if len(session_id) == 24 and all(c in "0123456789abcdefABCDEF" for c in session_id):
+        try:
+            return {"_id": ObjectId(session_id)}
+        except Exception:
+            pass
+    return {"_id": session_id}
+
+
 async def _update_session_by_any_id(session_id: str, update: Dict[str, Any]):
-    """
-    Update by plain string id, fallback to ObjectId.
-    Returns matched_count.
-    """
-    result = await db.proctor_sessions.update_one({"_id": session_id}, update)
+    """Update session by id (string or ObjectId). Returns matched_count."""
+    q = _session_id_query(session_id)
+    if not q:
+        return 0
+    result = await db.proctor_sessions.update_one(q, update)
     if result.matched_count > 0:
         return result.matched_count
+    # Fallback: try string _id if we tried ObjectId, or vice versa
+    from bson import ObjectId
+    alt = {"_id": session_id} if isinstance(q.get("_id"), ObjectId) else {"_id": ObjectId(session_id)}
     try:
-        from bson import ObjectId
-        result = await db.proctor_sessions.update_one({"_id": ObjectId(session_id)}, update)
+        result = await db.proctor_sessions.update_one(alt, update)
         return result.matched_count
     except Exception:
         return 0
@@ -393,10 +412,18 @@ async def get_candidate_monitoring(candidate_id: str, current=Depends(get_curren
     """
     await _assert_recruiter_owns_candidate(candidate_id, current)
     recruiter_id = str(getattr(current, "id", None) or "")
+    cid = str(candidate_id or "")
 
-    # Get all proctoring sessions for this candidate
+    # Get all proctoring sessions for this candidate (match string or ObjectId candidate_id)
     sessions = []
-    async for session in db.proctor_sessions.find({"candidate_id": candidate_id}).sort("started_at", -1):
+    from bson import ObjectId
+    session_query: Dict[str, Any] = {"candidate_id": cid}
+    if len(cid) == 24 and all(c in "0123456789abcdefABCDEF" for c in cid):
+        try:
+            session_query = {"candidate_id": {"$in": [cid, ObjectId(cid)]}}
+        except Exception:
+            pass
+    async for session in db.proctor_sessions.find(session_query).sort("started_at", -1):
         session_id = str(session.get("_id", ""))
         
         # Get snapshots metadata for this session (exclude heavy inline payloads)
