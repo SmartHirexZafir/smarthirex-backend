@@ -611,6 +611,25 @@ def _ensure_unique_questions(
         if fp:
             seen.add(fp)
         out.append(candidate_item)
+
+    # Final pass: ensure no two questions have identical text (LLM sometimes returns duplicates)
+    seen_text: set = set()
+    for i, item in enumerate(out):
+        qtext = (str(item.get("question") or "").strip()).lower()
+        if not qtext:
+            continue
+        if qtext in seen_text:
+            # Replace duplicate with a unique variant using fallback for this slot
+            replacement = dict(fallback[i] if i < len(fallback) else item)
+            base = str(replacement.get("question") or "Question").strip()
+            suffix = 1
+            while (f"{base} (variant {suffix})".lower() in seen_text) or (base.lower() in seen_text):
+                suffix += 1
+            replacement["question"] = f"{base} (Variant {suffix})"
+            out[i] = replacement
+            seen_text.add(replacement["question"].lower())
+        else:
+            seen_text.add(qtext)
     return out
 
 

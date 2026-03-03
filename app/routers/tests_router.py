@@ -235,6 +235,15 @@ def _to_utc_iso_z(dt_input: Optional[str | datetime]) -> Optional[str]:
     return serialize_utc(dt)
 
 
+def _ensure_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Return datetime as timezone-aware UTC. Safe for comparison with datetime.now(timezone.utc)."""
+    if dt is None or not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone.utc)
+
+
 def _one_test_conflict(message: str) -> HTTPException:
     return HTTPException(
         status_code=409,
@@ -674,8 +683,8 @@ async def start_test(req: StartTestRequest):
     # ✅ Check scheduled time - test cannot start before scheduled time
     scheduled_dt_str = invite.get("scheduledDateTime")
     if scheduled_dt_str:
-        scheduled_dt = _parse_utc_datetime(scheduled_dt_str)
-        if scheduled_dt and now < scheduled_dt:
+        scheduled_dt = _ensure_utc_aware(_parse_utc_datetime(scheduled_dt_str))
+        if scheduled_dt is not None and now < scheduled_dt:
             # Test not yet available - return scheduled time for countdown
             scheduled_iso = _to_utc_iso_z(scheduled_dt) or serialize_utc(scheduled_dt)
             raise HTTPException(
@@ -686,8 +695,8 @@ async def start_test(req: StartTestRequest):
     # ✅ Check if test has already started - if so, enforce actual test expiry
     existing_test = await db.tests.find_one({"token": req.token})
     if existing_test:
-        expires_dt = _parse_utc_datetime(existing_test.get("expiresAt"))
-        if expires_dt and now > expires_dt:
+        expires_dt = _ensure_utc_aware(_parse_utc_datetime(existing_test.get("expiresAt")))
+        if expires_dt is not None and now > expires_dt:
             if existing_test.get("status") != "submitted":
                 try:
                     await submit_test(SubmitTestRequest(token=req.token, answers=[]), forced_by_expiry=True)
@@ -718,8 +727,8 @@ async def start_test(req: StartTestRequest):
     invite_expires = invite.get("expiresAt")
     if isinstance(invite_expires, str):
         invite_expires = _parse_utc_datetime(invite_expires)
-    
-    if invite_expires and now > invite_expires:
+    invite_expires = _ensure_utc_aware(invite_expires)
+    if invite_expires is not None and now > invite_expires:
         raise HTTPException(status_code=410, detail="Invite link expired")
 
     candidate = await db.parsed_resumes.find_one({"_id": invite["candidateId"]})
@@ -975,6 +984,26 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
             logger.info("forced-submit skipped: already submitted token=%s testId=%s", req.token, test.get("_id"))
         raise _one_test_conflict("Test already submitted")
 
+    try:
+        return await _submit_test_impl(req, test, invite, test_type, forced_by_expiry)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("submit_test failed token=%s: %s", req.token, e)
+        raise HTTPException(
+            status_code=500,
+            detail="Test submission failed. Please try again.",
+        )
+
+
+async def _submit_test_impl(
+    req: SubmitTestRequest,
+    test: Dict[str, Any],
+    invite: Dict[str, Any],
+    test_type: TestType,
+    forced_by_expiry: bool,
+) -> SubmitTestResponse:
+    """Inner implementation of submit_test so we can catch all exceptions at the route level."""
     questions: List[Dict[str, Any]] = test.get("questions", [])
     total_questions = len(questions)
     incoming_answers = _normalize_answers(req.answers, total_questions)
@@ -986,7 +1015,8 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
     # Server-enforced timer validation (anti-devtools/API-time manipulation).
     now = datetime.now(timezone.utc)
     expires_dt = _parse_utc_datetime(test.get("expiresAt"))
-    effective_forced_by_expiry = bool(forced_by_expiry or (expires_dt and now > expires_dt))
+    expires_dt = _ensure_utc_aware(expires_dt)
+    effective_forced_by_expiry = bool(forced_by_expiry or (expires_dt is not None and now > expires_dt))
     if effective_forced_by_expiry:
         # After deadline, ignore new payload edits and lock to last server-saved draft.
         # If no draft exists, we fallback to merged answers to avoid empty-loss edge cases.
@@ -1418,16 +1448,20 @@ async def autosave_test(req: AutosaveRequest):
         {"$set": {"draftAnswers": merged, "draftSavedAt": now}},
     )
 
-    expires_dt = _parse_utc_datetime(test.get("expiresAt"))
-    if expires_dt and now > expires_dt:
-        # Force submit using server-draft answers to lock deadline.
-        await submit_test(SubmitTestRequest(token=req.token, answers=[]), forced_by_expiry=True)
-        return AutosaveResponse(
-            ok=True,
-            status="submitted",
-            saved_at=_to_utc_iso_z(now) or serialize_utc(now),
-            auto_submitted=True,
-        )
+    expires_dt = _ensure_utc_aware(_parse_utc_datetime(test.get("expiresAt")))
+    if expires_dt is not None and now > expires_dt:
+            try:
+                await submit_test(SubmitTestRequest(token=req.token, answers=[]), forced_by_expiry=True)
+                return AutosaveResponse(
+                    ok=True,
+                    status="submitted",
+                    saved_at=_to_utc_iso_z(now) or serialize_utc(now),
+                    auto_submitted=True,
+                )
+            except Exception as e:
+                logger.exception("autosave force-submit failed: %s", e)
+                # Return active so client does not see 500; next autosave will retry
+                pass
 
     return AutosaveResponse(
         ok=True,
@@ -1612,6 +1646,12 @@ def _attach_candidate_stub(doc: Dict[str, Any], cand: Optional[Dict[str, Any]]) 
         "questions": doc.get("questions", []),
         "answers": doc.get("answers", []),
         "details": doc.get("details", []),
+        "duration_minutes": doc.get("durationMinutes") or doc.get("duration_minutes"),
+        "durationMinutes": doc.get("durationMinutes") or doc.get("duration_minutes"),
+        "questionCount": doc.get("questionCount") or len(doc.get("questions") or []),
+        "recruiter_name": doc.get("recruiterName") or doc.get("recruiter_name"),
+        "recruiterName": doc.get("recruiterName") or doc.get("recruiter_name"),
+        "custom": doc.get("custom") or {},
     }
     return out
 

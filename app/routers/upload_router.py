@@ -1,5 +1,6 @@
 # app/routers/upload_router.py
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import uuid
@@ -43,6 +44,12 @@ router = APIRouter()
 
 ALLOWED_EXTS = {".pdf", ".doc", ".docx"}
 MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+
+# Directory for storing uploaded resume files (served at /uploads/resumes/...)
+# Use same base as main.py: project root / uploads (override with UPLOADS_DIR env)
+_root = Path(__file__).resolve().parent.parent.parent
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", str(_root / "uploads"))).resolve()
+RESUMES_SUBDIR = "resumes"
 
 # ✅ UI timing hints for the frontend (ms) — toaster should disappear ~3–4s
 TOAST_HOLD_MS = 3500          # green toast ~3.5s
@@ -321,7 +328,20 @@ async def upload_resumes(
         resume_data["email"] = resume_data.get("email") or None
         resume_data["phone"] = resume_data.get("phone") or None
         resume_data["skills"] = resume_data.get("skills") or []
-        resume_data["resume_url"] = resume_data.get("resume_url", "")
+        # Save uploaded file to disk and set resume_url so Candidate Profile can open the CV
+        resume_url_value = ""
+        try:
+            UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            resumes_dir = UPLOADS_DIR / RESUMES_SUBDIR
+            resumes_dir.mkdir(parents=True, exist_ok=True)
+            safe_ext = ext if ext.lower() in ALLOWED_EXTS else ".pdf"
+            file_path = resumes_dir / f"{_id}{safe_ext}"
+            file_path.write_bytes(contents)
+            resume_url_value = f"/uploads/{RESUMES_SUBDIR}/{_id}{safe_ext}"
+        except Exception as e:
+            import logging
+            logging.warning("Failed to save resume file to disk: %s", e)
+        resume_data["resume_url"] = resume_url_value or resume_data.get("resume_url", "")
         resume_data["company"] = resume_data.get("company") or "N/A"
 
         # Nested resume section (ensure presence)
@@ -332,7 +352,7 @@ async def upload_resumes(
             "workHistory": resume.get("workHistory", []),
             "projects": resume.get("projects", []),
             "filename": filename,
-            "url": resume_data.get("resume_url", ""),
+            "url": resume_data["resume_url"],
         }
 
         # ✅ Clean redundant/transient fields before persistence

@@ -155,6 +155,7 @@ _root = Path(__file__).resolve().parent
 _public_dir = Path(os.getenv("PUBLIC_DIR", _root / "public"))
 _static_dir = Path(os.getenv("STATIC_DIR", _root / "static"))
 _assets_dir = Path(os.getenv("ASSETS_DIR", _root / "assets"))
+_uploads_dir = Path(os.getenv("UPLOADS_DIR", str(_root / "uploads"))).resolve()
 
 if _public_dir.is_dir():
     app.mount("/public", StaticFiles(directory=str(_public_dir)), name="public")
@@ -162,6 +163,9 @@ if _static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
 if _assets_dir.is_dir():
     app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
+# Uploaded resume files (Candidate Profile opens CV via this URL)
+_uploads_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(_uploads_dir)), name="uploads")
 
 # ---------------------------------------------------------
 # Default avatar fallback to eliminate repeated 404s

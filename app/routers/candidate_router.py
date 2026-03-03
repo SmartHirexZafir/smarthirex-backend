@@ -95,8 +95,16 @@ async def get_candidate(
     resume.setdefault("workHistory", [])
     resume.setdefault("projects", [])
     resume.setdefault("filename", candidate.get("filename", "resume.pdf"))
-    # ensure a downloadable URL lives under resume.url
-    resume.setdefault("url", candidate.get("resume_url", "") or candidate.get("resumeUrl", "") or "")
+    # ensure a downloadable URL lives under resume.url (from MongoDB stored fields)
+    resume_url_value = (
+        candidate.get("resume_url", "")
+        or candidate.get("resumeUrl", "")
+        or resume.get("url", "")
+        or (resume.get("file_url") if isinstance(resume.get("file_url"), str) else "")
+    )
+    resume.setdefault("url", resume_url_value or "")
+    candidate["resume_url"] = (resume.get("url", "") or candidate.get("resume_url", "") or "").strip()
+    candidate["resumeUrl"] = candidate["resume_url"]
 
     # ---------------- Scores & skills normalization ----------------
     # Legacy overall match score field
