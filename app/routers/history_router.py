@@ -639,10 +639,7 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
         # Do not fail the re-run API if persistence has issues
         pass
 
-    # Prepare metadata & timestamps
-    ts_raw = datetime.now(timezone.utc)
-    ts_disp = _now_display()
-
+    # Prepare metadata & timestamps (do NOT update history here — only on save-selection so Cancel leaves block unchanged)
     match_meta = {
         "strictCount": sum(1 for x in matches if x.get("is_strict_match")),
         "closeCount": sum(1 for x in matches if not x.get("is_strict_match")),
@@ -651,25 +648,11 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
         "hasClose": any(x.get("match_type") == "close" for x in matches),
     }
 
-    # Update the SAME history document in-place (scoped by owner)
-    await db.search_history.update_one(
-        {"_id": oid, "ownerUserId": owner_id},
-        {
-            "$set": {
-                "prompt": prompt,
-                "timestamp_raw": ts_raw,
-                "timestamp_display": ts_disp,
-                "totalMatches": len(matches),
-                "candidates": matches,
-                "matchMeta": match_meta,
-            }
-        },
-    )
-
-    # Return a chat-friendly payload for the popup UI
+    # Return results for UI; block is updated only when user clicks Save (save-selection)
     return {
         "reply": f"Showing {len(matches)} result(s) for your query.",
         "resumes_preview": matches,
+        "candidates": matches,
         "totalMatches": len(matches),
         "matchMeta": match_meta,
         "no_results": len(matches) == 0,
@@ -677,6 +660,78 @@ async def rerun_history_block(history_id: str, payload: Dict[str, Any], current=
             "primaryMessage": f"Updated this block to {len(matches)} candidate(s).",
             "query": prompt,
         },
+    }
+
+
+@router.post("/rerun/{history_id}/save-selection")
+async def rerun_save_selection(history_id: str, payload: Dict[str, Any], current=Depends(get_current_user)):
+    """
+    Replace the existing history block's candidate selection with the selected IDs from the rerun results.
+    Used when user clicks "Save selection" in the Rerun Prompt modal.
+    """
+    try:
+        oid = ObjectId(history_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid history id")
+
+    selected_ids = payload.get("selectedIds", [])
+    if not isinstance(selected_ids, list) or len(selected_ids) == 0:
+        raise HTTPException(status_code=400, detail="selectedIds array is required and must not be empty")
+    new_prompt = (payload.get("prompt") or "").strip() if isinstance(payload.get("prompt"), str) else None
+
+    owner_id = str(getattr(current, "id", None) or getattr(current, "_id", None) or "")
+    h = await db.search_history.find_one({"_id": oid, "ownerUserId": owner_id})
+    if not h:
+        raise HTTPException(status_code=404, detail="History entry not found")
+
+    id_list_raw = [str(cid).strip() for cid in selected_ids if cid is not None and str(cid).strip()]
+    if not id_list_raw:
+        raise HTTPException(status_code=400, detail="No valid candidate IDs provided")
+
+    # Support both string and ObjectId _id in parsed_resumes
+    id_list: List[Any] = []
+    for cid in id_list_raw:
+        if len(cid) == 24 and all(c in "0123456789abcdefABCDEF" for c in cid):
+            try:
+                id_list.append(ObjectId(cid))
+            except Exception:
+                id_list.append(cid)
+        else:
+            id_list.append(cid)
+
+    cursor = db.parsed_resumes.find({"ownerUserId": owner_id, "_id": {"$in": id_list}})
+    candidates = [doc async for doc in cursor]
+    for doc in candidates:
+        doc["_id"] = str(doc.get("_id", ""))
+
+    ts_raw = datetime.now(timezone.utc)
+    ts_disp = _now_display()
+    match_meta = {
+        "strictCount": sum(1 for x in candidates if x.get("is_strict_match")),
+        "closeCount": sum(1 for x in candidates if not x.get("is_strict_match")),
+        "total": len(candidates),
+        "hasExact": any(x.get("match_type") == "exact" for x in candidates),
+        "hasClose": any(x.get("match_type") == "close" for x in candidates),
+    }
+
+    update_set: Dict[str, Any] = {
+        "candidates": candidates,
+        "totalMatches": len(candidates),
+        "matchMeta": match_meta,
+        "timestamp_raw": ts_raw,
+        "timestamp_display": ts_disp,
+    }
+    if new_prompt:
+        update_set["prompt"] = new_prompt
+    await db.search_history.update_one(
+        {"_id": oid, "ownerUserId": owner_id},
+        {"$set": update_set},
+    )
+
+    return {
+        "ok": True,
+        "savedId": history_id,
+        "message": f"Selection saved. {len(candidates)} candidate(s) now in this block.",
     }
 
 

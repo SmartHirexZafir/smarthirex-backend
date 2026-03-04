@@ -230,6 +230,20 @@ async def _update_session_by_any_id(session_id: str, update: Dict[str, Any]):
         return 0
 
 
+async def _update_test_submission_video(test_id: str, candidate_id: str, video_id: str) -> None:
+    """Update the test attempt document with videoUrl and videoUploadStatus so each attempt has a video link."""
+    from bson import ObjectId
+    tid = test_id
+    try:
+        tid = ObjectId(test_id)
+    except Exception:
+        pass
+    await db.test_submissions.update_one(
+        {"testId": tid, "candidateId": candidate_id},
+        {"$set": {"videoUrl": video_id, "videoUploadStatus": "completed"}},
+    )
+
+
 # ---------- Routes ----------
 
 @router.post("/start", response_model=StartProctorResponse)
@@ -454,8 +468,8 @@ async def get_candidate_monitoring(candidate_id: str, current=Depends(get_curren
         video_access = _media_token("video", str(video_id), recruiter_id) if video_id else None
         sessions.append({
             "session_id": session_id,
-            "test_id": session.get("test_id"),
-            "candidate_id": session.get("candidate_id"),
+            "test_id": str(session.get("test_id") or ""),
+            "candidate_id": str(session.get("candidate_id") or ""),
             "started_at": _normalize_iso_utc(session.get("started_at")) or session.get("started_at"),
             "ended_at": _normalize_iso_utc(session.get("ended_at")) or session.get("ended_at"),
             "active": session.get("active", False),
@@ -565,6 +579,9 @@ async def upload_video(
             }
         })
 
+        # Link video to test attempt (TestAttempt must contain videoUrl)
+        await _update_test_submission_video(test_id, candidate_id, video_id)
+
         return {
             "status": "ok",
             "video_id": video_id,
@@ -619,6 +636,12 @@ async def _finalize_video_upload_record(
     await db.proctor_video_uploads.update_one(
         {"_id": upload_doc["_id"]},
         {"$set": {"status": "finalized", "final_video_id": video_id, "finalized_at": _now_iso()}},
+    )
+    # Link video to test attempt (TestAttempt must contain videoUrl)
+    await _update_test_submission_video(
+        str(upload_doc.get("test_id") or ""),
+        str(upload_doc.get("candidate_id") or ""),
+        video_id,
     )
     return {"video_id": video_id, "file_size": file_size}
 

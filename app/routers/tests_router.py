@@ -442,8 +442,9 @@ class SubmitTestRequest(BaseModel):
 class SubmitTestResponse(BaseModel):
     test_id: str
     candidate_id: str
-    score: float  # unified percent (0.0 for ungraded custom)
+    score: float  # unified percent (0.0 for ungraded custom / pending manual)
     details: List[Dict[str, Any]]
+    pending_manual_review: Optional[bool] = False  # True when scenario/custom needs recruiter marking
 
 
 class AutosaveRequest(BaseModel):
@@ -964,7 +965,6 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
     if test.get("status") == "submitted":
         existing = await db.test_submissions.find_one({"testId": test["_id"]})
         if existing:
-            # Only propagate to candidate profile for graded (i.e., not needs_marking)
             if not existing.get("needs_marking", False):
                 try:
                     await db.parsed_resumes.update_one(
@@ -978,10 +978,27 @@ async def submit_test(req: SubmitTestRequest, forced_by_expiry: bool = False):
                 candidate_id=test["candidateId"],
                 score=float(existing.get("score", 0.0)),
                 details=existing.get("details", []),
+                pending_manual_review=bool(existing.get("needs_marking") or existing.get("manual_review_required")),
             )
-        # Defensive guard: once status is submitted, never re-finalize.
         if forced_by_expiry:
             logger.info("forced-submit skipped: already submitted token=%s testId=%s", req.token, test.get("_id"))
+        raise _one_test_conflict("Test already submitted")
+
+    # Claim submission immediately so concurrent requests cannot double-submit
+    claim = await db.tests.update_one(
+        {"_id": test["_id"], "status": {"$ne": "submitted"}},
+        {"$set": {"status": "submitted"}},
+    )
+    if claim.matched_count == 0:
+        existing = await db.test_submissions.find_one({"testId": test["_id"]})
+        if existing:
+            return SubmitTestResponse(
+                test_id=test["_id"],
+                candidate_id=test["candidateId"],
+                score=float(existing.get("score", 0.0)),
+                details=existing.get("details", []),
+                pending_manual_review=bool(existing.get("needs_marking") or existing.get("manual_review_required")),
+            )
         raise _one_test_conflict("Test already submitted")
 
     try:
@@ -1031,17 +1048,42 @@ async def _submit_test_impl(
 
     # ---------- CUSTOM TEST PATH (manual marking) ----------
     if test_type == "custom":
-        # Build lightweight details pairing question/answer for UI preview
+        # Build lightweight details pairing question/answer for UI preview and manual marking
+        # Auto-grade MCQ by comparing with correct_answer / correctOption; only free text needs manual marking
         details: List[Dict[str, Any]] = []
         for i, q in enumerate(questions):
-            details.append(
-                {
+            qtype = (q.get("type") or "text").strip().lower()
+            cand_answer = (effective_answers[i].get("answer") if i < len(effective_answers) else None) or ""
+            cand_norm = str(cand_answer).strip().lower()
+            correct_ref = (q.get("correct_answer") or q.get("correctOption") or "").strip().lower()
+            max_score = float(q.get("max_score") or q.get("max_points") or (1.0 if qtype == "mcq" else 100))
+
+            if qtype == "mcq":
+                is_correct = bool(correct_ref and cand_norm == correct_ref)
+                details.append({
                     "question": q.get("question", ""),
-                    "type": q.get("type", "text"),
-                    "answer": (effective_answers[i].get("answer") if i < len(effective_answers) else None),
+                    "type": "mcq",
+                    "answer": cand_answer,
+                    "is_correct": is_correct,
+                    "score": 1.0 if is_correct else 0.0,
+                    "max_score": 1.0,
+                    "correct_answer": q.get("correct_answer") or q.get("correctOption"),
+                    "options": q.get("options"),
+                })
+            else:
+                details.append({
+                    "question": q.get("question", ""),
+                    "type": qtype,
+                    "answer": cand_answer,
                     "is_correct": None,
-                }
-            )
+                    "max_score": max_score,
+                })
+
+        # Initial score from auto-graded MCQs only; text adds after manual marking
+        total_obtained = sum(float(d.get("score", 0)) for d in details)
+        total_possible = sum(float(d.get("max_score", 0)) for d in details)
+        initial_score = round((total_obtained / total_possible * 100.0), 2) if total_possible else 0.0
+        has_text_questions = any((d.get("type") or "text").strip().lower() != "mcq" for d in details)
 
         # ✅ Save COMPLETE test data for custom tests
         submission_doc = {
@@ -1050,10 +1092,12 @@ async def _submit_test_impl(
             "candidateId": test["candidateId"],
             "answers": effective_answers,  # Candidate's submitted answers
             "questions": questions,  # ✅ Complete questions from the custom test
-            "score": 0.0,  # not graded yet
+            "score": initial_score,  # MCQ score until text questions are manually graded
             "details": details,  # ✅ Complete details (question, answer, type, etc.)
             "submittedAt": datetime.now(timezone.utc),
-            "needs_marking": True,
+            "needs_marking": has_text_questions,
+            "manual_review_required": has_text_questions,
+            "status": "Needs manual marking (custom)" if has_text_questions else "Checked",
             "type": "custom",
             # ✅ Include test metadata
             "testType": "custom",
@@ -1069,6 +1113,8 @@ async def _submit_test_impl(
             "invitedByUserId": test.get("invitedByUserId") or invite.get("invitedByUserId"),
             "recruiterName": test.get("recruiterName") or invite.get("recruiterName"),
             "recruiterEmail": test.get("recruiterEmail") or invite.get("recruiterEmail"),
+            "videoUrl": None,
+            "videoUploadStatus": "pending",
         }
         try:
             await db.test_submissions.insert_one(submission_doc)
@@ -1077,12 +1123,20 @@ async def _submit_test_impl(
         await db.tests.update_one({"_id": test["_id"]}, {"$set": {"status": "submitted"}})
         await db.test_invites.update_one({"token": req.token}, {"$set": {"status": "completed"}})
 
-        # Note: we DO NOT update candidate.test_score for custom until graded
+        if not has_text_questions:
+            try:
+                await db.parsed_resumes.update_one(
+                    {"_id": test["candidateId"]},
+                    {"$set": {"test_score": initial_score}},
+                )
+            except Exception:
+                pass
         return SubmitTestResponse(
             test_id=test["_id"],
             candidate_id=test["candidateId"],
-            score=0.0,
+            score=initial_score,
             details=details,
+            pending_manual_review=has_text_questions,
         )
 
     # ---------- SMART TEST PATH (original logic + optional enhancers) ----------
@@ -1110,6 +1164,7 @@ async def _submit_test_impl(
     code_summary_passed = 0
     total_points_sum = 0.0
     total_points_max = 0.0
+    has_scenario_pending = False  # True if any scenario question (manual marking required)
 
     for i, det in enumerate(details):
         # Ensure type is visible to the UI
@@ -1153,104 +1208,78 @@ async def _submit_test_impl(
             total_points_max += float(det["max_score"])
             continue
 
-        # ---------------- Scenario / Free-form auto-grading (GPT-based for scenarios) ---------------- 
-        if qtype in {"scenario", "freeform", "free-form", "text"}:
-            # ✅ ALWAYS use GPT evaluator for scenario questions (no keyword matching)
-            if qtype == "scenario":
+        # ---------------- Scenario: manual marking only (no auto/GPT grading) ----------------
+        if qtype == "scenario":
+            auto_max = float(FREEFORM_MAX_POINTS)
+            det["score"] = 0.0
+            det["max_score"] = int(auto_max)
+            det["is_correct"] = None
+            det["manual_review_required"] = True
+            det["explanation"] = "Pending manual review."
+            det["auto_points"] = 0.0
+            det["auto_max"] = int(auto_max)
+            det["auto_feedback"] = "Pending manual review."
+            ff_max_sum += auto_max
+            total_points_max += auto_max
+            has_scenario_pending = True
+            continue
+
+        # ---------------- Other free-form (freeform, text): optional rules/LLM ----------------
+        if qtype in {"freeform", "free-form", "text"}:
+            auto_points = 0.0
+            auto_max = float(FREEFORM_MAX_POINTS)
+            auto_feedback_parts: List[str] = []
+
+            if USE_RULES and _rules_grader:
                 try:
-                    from app.logic.scenario_evaluator import evaluate_scenario_with_leniency
-                    gpt_result = evaluate_scenario_with_leniency(
+                    r = _rules_grader(
                         question=question_text,
-                        candidate_answer=submitted_text,
-                        max_score=float(FREEFORM_MAX_POINTS),
-                        ideal_answer=_norm_text((questions[i] if i < len(questions) else {}).get("ideal_answer", "")),
-                        rubric=(questions[i] if i < len(questions) else {}).get("rubric"),
+                        answer=submitted_text,
+                        max_points=FREEFORM_MAX_POINTS,
                     )
-                    
-                    auto_points = float(gpt_result.get("score", 0.0) or 0.0)
-                    auto_max = float(FREEFORM_MAX_POINTS)
-                    auto_feedback = str(gpt_result.get("explanation", "Evaluated by AI."))
-                    
-                    # Update detail with GPT evaluation results
-                    det["auto_points"] = round(auto_points, 2)
-                    det["auto_max"] = int(auto_max)
-                    det["auto_feedback"] = auto_feedback
-                    det["score"] = round(auto_points, 2)
-                    det["max_score"] = int(auto_max)
-                    det["is_correct"] = bool(gpt_result.get("is_correct", False))
-                    det["explanation"] = auto_feedback
-                    det["confidence"] = float(gpt_result.get("confidence", 0.0) or 0.0)
-                    det["ai_reasoning"] = auto_feedback
-                    
-                    # Update aggregates
-                    ff_points_sum += max(0.0, min(auto_points, auto_max))
-                    ff_max_sum += auto_max
-                    
-                except Exception as e:
-                    # Fallback if GPT evaluation fails
-                    det["auto_points"] = 0.0
-                    det["auto_max"] = int(FREEFORM_MAX_POINTS)
-                    det["auto_feedback"] = f"Evaluation error: {str(e)[:100]}"
-                    det["score"] = 0.0
-                    det["max_score"] = int(FREEFORM_MAX_POINTS)
-                    det["is_correct"] = False
-                    det["explanation"] = det["auto_feedback"]
-            else:
-                # For other free-form types (not scenario), use existing logic
-                auto_points = 0.0
-                auto_max = float(FREEFORM_MAX_POINTS)
-                auto_feedback_parts: List[str] = []
+                    rp = float(r.get("points", 0.0) or 0.0)
+                    rmax = float(r.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
+                    rfb = _norm_text(r.get("feedback", ""))
+                    auto_points = max(auto_points, rp)
+                    auto_max = max(auto_max, rmax)
+                    if rfb:
+                        auto_feedback_parts.append(f"[rules] {rfb}")
+                    if isinstance(r.get("rubric"), dict):
+                        det["rubric_breakdown"] = r["rubric"]
+                except Exception:
+                    pass
 
-                if USE_RULES and _rules_grader:
-                    try:
-                        r = _rules_grader(
-                            question=question_text,
-                            answer=submitted_text,
-                            max_points=FREEFORM_MAX_POINTS,
-                        )
-                        rp = float(r.get("points", 0.0) or 0.0)
-                        rmax = float(r.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
-                        rfb = _norm_text(r.get("feedback", ""))
-                        auto_points = max(auto_points, rp)
-                        auto_max = max(auto_max, rmax)
-                        if rfb:
-                            auto_feedback_parts.append(f"[rules] {rfb}")
-                        if isinstance(r.get("rubric"), dict):
-                            det["rubric_breakdown"] = r["rubric"]
-                    except Exception:
-                        pass
+            if USE_LLM and _llm_grader:
+                try:
+                    l = _llm_grader(
+                        question=question_text,
+                        answer=submitted_text,
+                        max_points=FREEFORM_MAX_POINTS,
+                    )
+                    lp = float(l.get("points", 0.0) or 0.0)
+                    lmax = float(l.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
+                    lfb = _norm_text(l.get("feedback", ""))
+                    if lp > auto_points:
+                        auto_points = lp
+                    auto_max = max(auto_max, lmax)
+                    if lfb:
+                        auto_feedback_parts.append(f"[llm] {lfb}")
+                    if isinstance(l.get("rubric"), dict):
+                        det["rubric_breakdown"] = l["rubric"]
+                except Exception:
+                    pass
 
-                if USE_LLM and _llm_grader:
-                    try:
-                        l = _llm_grader(
-                            question=question_text,
-                            answer=submitted_text,
-                            max_points=FREEFORM_MAX_POINTS,
-                        )
-                        lp = float(l.get("points", 0.0) or 0.0)
-                        lmax = float(l.get("max_points", FREEFORM_MAX_POINTS) or FREEFORM_MAX_POINTS)
-                        lfb = _norm_text(l.get("feedback", ""))
-                        if lp > auto_points:
-                            auto_points = lp
-                        auto_max = max(auto_max, lmax)
-                        if lfb:
-                            auto_feedback_parts.append(f"[llm] {lfb}")
-                        if isinstance(l.get("rubric"), dict):
-                            det["rubric_breakdown"] = l["rubric"]
-                    except Exception:
-                        pass
+            if (USE_RULES and _rules_grader) or (USE_LLM and _llm_grader):
+                ff_points_sum += max(0.0, min(auto_points, auto_max))
+                ff_max_sum += auto_max
 
-                if (USE_RULES and _rules_grader) or (USE_LLM and _llm_grader):
-                    ff_points_sum += max(0.0, min(auto_points, auto_max))
-                    ff_max_sum += auto_max
-
-                det["auto_points"] = round(float(auto_points), 2)
-                det["auto_max"] = int(auto_max)
-                det["auto_feedback"] = " ".join(auto_feedback_parts).strip()
-                det["score"] = det["auto_points"]
-                det["max_score"] = det["auto_max"]
-                if ff_max_sum > 0:
-                    det["is_correct"] = det.get("is_correct", False) or (float(auto_points) >= (0.6 * auto_max))
+            det["auto_points"] = round(float(auto_points), 2)
+            det["auto_max"] = int(auto_max)
+            det["auto_feedback"] = " ".join(auto_feedback_parts).strip()
+            det["score"] = det["auto_points"]
+            det["max_score"] = det["auto_max"]
+            if ff_max_sum > 0:
+                det["is_correct"] = det.get("is_correct", False) or (float(auto_points) >= (0.6 * auto_max))
 
         # ---------------- Code runner (optional) ----------------
         if qtype == "code" and CODE_RUNNER_ENABLED and _runner_run and submitted_text:
@@ -1356,7 +1385,9 @@ async def _submit_test_impl(
         "mcq_score": mcq_percent,
         "details": details,  # ✅ Complete evaluation details (question, answer, is_correct, explanation, etc.)
         "submittedAt": datetime.now(timezone.utc),
-        "needs_marking": False,  # SMART tests are auto-graded
+        "needs_marking": has_scenario_pending,  # True when scenario questions need manual review
+        "manual_review_required": has_scenario_pending,
+        "status": "Needs manual marking" if has_scenario_pending else "submitted",
         "type": "smart",
         # ✅ Include test metadata
         "testType": "smart",
@@ -1371,6 +1402,8 @@ async def _submit_test_impl(
         "invitedByUserId": test.get("invitedByUserId") or invite.get("invitedByUserId"),
         "recruiterName": test.get("recruiterName") or invite.get("recruiterName"),
         "recruiterEmail": test.get("recruiterEmail") or invite.get("recruiterEmail"),
+        "videoUrl": None,
+        "videoUploadStatus": "pending",
     }
 
     # Include free-form grading summary for reporting (non-breaking)
@@ -1403,17 +1436,19 @@ async def _submit_test_impl(
     await db.tests.update_one({"_id": test["_id"]}, {"$set": {"status": "submitted"}})
     await db.test_invites.update_one({"token": req.token}, {"$set": {"status": "completed"}})
 
-    # Update candidate profile with latest test_score (%)
-    try:
-        await db.parsed_resumes.update_one({"_id": test["candidateId"]}, {"$set": {"test_score": unified_total_percent}})
-    except Exception:
-        pass  # not fatal
+    # Update candidate profile only when no pending manual review (recruiter will update after marking)
+    if not has_scenario_pending:
+        try:
+            await db.parsed_resumes.update_one({"_id": test["candidateId"]}, {"$set": {"test_score": unified_total_percent}})
+        except Exception:
+            pass  # not fatal
 
     return SubmitTestResponse(
         test_id=test["_id"],
         candidate_id=test["candidateId"],
-        score=unified_total_percent,
+        score=unified_total_percent if not has_scenario_pending else 0.0,
         details=submission_doc["details"],
+        pending_manual_review=has_scenario_pending,
     )
 
 
@@ -1535,9 +1570,9 @@ async def grade_attempt(
     if not attempt:
         raise HTTPException(status_code=404, detail="Attempt not found")
 
-    # Only custom tests should be manually graded
-    if attempt.get("type") != "custom":
-        raise HTTPException(status_code=400, detail="Only custom test attempts can be manually graded")
+    # Custom tests and smart tests with scenario (manual_review_required) can be graded
+    if attempt.get("type") != "custom" and not attempt.get("manual_review_required"):
+        raise HTTPException(status_code=400, detail="This attempt does not require manual grading")
 
     if body is None:
         raise HTTPException(status_code=400, detail="Request body is required")
@@ -1550,25 +1585,31 @@ async def grade_attempt(
             raise HTTPException(status_code=403, detail="Not authorized to grade this attempt")
 
     score = float(body.score)
-    
-    # ✅ Update details with per-question grades if provided
     details = list(attempt.get("details", []))
     computed_scores: List[float] = []
+    # Per-question grades: score is points obtained for that question (max from details[idx].max_score)
     if body.question_grades:
         for q_grade in body.question_grades:
             idx = q_grade.question_index
             if 0 <= idx < len(details):
-                q_score = max(0.0, min(100.0, float(q_grade.score)))
+                q_max = float(details[idx].get("max_score") or 100.0)
+                q_score = max(0.0, min(q_max, float(q_grade.score)))
                 details[idx]["score"] = q_score
-                details[idx]["max_score"] = 100.0  # Normalize to 100
-                details[idx]["is_correct"] = q_score >= 60.0  # Consider >= 60% as correct
+                details[idx]["max_score"] = q_max
+                details[idx]["is_correct"] = q_score >= (0.6 * q_max) if q_max > 0 else False
                 if q_grade.feedback:
                     details[idx]["feedback"] = q_grade.feedback
                     details[idx]["explanation"] = q_grade.feedback
                 computed_scores.append(q_score)
     fully_graded = bool(details) and len(computed_scores) == len(details)
     if computed_scores and fully_graded:
-        score = round(sum(computed_scores) / len(computed_scores), 2)
+        # percentage = (obtained_marks / total_possible_marks) * 100
+        total_obtained = sum(computed_scores)
+        total_possible = sum(float(details[i].get("max_score") or 100.0) for i in range(len(details)))
+        if total_possible > 0:
+            score = round((total_obtained / total_possible) * 100.0, 2)
+        else:
+            score = round(sum(computed_scores) / len(computed_scores), 2)
     
     # ✅ Update submission with score and detailed grades
     update_data = {
@@ -1583,6 +1624,7 @@ async def grade_attempt(
         update_data["score"] = score
         update_data["total_score"] = score
         update_data["needs_marking"] = False
+        update_data["status"] = "Checked"
         update_data["gradedAt"] = datetime.now(timezone.utc)
     else:
         # Keep the attempt pending until every question has a mark.
@@ -1694,6 +1736,28 @@ async def get_history_all(current=Depends(get_current_user)):
         "attempts": attempts,
         "needs_marking": needs,
     }
+
+
+@router.get("/attempt/{attempt_id}")
+async def get_attempt_by_id(attempt_id: str, current=Depends(get_current_user)):
+    """
+    Return one full attempt by id (questions, answers, details) for manual marking.
+    Requires auth and candidate ownership.
+    """
+    owner_id = str(getattr(current, "id", None) or "")
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    attempt = await db.test_submissions.find_one({"_id": attempt_id})
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+
+    cand_id = attempt.get("candidateId")
+    cand = await db.parsed_resumes.find_one({"_id": cand_id, "ownerUserId": owner_id}) if cand_id else None
+    if not cand:
+        raise HTTPException(status_code=403, detail="Not authorized to view this attempt")
+
+    return _attach_candidate_stub(attempt, cand)
 
 
 @router.get("/history/{candidate_id}/{attempt_id}/report.pdf")
